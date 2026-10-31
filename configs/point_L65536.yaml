@@ -1,0 +1,101 @@
+model:
+  name: deepseek_v4_1_flash
+  hidden: 5120
+  moe_intermediate: 2304
+  swiglu_limit: 10.0
+  n_layers: 40
+  n_routed_experts: 384
+  n_shared_experts: 1
+  topk: 6
+  sliding_window: 128
+  compress_ratios:
+  - 0
+  - 0
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  kv_source_layers:
+  - 2
+  - 8
+  - 14
+  - 20
+  index_source_layers:
+  - 2
+  - 8
+  - 14
+  - 20
+  - 24
+  - 28
+  - 32
+  - 36
+  candidate_source_layer: 20
+  engram_layers:
+  - 1
+  - 14
+  engram_offload: true
+  engram_tp_size: 8
+parallel_config:
+  world_size: 8
+  cp_size: 1
+  moe_ep_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 1
+  lmhead_tp_size: 1
+run:
+  seq_len: 65536
+  batch: 1
+  iters: 4
+  moe_chunk_max_len: 8192
+weights:
+  mode: synthetic
+  path: /mnt/xds/sfs/DeepSeek-V4.1-Flash-cann-mxfp8-mxfp4
+  engram_table_rows: 1048576
+  # lazy_experts: 不显式设置 → 代码按运行卡数决定（EP8/多卡=常驻，单卡=逐层）。2026-10-18 用户口径
+  share_across_layers: true
+backends:
+  megamoe: deepgemm
+  indexer_prolog_qw: ascendc
+  gate_topk: tilelang
+  engram: tilelang
+  swiglu: fused
+hit:
+  ratio: 0.9707031
+  source: fake
+  replay_tail: 140
+features:
+  decoder_replay: false

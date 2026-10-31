@@ -1,0 +1,3841 @@
+"""exec_ops.py —— 算子执行表（M2）：我们的 op key → **真实调用**。
+
+约定：`fn(st, ctx, w)`
+  st   激活表（dict）：op 读写其中的张量（x / h / q / kv / gate_logits …）
+  ctx  本层上下文（run.ctx_for 给的 T/H/ratio/层角色 + 模型常量）
+  w    本层权重（weights.iter_layer 的返回；en=经 pack_* 打包的视图）
+
+纪律：
+  · 只登记**能真跑**的算子；跑不了的放 SKIP 并写清原因（runner 跳过并如实汇报，不造假）。
+  · 所有调用式都来自官方仓库的调用点（见各函数注释的 文件:行），不发明参数。
+  · 权重布局转换（transpose / scale 配对 / NZ）统一走 `pack_*`，合成与真实共用。
+
+张量口径（真权重实况）：
+  H=5120  heads=64  head_dim=512  rope=64  q_lora=1280  o_lora=1024(×8 组)  experts=384 topk=6
+"""
+from __future__ import annotations
+
+import os
+import time
+import sys
+
+import torch
+import torch_npu
+
+import batch as batch_layout
+import mq_fastcall as _mqfc        # ★ A1：mqsmla 薄下发通道（默认 DS41M_MQ_FAST=0 = 原行为）
+# ★ B3：mqsmla 的「薄下发 L2」（默认 DS41M_MQ_L2=0 = 仍旧走上面 A1 的通道，逐字节同前）。
+#   开关在 import 期读一次（与其它 env 快照同一纪律）；关掉时热路径**不经过**本模块。
+try:
+    import mq_fastcall2 as _mqfc2
+    _MQ_L2_ON = _mqfc2.enabled()
+except Exception:                                     # noqa: BLE001  模块缺失 ⇒ 完全不启用
+    _mqfc2 = None
+    _MQ_L2_ON = False
+# ★ 2026-10-29（桥 L3，**已否决**）：layout/device 解析缓存在 256k@0.97 上触发
+#   aicore exception（8k@0.90 CP2 能过）。代码已删，勿再启用；
+#   结论见 NOTES/2026-10-29-bridge-l3-rejected.md。
+# ★ 2026-10-29（bind-probe，诊断，默认关）：测 vendor 「绑定后直发」的 host 上限。
+try:
+    import bind_probe as _bind_probe
+    _bind_probe.install()
+except Exception:                                     # noqa: BLE001
+    _bind_probe = None
+# ★ 2026-10-29（mq-outbuf，原型，默认关）：mqsmla 输出改常驻缓冲（让 vendor 绑定可复用）。
+try:
+    import mq_outbuf as _mq_outbuf
+    _mq_outbuf.install()
+except Exception:                                     # noqa: BLE001
+    _mq_outbuf = None
+# ★ 2026-10-29（bind-fast，原型，默认关）：按实参指纹缓存 vendor 绑定，命中走 bound.invoke()。
+try:
+    import bind_fast as _bind_fast
+    _bind_fast.install()
+except Exception:                                     # noqa: BLE001
+    _bind_fast = None
+
+# ★ 以下默认值 = 2026-10-19 改造前的硬编码值；启动时由 model_spec 按 config 刷新
+#   （见 `_apply_spec`）。运行期仍读模块全局 → 热路径零额外开销。
+EPS = 1e-20              # rms_norm_eps（config.model.rms_norm_eps）
+BLOCK_K = 32             # mxfp8 量化块（格式不变量；model_spec.quant_block）
+N_HEADS, HEAD_DIM, ROPE_DIM = 64, 512, 64      # 主注意力头数 / head_dim / rope 宽
+Q_LORA, O_LORA, O_GROUPS = 1280, 1024, 8
+BS = 128                 # attention page / 压缩块（model_spec.block_size）
+KV_ROW_W = 544           # 窗口池行宽（head_dim + scale）
+CMP_ROW_W = 320          # 压缩池行宽
+
+# ★ Phase 1.5（2026-10-24）：上下文探针钩子，由 runner 启动时注入 `runtime_probe.set_current`。
+#   None = 关闭（默认）。**只包算子实现体**（不含 run_op 的 packed 分派/CP 判断），
+#   否则 `batch.cu`/`batch.n_seqs` 这类框架读会被误算成每个 op 的依赖。
+PROBE_SET = None
+WIN_SLOTS = 384          # 持久窗口池槽位（= 3 × sliding_window）
+
+
+def _apply_spec(cfg=None, spec=None):
+    """按 model_spec 刷新模块级常量（启动时一次；运行期零开销）。
+
+    `cfg` 非空时顺便构建/校验 spec（strict=False：真正的 fail-fast 在 runner.main）。
+    """
+    import model_spec as _ms
+    s = spec or (_ms.set_spec(cfg, strict=False) if cfg is not None else _ms.get())
+    global EPS, BLOCK_K, N_HEADS, HEAD_DIM, ROPE_DIM, Q_LORA, O_LORA, O_GROUPS
+    global BS, KV_ROW_W, CMP_ROW_W, WIN_SLOTS
+    EPS = float(s.rms_norm_eps)
+    BLOCK_K = int(s.quant_block)
+    N_HEADS, HEAD_DIM, ROPE_DIM = int(s.n_attention_heads), int(s.head_dim), int(s.qk_rope_head_dim)
+    Q_LORA, O_LORA, O_GROUPS = int(s.q_lora_rank), int(s.o_lora_rank), int(s.o_groups)
+    BS = int(s.block_size)
+    KV_ROW_W = int(s.kv_row_width)
+    CMP_ROW_W = int(s.cmp_row_width)
+    WIN_SLOTS = int(s.win_pool_slots)
+    return s
+
+OPS = {}
+SKIP = {}
+# 隐式算子：配方里有（模型/对拍要计数），但执行侧由别的算子内部产生、不单独调用
+IMPLICIT = {"dyn_mx_quant"}
+
+_MEMDBG = os.environ.get("DS41M_MEMDBG")   # ★ host 优化：run_op 热路径不再查 env
+_ENV_DUMP_TENSORS = os.environ.get("DS41M_DUMP_TENSORS")   # 同上：逐算子 dump 目录（默认空）
+# ★ 2026-10-23 显存优化：mqsmla 后释放 st["q"]、wo_a 后释放 st["attn_out"]。
+#   有逐算子 dump/digest/stats/nan-trace 时自动禁用（它们还要读这些键）。
+# ★ 2026-10-30（C4）：**默认开**（PERF_RULES §0：显存→避免 OOM 也算性能）。
+#   实现只是把 `st["q"] / st["attn_out"]` 用完后置 None（零算力成本，纯提前释放），
+#   有 dump/digest/stats/nan-trace 时自动禁用（它们还要读这些键）。
+#   kill switch：`DS41M_RELEASE_Q_ATTN=0`。
+_ENV_RELEASE_Q_ATTN = (
+    os.environ.get("DS41M_RELEASE_Q_ATTN", "1").strip().lower() not in ("0", "off", "false", "no")
+    and not any(os.environ.get(_k) for _k in (
+        "DS41M_DUMP_OPS", "DS41M_OP_DIGEST", "DS41M_STATS", "DS41M_DUMP_SLICE",
+        "DS41M_DUMP_TENSORS", "DS41M_NAN_TRACE")))
+
+# ★ 2026-10-18 host 优化：热路径里的 import / `torch.ops.*` 属性解析提到模块级缓存
+#   （逐算子 Python 路径上，40 层 × 多算子累计的 host 开销可观；见 NOTES 的 host 账本）
+_D41_NS = None
+
+# ★ 2026-10-23 CP（Step 2）：runner 每次 forward 设置；默认 None = 原 cp1 路径零变化。
+#   只在 prefill 用（decode 仍走原路径）。
+CP_STATE = None
+
+
+def set_cp_state(cp) -> None:
+    global CP_STATE
+    CP_STATE = cp
+
+
+def _cp_of(ctx):
+    """只有 prefill 且 CP 已设置才返回 CpState；decode 一律 None。
+
+    `ctx["_cp_full"]` = CP 内部的全长复算（压缩器/K 缓存在 gather 后的全局 hidden 上
+    跑）——此时按 CP=1 处理，避免递归再 gather。
+    """
+    cp = CP_STATE
+    if cp is None or bool((ctx or {}).get("is_decode_step")):
+        return None
+    if bool((ctx or {}).get("_cp_full")):
+        return None
+    return cp
+
+
+# ★ 2026-10-28（P0 尾段 host 优化）：`DS41M_HOST_OPT=0` 回退到改动前行为，只用于 A/B 归因。
+#   P0-1 = `_mqsmla` 里那行无用的阻塞 `.item()`；P0-2 = 6 处零/一张量改 `_meta` 缓存。
+_HOST_OPT = os.environ.get("DS41M_HOST_OPT", "1").strip().lower() in (
+    "1", "on", "true", "yes")
+
+# ★ 2026-10-28：CP 的 KV all-gather 侧流预取（见 `_rope` / `_kv_epilog` 注释）。
+#   `DS41M_CP_KV_PREFETCH=0` 回退成 kv_epilog 内同步 gather（数值同样逐位不变）。
+_CP_KV_PREFETCH = os.environ.get("DS41M_CP_KV_PREFETCH", "1").strip().lower() in (
+    "1", "on", "true", "yes")
+_CP_KV_PRE_ERR = [0]
+
+
+def _launch_cp_kv_gather(st, ctx, cp) -> None:
+    """在侧流发起本层 KV 的 all-gather，句柄挂 `st["_cp_kv_pre"]`（`_kv_epilog` 消费）。"""
+    kv = st.get("kv")
+    if not isinstance(kv, torch.Tensor) or kv.dim() < 2:
+        return
+    try:
+        kv2 = kv.view(-1, ctx["head_dim"])
+        if int(kv2.shape[0]) != int(cp.local_rows):
+            return
+        out, ev = cp.merge_global_async(kv2, buf_key="kv_epilog")
+    except Exception as exc:                       # noqa: BLE001
+        _CP_KV_PRE_ERR[0] += 1
+        if _CP_KV_PRE_ERR[0] <= 3:
+            print(f"  ⚠️ [cp-kv-prefetch] 关闭（{type(exc).__name__}: {exc}）", flush=True)
+        return
+    st["_cp_kv_pre"] = (out, ev, kv, cp)
+
+
+def _d41():
+    global _D41_NS
+    if _D41_NS is None:
+        _D41_NS = torch.ops.cann_ops_transformer.ds41
+    return _D41_NS
+
+
+_TOPK_GATE_FN = None
+
+
+def _topk_gate_fn():
+    global _TOPK_GATE_FN
+    if _TOPK_GATE_FN is None:
+        from tile_kernels.moe import moe_topk_gate as _f
+        _TOPK_GATE_FN = _f
+    return _TOPK_GATE_FN
+
+
+def ensure_ops(cfg=None):
+    """加载 vendor 命名空间（**必须在用之前**：torch.ops.custom 的属性是 import 时才注册的）。
+
+    实测本机：custom 32 个、cann_ops_transformer 85 个、ds41 子组 11 个、cann_ops_nn 20 个。
+    """
+    import importlib
+    # 实测（tools/probe_ds41_ns.py，4 个变体）：**只 import `cann_ops_transformer` 即可**
+    # （它自己会注册 ds41 组 11 个算子）；再显式 import `cann_ops_transformer_experimental`
+    # 或给它塞 stub shim，都会让 ds41 组变成 0 个（indexer/mqsmla 全丢）。
+    for m in ("custom_ops", "cann_ops_transformer", "cann_ops_nn"):
+        try:
+            importlib.import_module(m)
+        except Exception as exc:                    # noqa: BLE001
+            print(f"  [exec_ops] 警告：import {m} 失败：{type(exc).__name__}: {exc}")
+    ops = getattr(torch, "ops", None)
+    for ns in ("custom", "cann_ops_transformer", "cann_ops_nn"):
+        n = len([x for x in dir(getattr(ops, ns)) if not x.startswith("_")]) if hasattr(ops, ns) else 0
+        print(f"  [exec_ops] torch.ops.{ns}: {n} 个算子")
+    # ★ 2026-10-26（A4）：cannbotdsl ABI 契约缓存（默认开，纯 host，数值零影响）。
+    #   依据：`CallContract.runtime_parameters/.abi_arguments` 是普通 @property，每次访问重建 tuple，
+    #   而 `parameter_lowering.bind_physical` 在 for 循环里逐参数访问 ⇒ O(n²)。
+    #   实测 244 invoke/4 forward 对应 11352 次 abi_arguments；CPU 微基准 195 µs/invoke。
+    #   详见 ops/fast_abi.py 文件头 + NOTES/2026-10-26-a4-deepinfer-host.md。
+    try:
+        import fast_abi as _fast_abi            # ops/ 在 sys.path（与 exec_indexer 等同目录导入）
+    except Exception:                           # noqa: BLE001
+        try:
+            from ops import fast_abi as _fast_abi
+        except Exception:                       # noqa: BLE001
+            _fast_abi = None
+    if _fast_abi is not None and _fast_abi.install():
+        print("  [exec_ops] cannbotdsl ABI 契约缓存已启用（DS41M_FAST_ABI=0 可关）")
+    _load_plugins(cfg)                 # 插件在拿到 cfg 之后再加载（engram 要用配置里的表规模）
+    set_kv_manager(cfg)                # KV 管理单例（池分配/寻址几何）
+
+
+# 注：SwiGLU 截断（`activation_clamp=moe.swiglu_limit`=10.0，官方 deepgemm_backend.py:212/263）
+# 现在由 exec_moe.py 自己传（`ctx["swiglu_limit"]`，runner.py 的 ctx 里写入）——
+# 之前我在这里用 monkeypatch 兜过，已撤掉，避免两处重复。
+
+
+def op(key):
+    def deco(fn):
+        OPS[key] = fn
+        return fn
+    return deco
+
+
+def skip(key, why):
+    SKIP[key] = why
+
+
+# ─────────────────── 权重打包（合成/真实共用；对齐官方 process_weights_after_loading）──
+def reshape_mx_scale(scale):
+    """官方 module/quantization/utils/quant_utils.py:50：末维配对（奇数补 0）。（本文件不再用，留作参考。）"""
+    n = scale.size(-1)
+    if n % 2:
+        pad = torch.zeros((*scale.shape[:-1], 1), dtype=scale.dtype, device=scale.device)
+        scale = torch.cat((scale, pad), dim=-1)
+        n += 1
+    return scale.view(*scale.shape[:-1], n // 2, 2)
+
+
+def pack_qmm(w, ws, is_nz=True):
+    """mxfp8 线性层权重打包 —— 逐字对齐官方 mxfp8.py:184 process_weights_after_loading。
+
+    权重 [N,K]→[K,N]（+ NZ）；scale 先按末维配对再 transpose(0,1)（官方同时做这两步，
+    漏掉会导致 npu_quant_matmul 报 "x2 tensor and scale tensor's transpose are not same"）。
+    """
+    w = w.transpose(-2, -1)                                  # [N,K] → [K,N]
+    ws = reshape_mx_scale(ws).transpose(0, 1)                # [N,K/32] → [K/64,N,2]
+    if is_nz:
+        w = torch_npu.npu_format_cast(w.contiguous(), 29)    # 29 = NZ
+        ws = ws.contiguous()
+    return w, ws
+
+
+def pack_wo_a(w, ws, o_groups=None, o_lora=None, head_dim_per_group=None, is_nz=True):
+    """wo_a 专用打包（官方 modeling_deepseek.py:2653 逐字）：
+
+    `o_groups/o_lora/head_dim_per_group` 缺省 None → 取 `_apply_spec` 刷新后的模块全局
+    （值 = 旧硬编码 8/1024/4096），换模型结构时只改 config。
+
+        w.view(-1, o_lora_rank, head_dim_per_group).transpose(1, 2).contiguous()
+        scale: reshape_mx_scale → view(-1, o_lora, *rest).transpose(1,2).contiguous()
+
+    [8192,4096] → [8,1024,4096] → [8,4096,1024]（+NZ）；scale → [8,64,1024,2]
+    —— trace 里 TransposeQuantBatchMatMul 的 x2 形状 `8,32,256,16,32 / 8,64,1024,2` 正是这个 ✓
+    """
+    o_groups = int(o_groups or O_GROUPS)
+    o_lora = int(o_lora or O_LORA)
+    head_dim_per_group = int(head_dim_per_group or (N_HEADS * HEAD_DIM // max(1, o_groups)))
+    w = w.view(-1, o_lora, head_dim_per_group).transpose(1, 2).contiguous()
+    ws = reshape_mx_scale(ws)
+    ws = ws.view(-1, o_lora, *ws.shape[1:]).transpose(1, 2).contiguous()
+    if is_nz:
+        w = torch_npu.npu_format_cast(w, 29)
+    return w, ws
+
+
+# ─────────────────── 通用 ───────────────────
+@op("rmsnorm")
+def _rmsnorm(st, ctx, w):
+    """官方 common_modules.py:222（DeepseekV41RMSNorm）。权重按阶段选：attn_norm / ffn_norm。"""
+    name = st.get("_norm_stage", "attn")
+    wt = w[f"{'attn' if name == 'attn' else 'ffn'}_norm.weight"]
+    st["x"] = torch_npu.npu_rms_norm(st["x"], wt, EPS)[0]
+
+
+_CP_PAD_CACHE: dict = {}
+
+
+def _cp_ref_pad(x2d, ctx, min_pad: int = 512):
+    """CP：`npu_quant_matmul` 的 M 分块等价类（NOTES/2026-10-22-qmm-shape-sensitivity.md）。
+
+    本地行数 <512（CP8@1024 的 128 行）时 qmm 走小 M 分块：尾部行与参考 M（=全长
+    total_q）**不逐位相同**（单算子实测 46/163840 个元素不同、max=4096，源自行级
+    mxfp8 scale 的选取差异）。把本地行放到参考 M 缓冲的**尾部**、前端零补，实测尾部
+    与参考逐位一致（tmp/qmm_ref1024.py：pad128→256/512/1024 全 equal）。
+
+    默认只在小 M 触发（local<512 ⇒ total_q<512*CP≤4096，补到 total_q 代价可忽略）。
+    调用方可用 `min_pad` 放宽阈值：
+      · qmm 默认 512（≥512 与任意大参考同分块类）；
+      · `indexer_prologue_qw` 的 `w` 输出用 4096（NOTES/2026-10-22：M≤2048 与全长不同，
+        补到 4096/8192 才匹配 ≥12288 的参考）。
+    """
+    _cp = _cp_of(ctx)
+    if _cp is None:
+        return x2d, 0
+    T = int(x2d.shape[0])
+    # ★ 参考 M = **当前 CP 计划的全局行数**：全量段 = L；compact 段 = 保留宽度
+    #   （与 CP1 非 CP 拆分在该段的 M 口径一致——CP1 compact 就是按 512/140 跑的）。
+    ref = min(8192, int(_cp.plan.total_q))
+    if T >= int(min_pad) or ref <= T:
+        return x2d, 0
+    key = (tuple(x2d.shape[1:]), x2d.dtype, str(x2d.device))
+    d = _CP_PAD_CACHE.get(key)
+    if d is None or int(d["cap"]) < ref:
+        cap = max(ref, 512)
+        d = {"cap": cap,
+             "x": torch.zeros((cap, *x2d.shape[1:]), dtype=x2d.dtype,
+                              device=x2d.device)}
+        _CP_PAD_CACHE[key] = d
+    buf = d["x"][:ref]
+    buf[: ref - T].zero_()                 # 前端补零区（含跨 pass 残值）
+    buf[ref - T:].copy_(x2d)
+    return buf, T
+
+
+_HC_PAD_CACHE: dict = {}
+
+
+def _hc_pad_buffers(padM, x, pmix):
+    """hc_pre 零补缓冲：**模块级常驻**（地址稳定，层 20 入图后图里录的地址跨 pass 有效）。
+
+    一个进程按 (x 形状, dtype, pmix dtype, device) 只开一块 cap=max(padM, 8192) 行；
+    按 padM 取前缀切片（data_ptr 不变）。前端补零区由调用方每次 `zero_()`。
+    """
+    shape = tuple(x.shape[1:])
+    key = (shape, x.dtype, pmix.dtype, str(x.device))
+    d = _HC_PAD_CACHE.get(key)
+    if d is None or int(d["cap"]) < int(padM):
+        cap = max(int(padM), 8192)
+        d = {"cap": cap,
+             "x": torch.zeros((cap, *shape), dtype=x.dtype, device=x.device),
+             "pm": torch.zeros((cap, int(pmix.shape[-1])), dtype=pmix.dtype,
+                               device=pmix.device)}
+        _HC_PAD_CACHE[key] = d
+    return d["x"][:int(padM)], d["pm"][:int(padM)]
+
+
+# ★ 2026-10-26（T-062）：hc_pre 的 [T,M,H] 常驻缓冲 + 展开源直写（见 `_hc_pre` 注释）。
+# ★ 2026-10-26（T-063）：压缩池 slot 的点位不变量缓存（见 `_kv_compress_pk` 注释）。
+_ENV_CMP_SLOT_CACHE = os.environ.get(
+    "DS41M_CMP_SLOT_CACHE", "1").strip().lower() in ("1", "on", "true", "yes")
+_CMP_SLOT_CACHE: dict = {}
+
+_ENV_HC_XREUSE = os.environ.get(
+    "DS41M_HC_XREUSE", "1").strip().lower() in ("1", "on", "true", "yes")
+_HC_X_CACHE: dict = {}
+
+
+def _hc_xbuf(x2d, T, M, H):
+    """把 [T,H] 展开成 [T,M,H] 写进**常驻**缓冲（同形复用，避免每层 2.6 GB 分配+拷贝）。"""
+    key = (int(T), int(M), int(H), x2d.dtype, str(x2d.device))
+    buf = _HC_X_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty((int(T), int(M), int(H)), dtype=x2d.dtype, device=x2d.device)
+        _HC_X_CACHE.clear()
+        _HC_X_CACHE[key] = buf
+    buf.copy_(x2d.unsqueeze(1))          # copy_ 自带广播：等价于 expand(...).contiguous()
+    return buf
+
+
+@op("hc_pre")
+def _hc_pre(st, ctx, w):
+    """官方 op_impls/mhc.py:59 → torch.ops.custom.npu_hc_pre_v2。x:[T,hc_mult,H]。"""
+    T, H, M = st["x"].shape[0], ctx["H"], ctx["hc_mult"]
+    # 官方 hc_pre 吃 [T, hc_mult, H]：hc_mult 份拷贝（官方在 mhc 模块里展开）
+    # ★ 2026-10-26（T-062）：**不再物化** [T,M,H]。原来 `expand(...).contiguous()` 每层新建一块
+    #   [T,M,H]（256k 时 62914×4×5120×2B = **2.6 GB**），紧接着 pad 路径又把它整块 copy_ 进
+    #   `_hc_pad_buffers` 的常驻缓冲 ⇒ **每层两次 2.6 GB 拷贝 + 一次大分配**。256k 的 trace 里
+    #   HcPre 前有 4.8 ms/次的 gap（74 次 = 空泡的 64%）。
+    #   现在：pad 路径直接以**展开视图**为源写进常驻缓冲（copy_ 支持广播源，值完全相同）；
+    #   非 pad 路径按 (T,M,H,dtype,device) 复用一块常驻缓冲再 copy_。两者都逐位不变。
+    #   kill switch：`DS41M_HC_XREUSE=0`。
+    _xcache = None
+    if st["x"].dim() == 2:
+        if _ENV_HC_XREUSE:
+            _xcache = _hc_xbuf(st["x"], T, M, H)
+            x = _xcache
+        else:
+            x = st["x"].unsqueeze(1).expand(T, M, H).contiguous()
+    else:
+        x = st["x"]
+    stage = st.get("_norm_stage", "attn")        # attn / ffn 各有一套 hc 权重
+    # ★ T-042 兜底：ffn 段入口再清一次 quant 去重缓存（正常已在 attn 段 hc_post 清空；
+    #   这条防的是 ffn 段里自己调 _qmm 的路径——decode 的 _shared_expert——把缓存带到下一步）。
+    if _ENV_QD and stage == "ffn":
+        _QD_N["hit"] = _QD_N["miss"] = 0
+        quant_dedupe_reset()
+    pm = st.get("hc_pre_t")                      # 第二次调用用第一次返回的 pre（官方 pre_mix=attn_pre）
+    # ★ pre_mix 口径（官方 make_identity_pre_mix，op_impls/mhc.py:31-36）：
+    #   层内第一次 hc_pre 的 pre_mix = **上一层 ffn 段 hc_pre 返回的 pre**（modeling_deepseek.py:2311
+    #   `hidden_states, pre_mix = self._run_decoder_layer(...)`，逐层往下传）；
+    #   只有**层 0** 用 make_identity_pre_mix = **独热**（pre_mix[:, 0] = 1），不是 1/M 均匀！
+    if pm is None:
+        pm = _hold(st).get("_ffn_pre")
+    if pm is None:
+        pre_mix = torch.zeros((T, M), dtype=torch.float32, device=x.device)
+        pre_mix[:, 0] = 1.0
+    _pmix = pre_mix if pm is None else pm
+    # ★ 2026-10-22（层 20 边界拆分）：`npu_hc_pre_v2` 的 post/comb/pre 也**按 M 分块**
+    #   （y 不受影响）。实测 M=140/512…4096 与全长尾部的 post/comb 逐位不同，
+    #   而把输入零补到 M=8192 后，最后 140/512 行与任意参考 M（12288/16384/20000/
+    #   32768）**逐位相同**（hc_ab/tile2.log）。边界 compact 段 ctx 带 `hc_pad_ref`，
+    #   这里补零到该宽度再取尾部 → 与未拆分的全长基线逐位一致。
+    _refM = int(ctx.get("hc_pad_ref") or 0)
+    _capM = int(ctx.get("hc_pad_cap") or 0)
+    _padM = 0
+    if _refM > 0:
+        _padM = _refM if (_capM <= 0 or _refM <= _capM) else _capM
+    if _padM > T:
+        # ★ 模块级常驻缓冲（**不能**放 st/shared）：层 20 compact 段要入 ACL graph，
+        #   图里录的是地址；points 模式每 pass 新建 shared，放 shared 会每 pass 换址。
+        #   一个进程固定一块 cap=8192 行缓冲，按 padM 取前缀切片（地址稳定）。
+        #   前端补零区每次显式 `zero_()`（内容不参与尾部计算，但保持"零补"口径）。
+        _bx, _bp = _hc_pad_buffers(_padM, x, _pmix)
+        _bx[: _padM - T].zero_()
+        _bp[: _padM - T].zero_()
+        # ★ T-062：直接以**展开视图**为源写常驻缓冲（copy_ 支持广播），省掉中间那次
+        #   [T,M,H] 物化——256k 时那是 2.6 GB/层。
+        _bx[_padM - T:].copy_(st["x"].unsqueeze(1) if (_ENV_HC_XREUSE and st["x"].dim() == 2) else x)
+        _bp[_padM - T:].copy_(_pmix)
+        x, _pmix = _bx, _bp
+    y, post, comb, pre = torch.ops.custom.npu_hc_pre_v2(
+        x=x, hc_fn=w[f"hc_{stage}_fn"], hc_scale=w[f"hc_{stage}_scale"],
+        hc_base=w[f"hc_{stage}_base"],
+        pre_mix=_pmix, hc_mult=M,
+        hc_sinkhorn_iters=ctx["hc_sinkhorn_iters"],
+        norm_eps=EPS, hc_eps=ctx["hc_eps"])
+    if _padM > T:
+        y, post, comb, pre = y[-T:], post[-T:], comb[-T:], pre[-T:]
+    # 诊断（DS41M_HC_DUMP=1）：落盘 hc_pre 的输入/权重/输出，离线做 M 形状扫描
+    #   （npu_quant_matmul 之外，npu_hc_pre_v2 也可能对 M 分块敏感）。
+    if (_oenv("DS41M_HC_DUMP", "").strip().lower() in ("1", "on", "true", "yes")
+            and stage == "ffn"
+            and int(ctx.get("idx", -1)) == int(_oenv("DS41M_HC_DUMP_LAYER", "20"))):
+        try:
+            _dd = "/mnt/xds/sfs/l00972766/tmp/hc_ab"
+            os.makedirs(_dd, exist_ok=True)
+            torch.save({"x": st["x"].detach().cpu(), "pre_mix": _pmix.detach().cpu(),
+                        "fn": w[f"hc_{stage}_fn"].detach().cpu(),
+                        "scale": w[f"hc_{stage}_scale"].detach().cpu(),
+                        "base": w[f"hc_{stage}_base"].detach().cpu(),
+                        "y": y.detach().cpu(), "post": post.detach().cpu(),
+                        "comb": comb.detach().cpu(), "pre": pre.detach().cpu(),
+                        "M": M, "iters": ctx["hc_sinkhorn_iters"],
+                        "eps": EPS, "hc_eps": ctx["hc_eps"]},
+                       os.path.join(_dd, f"L{int(ctx.get('idx'))}_ffn.pt"))
+            print(f"      [hc-dump] L{ctx.get('idx')} ffn T={T} → {_dd}", flush=True)
+        except Exception as _de:                        # noqa: BLE001
+            print(f"      [hc-dump] 失败: {_de}", flush=True)
+    st["hc_post_t"] = (post, comb)
+    st["hc_pre_t"] = pre
+    if stage == "ffn":                           # ffn 段的 pre 要传给**下一层**的第一次 hc_pre
+        _hold(st)["_ffn_pre"] = pre
+    if _oenv("DS41M_DEBUG"):
+        print(f"      [hc_pre:{stage}] x={tuple(st['x'].shape)} y={tuple(y.shape)} "
+              f"post={tuple(post.shape)} comb={tuple(comb.shape)} pre={tuple(pre.shape)}", flush=True)
+    st["x"] = y.reshape(T, H)
+
+
+@op("hc_post")
+def _hc_post(st, ctx, w):
+    """官方 op_impls/mhc.py:68 → torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)。
+
+    ★ 残差流语义（官方 modeling_deepseek.py:1595/1605/1608/1622）：
+        residual = hidden_states            ← 层输入，**只给 attn 段 hc_post 用**
+        ... attn 段 hc_post ...
+        residual = hidden_states            ← ★ attn 段 hc_post 之后 residual 更新为它的输出，
+                                              它是 ffn 段 hc_post 的 residual！
+    所以 st["residual"] 必须在 attn 段 hc_post 之后刷新；否则 ffn 段 hc_post 拿层输入当残差，
+    层输出整体错（实测 layer 0 rel_fro 0.42 —— 这是 0.49 的主因）。
+    """
+    residual, x = st["residual"], st["x"]
+    post, comb = st["hc_post_t"]
+    stage = st.get("_norm_stage", "attn")
+    # ★ T-042：attn 段 hc_post = 注意力块结束（wq_a/wq_b/wkv/wo_b 都跑完了）→ 在这里放掉
+    #   层内 quant 缓存，**进 MoE 之前**就清干净（qr/o_lora 的 fp8 副本不跨 MoE 常驻；
+    #   256K@60 那一份 ≈0.35 GiB，正好压在 48 GiB 墙上）。
+    #   复用窗口不受影响：wq_a→wkv 都在 ①~② 段内，见 recipes.yaml:common。
+    if _ENV_QD and stage == "attn":
+        if _QD_STATS and (_QD_N["hit"] or _QD_N["miss"]):
+            print(f"      [qd] L{ctx.get('idx')} hit={_QD_N['hit']} miss={_QD_N['miss']} "
+                  f"held={len(_QD_CACHE)} slots={_QD_SLOTS}", flush=True)
+        _QD_N["hit"] = _QD_N["miss"] = 0
+        quant_dedupe_reset()
+    M = ctx["hc_mult"]
+    T, H = x.shape[0], ctx["H"]
+    # 官方 op_impls/mhc.py:68：mhc_post(x=residual, hRes=comb, hOut=hidden, hPost=post)
+    # 实测 aclnn 约束：x 要 3D 且 dim[1] == hRes.dim[1] == hc_mult；hOut 要 2D。
+    # comb 是 [T,4,4] → residual 走 [T, hc_mult, H]（N=hc_mult 的 TND）。
+    backend = ((st.get("_backends") or {}).get("hc_post") or "ascendc")
+    if backend == "tilelang":
+        # 官方 op_impls/mhc_tilelang.py:27（参考配置用的就是这条）：
+        #   mhc_post_fwd(x[1,T,M,H], residual[1,T,M,H], post[1,T,M,1], comb[1,T,M,M])
+        from tile_kernels.mhc import mhc_post_fwd
+        # 契约（tile_kernels/mhc/post_kernel.py:10-23 的 assert）：
+        #   residual = [num_seqs=1, T, mhc, H]（4D）；**x = [1, T, H]（3D）**；
+        #   post = [1,T,mhc,1] fp32；comb = [1,T,mhc,mhc] fp32 —— 之前把 x 也扩成 4D ✗
+        r4 = (residual.unsqueeze(1).expand(T, M, H).contiguous()
+              if residual.dim() == 2 else residual.contiguous()).unsqueeze(0)
+        x3 = (x.unsqueeze(1).expand(T, M, H).contiguous()
+              if x.dim() == 3 else x.contiguous()).unsqueeze(0)
+        y = mhc_post_fwd(x3, r4, post.reshape(1, -1, M, 1).contiguous(),
+                         comb.reshape(1, -1, M, M).contiguous())[0]
+        if _oenv("DS41M_DEBUG"):
+            print(f"      [hc_post/tilelang] x{tuple(x.shape)} r{tuple(residual.shape)} "
+                  f"→ y{tuple(y.shape)}", flush=True)
+        st["x"] = y
+        if stage != "ffn":                 # attn 段：residual 刷新为本次输出（见上）
+            st["residual"] = y
+        return
+    r3 = residual.unsqueeze(1).expand(T, M, H).contiguous() if residual.dim() == 2 else residual
+    y = torch.ops.cann_ops_transformer.mhc_post(r3, comb, x, post)
+    # 层间 hidden 就是 [T, hc_mult, H]（官方 hc_pre 的输入签名如此；aclnn 也要求第 1 参 3D）。
+    # 只有**最后一层之后**才用 hc_pre_mix(最后一层的 ffn pre) 塌缩成 [T,H] 再过 norm/head。
+    st["x"] = y
+    if stage != "ffn":                     # attn 段：residual 刷新为本次输出（见上）
+        st["residual"] = y
+
+
+def _fmt(t):
+    try:
+        return torch_npu.get_npu_format(t)
+    except Exception:                                   # noqa: BLE001
+        return "?"
+
+
+# ── T-042（host 瘦身①）共用小工具：contiguous / dtype 短路 ──────────────────
+#   依据：NOTES/2026-10-26-deepinfer-host-study.md 可照搬项①（层内零分配/零拷贝）。
+#   注：PyTorch 对**已连续**的张量 `.contiguous()` 本来就返回 self（同 dtype 的 `.to()`
+#   同理），所以这里不是省一次复制，而是把"这次到底有没有复制"写在代码里，
+#   防止上游布局一变就悄悄多出一次全量拷贝（trace 里 `aten::clone` = 60 次/forward）。
+def _contig(t):
+    """连续则原样返回，否则才复制（T-042 第 2 项）。"""
+    return t if t.is_contiguous() else t.contiguous()
+
+
+def _as_dtype(t, dt):
+    """dtype 已相同则原样返回，否则才转换（T-042 第 2 项）。"""
+    return t if t.dtype == dt else t.to(dt)
+
+
+# ★ 2026-10-26（T-042，移植 T-027）：`wq_a` 与 `wkv` 在**同一层、同一份 `st["x"]`** 上
+#   各调一次 `_qmm`，而 `_qmm` 内部无条件跑 `npu_dynamic_mx_quant` ⇒ 每层把 [T,5120]
+#   白量化一遍（recipes.yaml:attn_core 的 wq_a → q_norm → wq_b → wkv，中间没人改
+#   `st["x"]`：q_norm 只写 `st["qr"]`、wq_b 只写 `st["q"]`）。量化族已贴 HBM 峰值
+#   ⇒ 只能"少做一次"。这里把 quant 结果按 (data_ptr, dtype, shape, device) 缓存在**层内**，
+#   第二个消费者直接复用 (xq, xs)。
+#
+#   逐位前提（两条，缺一不可）：
+#     ① `npu_dynamic_mx_quant` 是纯函数（同输入同输出），`npu_quant_matmul` 只读 xq/xs；
+#     ② 缓存项只被**同层 + 同一个源张量对象**命中。data_ptr 会被 allocator 复用
+#        （同址的新张量），只看指针有逐位风险 ⇒ 命中还要求对象身份 `is`；
+#        层号 `ctx["idx"]` 再挡住跨层（层边界直接清空，不让大张量跨层常驻）。
+#   `_cp_ref_pad` 会换张量（把本地行拷进参考 M 缓冲）：键取 **pad 前**的源张量，
+#   值里连 pad 后的张量与 `_padT` 一起存，命中时原样恢复（下游行为逐字节不变）。
+#   清空点：**attn 段 hc_post**（= wo_b 之后、MoE 之前；qr/o_lora 的 fp8 副本不跨 MoE 常驻）
+#   + ffn 段 hc_pre 兜底（防 decode 的 _shared_expert 把缓存带到下一步）。
+#
+#   默认 **1（开）**（PERF_RULES §0：性能开关默认开；A/B 见 T-027 笔记）。
+_ENV_QD = os.environ.get("DS41M_QUANT_DEDUPE", "1").strip().lower() in ("1", "on", "true", "yes")
+_QD_SLOTS = max(1, int(os.environ.get("DS41M_QUANT_DEDUPE_SLOTS", "2") or 2))
+_QD_STATS = os.environ.get("DS41M_QUANT_DEDUPE_STATS", "").strip().lower() in (
+    "1", "on", "true", "yes")
+# key → [层号, 源张量(pad 前), pad 后张量, xq, xs, padT]；dict 保插入序 → 淘汰最旧
+_QD_CACHE: dict = {}
+_QD_N = {"hit": 0, "miss": 0}
+
+
+def quant_dedupe_reset() -> None:
+    """放掉层内缓存的 (xq, xs)（attn 段 hc_post / ffn 段 hc_pre 调用）。"""
+    _QD_CACHE.clear()
+
+
+def _qd_layer(ctx) -> int:
+    return int(ctx.get("idx", -1)) if isinstance(ctx, dict) else -1
+
+
+def _qmm(x2d, w_name, w, ctx, bias=None):
+    """mxfp8 量化矩阵乘（官方 mxfp8.py:166）：DynamicMxQuant + npu_quant_matmul。"""
+    # ★ CP（Step 2）：小 M 的 qmm 分块类与全长参考不同 → 尾部零补到参考 M，
+    #   结果再取尾部（见 `_cp_ref_pad`）。CP=1 / 大 L 无行为变化。
+    # ★ T-042：层内 quant 去重（wq_a → wkv 复用同一次 npu_dynamic_mx_quant）。
+    _hit = False
+    if _ENV_QD:
+        _li = _qd_layer(ctx)
+        _k = (int(x2d.data_ptr()), x2d.dtype, tuple(x2d.shape), str(x2d.device))
+        _e = _QD_CACHE.get(_k)
+        if _e is not None and _e[0] == _li and _e[1] is x2d:
+            _hit = True
+            _, _, x2d, xq, xs, _padT = _e
+        elif _e is not None and _e[0] != _li:
+            quant_dedupe_reset()        # 层边界：立刻放掉上一层的 xq/xs
+        _QD_N["hit" if _hit else "miss"] += 1
+    if not _hit:
+        _src = x2d
+        x2d, _padT = _cp_ref_pad(x2d, ctx)
+        xq, xs = torch_npu.npu_dynamic_mx_quant(x2d, dst_type=torch.float8_e4m3fn)
+        if _ENV_QD:
+            while len(_QD_CACHE) >= _QD_SLOTS:
+                _QD_CACHE.pop(next(iter(_QD_CACHE)), None)      # 淘汰最旧的一项
+            _QD_CACHE[_k] = [_li, _src, x2d, xq, xs, _padT]
+    W, WS = w["_packed"][w_name]
+    y = torch_npu.npu_quant_matmul(
+        xq, W, WS, pertoken_scale=xs, bias=bias, output_dtype=torch.bfloat16,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        pertoken_scale_dtype=torch_npu.float8_e8m0fnu, group_sizes=[1, 1, BLOCK_K])
+    if _padT:
+        y = y[-_padT:].contiguous()
+    if _oenv("DS41M_DEBUG"):
+        print(f"      [qmm {w_name.split('.')[-2]}]: x_fmt={_fmt(x2d)} xq_fmt={_fmt(xq)} "
+              f"W_fmt={_fmt(W)} WS_fmt={_fmt(WS)} y_fmt={_fmt(y)} "
+              f"y_contig={int(y.is_contiguous())} y_shape={tuple(y.shape)}", flush=True)
+    return y
+
+
+@op("wq_a")
+def _wq_a(st, ctx, w):
+    st["qr"] = _qmm(st["x"], "attn.wq_a.weight", w, ctx)
+
+
+@op("q_norm")
+def _q_norm(st, ctx, w):
+    """q_norm 作用在 q_lora 上（官方 modeling: 对 1280 维做 rmsnorm）。"""
+    st["qr"] = torch_npu.npu_rms_norm(st["qr"], w["attn.q_norm.weight"], EPS)[0]
+
+
+@op("wq_b")
+def _wq_b(st, ctx, w):
+    q = _qmm(st["qr"], "attn.wq_b.weight", w, ctx)
+    st["q"] = q.view(-1, N_HEADS, HEAD_DIM)
+
+
+@op("wkv")
+def _wkv(st, ctx, w):
+    st["kv"] = _qmm(st["x"], "attn.wkv.weight", w, ctx)
+
+
+@op("kv_norm")
+def _kv_norm(st, ctx, w):
+    st["kv"] = torch_npu.npu_rms_norm(st["kv"], w["attn.kv_norm.weight"], EPS)[0]
+
+
+# ★ 2026-10-26（T-020 P1 / T3）：packed 的 (cos, sin) 每层做 2 次 index_select
+#   （trace 实测 19.3 µs/次 × 160 次/forward ≈ 3.1 ms），wo_a 的 `-sin` 每次现造
+#   （17.5 µs × 40 ≈ 0.7 ms）。位置表 loc 在同一 forward 的 40 层是同一个对象 →
+#   按对象身份缓存。
+#   ★ T-042：按 PERF_RULES §0 把默认从 0 翻成 **1**（T-020 eager A/B 实测 −2.1 ms@64k97；
+#   逐位由 T-042 的 digest A/B 复核：L0/1/2/20 + 末行，64k@0.97 与 256k@0.60 各一遍）。
+#   安全前提：`batch.local_positions` 的返回是 `_CACHE` 里**只读复用**的同一个对象
+#   （key = cu/T/off/offs/device），本文件所有使用者都不原地改 loc。
+_ROPE_TBL_ON = os.environ.get("DS41M_ROPE_TBL_CACHE", "1").strip().lower() in (
+    "1", "on", "true", "yes")
+_ROPE_TBL_CACHE: dict = {}
+_ROPE_TBL_MAX = 2
+_NEG_SIN_CACHE: dict = {}
+# ★ 2026-10-28（P0-4）：CP 段的 cos/sin **按位置 gather 后的表**缓存。
+#   同一 stage 的 40 层 cp_abs 相同，但以前每层每处都重发 2 个 index_select
+#   （rope 80 次/pass = 160 个内核）。`DS41M_CP_POS_CACHE=0` 回退（A/B 归因）。
+_CP_POS_CACHE = os.environ.get("DS41M_CP_POS_CACHE", "1").strip().lower() in (
+    "1", "on", "true", "yes")
+_ROPE_CP_CACHE: dict = {}
+
+
+def _neg_sin(sin):
+    """缓存的 `-sin`（wo_a 逆 rope 用）；默认关时等价于 `-sin`。"""
+    if not _ROPE_TBL_ON:
+        return -sin
+    k = int(sin.data_ptr())
+    ent = _NEG_SIN_CACHE.get(k)
+    if ent is not None and ent[0] is sin:
+        return ent[1]
+    out = -sin
+    _NEG_SIN_CACHE.clear()
+    _NEG_SIN_CACHE[k] = (sin, out)
+    return out
+
+
+def _rope_tables(ctx, T, device):
+    """本段 T 行的 (cos, sin) —— **唯一实现**（正向 rope 与 wo_a 逆 rope 共用）。
+
+    ★ packed：每条序列的位置是**绝对位置**（请求内行号 + pos_offset），必须对
+      **全长表**（0..off+rows-1）gather。
+    ★★ 2026-10-21 修（packed hit 数值错的根因）：以前先用 start=off 把表切成
+      [off:off+T)，再按绝对位置 index_select → **越界**（NPU 不报错，静默读邻近显存）。
+      正向 rope 和 wo_a 的逆 rope 各有一份这种代码，修一处漏一处 → 收成一个函数。
+    ★ 单序列（无 cu）：仍走 [off:off+T] 切片，与历史逐位一致。
+    """
+    cp_pos = ctx.get("cp_positions")
+    if cp_pos is not None:
+        # CP：本地行是 head-tail 两块，位置不连续；按**绝对位置**对 full 表 gather。
+        # compact 段（层 20 截尾后）局部位置是 0..W-1，rope 要用绝对位置
+        # （cp_abs_positions = 局部 + pos_offset）。
+        cp_abs = ctx.get("cp_abs_positions")
+        if cp_abs is None:
+            cp_abs = cp_pos
+        n = int(ctx.get("cp_total_q") or ctx.get("L_full") or (int(cp_abs.max()) + 1))
+        cos, sin = _rope_cos_sin_step(n, ctx, device, 0)
+        # ★ 2026-10-28（P0-4）：gather 结果按 (表, 位置对象, n) 缓存；同 stage 40 层共用。
+        #   身份检查兜住 "data_ptr 被 allocator 复用" 的情况；表本身由 `_CS` 常驻。
+        if _CP_POS_CACHE and _ROPE_TBL_ON and not dg_on():
+            key = ("rope_cp", int(cos.data_ptr()), int(n), str(device),
+                   int(cp_abs.data_ptr()))
+            ent = _ROPE_CP_CACHE.get(key)
+            if ent is not None and ent[0] is cp_abs:
+                return ent[1]
+        out = (cos.index_select(0, cp_abs), sin.index_select(0, cp_abs))
+        if _CP_POS_CACHE and _ROPE_TBL_ON and not dg_on():
+            if len(_ROPE_CP_CACHE) >= _ROPE_TBL_MAX:
+                _ROPE_CP_CACHE.clear()
+            _ROPE_CP_CACHE[key] = (cp_abs, out)
+        return out
+    off = int(ctx.get("pos_offset", 0) or 0)
+    cu = batch_layout.cu_of(ctx)
+    if cu is None:
+        return _rope_cos_sin_step(T, ctx, device, off)
+    rows = max(cu[i + 1] - cu[i] for i in range(len(cu) - 1))
+    cos, sin = _rope_cos_sin_step(off + max(1, int(rows)), ctx, device, 0)
+    loc, _ = _packed_pos(ctx, T, device)
+    if loc is not None:
+        if _ROPE_TBL_ON:
+            # ★★ T-042 修（T-020 T3 的 bug，digest A/B 抓到）：key 必须包含**表本身**的
+            #   身份。win 层表（base=rope_theta=10000）与 comp 层表（base=compress_rope_theta
+            #   =160000 + YaRN）是 `_CS` 里两张不同的表，而它们共用同一个 `loc` 对象、
+            #   同样的 rows/off ⇒ 只按 (loc, rows, off) 做键会让 comp 层命中 win 层的表
+            #   （实测 64k@0.97：L0/1/2 一致、L20 与末行整段错，absmax 1.68e13→1.79e13）。
+            #   `_CS` 常驻持有表 ⇒ 不同表的 data_ptr 必然不同（不会被 allocator 复用）。
+            key = ("rope_pk", int(loc.data_ptr()), int(loc.shape[0]),
+                   int(rows), int(off), int(cos.data_ptr()), str(device))
+            ent = _ROPE_TBL_CACHE.get(key)
+            if ent is not None and ent[0] is loc:
+                return ent[1]
+        cos = cos.index_select(0, loc)
+        sin = sin.index_select(0, loc)
+        if _ROPE_TBL_ON:
+            if len(_ROPE_TBL_CACHE) >= _ROPE_TBL_MAX:
+                _ROPE_TBL_CACHE.clear()
+            _ROPE_TBL_CACHE[key] = (loc, (cos, sin))
+    return cos, sin
+
+
+@op("rope")
+def _rope(st, ctx, w):
+    """官方 modeling_deepseek.py:1050 → inplace_partial_rotary_mul（原地改 x 尾部 rope 维）。"""
+    T = st["x"].shape[0]
+    cos, sin = _rope_tables(ctx, T, st["x"].device)
+    part = ctx["rope_dim"]
+    # 边界层拆分后 rope 会被调用两次（先 kv、后 q）；用 done-set 防止重复 rope。
+    done = st.get("_rope_done")
+    if done is None:
+        done = st["_rope_done"] = set()
+    for key, ntap in (("q", 1), ("kv", 1)):
+        if key not in st or key in done:
+            continue
+        t = st[key]
+        # ★ T-042：view 出来的 4D 视图本来就连续（q/kv 都是 _qmm 的连续输出）→ 短路
+        t4 = _contig(t.view(T, -1, 1, t.shape[-1]) if t.dim() == 3 else t.view(T, 1, 1, -1))
+        _rope_dump(1, t4, cos, sin, [t4.shape[-1] - part, t4.shape[-1]],
+                   "interleave", ctx)
+        torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
+            t4, cos, sin, rotary_mode="interleave",
+            partial_slice=[t4.shape[-1] - part, t4.shape[-1]])
+        st[key] = t4.view(T, *t.shape[1:])
+        done.add(key)
+    # ★ 2026-10-28（CP 通信掩盖）：kv rope 完成 = 本层 KV 定稿 → 立刻在**侧流**发起
+    #   跨 rank all-gather，让它和紧跟的 q 投影（wq_a→q_norm→wq_b→rope(q)）并行；
+    #   `_kv_epilog` 只等事件。与 DeepInfer `v4_modules/attn.py:783` 同款
+    #   （"launch the all_gather first, overlapping it with the Q projection below"）。
+    #   数值同一条 all-gather（单块、字节不变 ⇒ 逐位不变）；`DS41M_CP_KV_PREFETCH=0` 关闭。
+    if "kv" in done and st.get("_cp_kv_pre") is None and _CP_KV_PREFETCH:
+        _cpk = _cp_of(ctx)
+        if _cpk is not None:
+            _launch_cp_kv_gather(st, ctx, _cpk)
+
+
+def _rope_at_pos(pos, ctx, device, n=None):
+    """按**逐行绝对位置**取 comp rope 表（packed：每序列局部位置；官方 `position_ids_c` 口径）。
+
+    `pos` 已经是 rope 位置（c2a = 压缩行号×ratio）。表按 max(pos)+1 行建（CPU 算、整块搬）。
+
+    ★ 2026-10-21 hostbound：`n` 可由调用方按几何（lens/ratio/pos_offset）直接算出来时
+      必须传进来——否则 `pos.max().item()` 是每层一次的**设备 max + 同步**（命中的
+      stage-B 里 b≥2 时每 pass 几十次，每次要等队列排空）。传 n 只是少同步，表内容不变。
+    """
+    if n is None:
+        n = int(pos.max().item()) + 1 if int(pos.numel()) else 1
+    else:
+        n = max(1, int(n))
+    # ★ 2026-10-31：按 pos 对象身份缓存 gather 结果（同一个 pos 张量 = 同一段几何）。
+    #   强引用 pos 一起存，`is` 判等 ⇒ 即使地址被复用也不会误命中。
+    if int(ctx.get("ratio", 0) or 0) > 0:
+        _rb, _ry = float(ctx.get("compress_rope_theta", 160000)), tuple(
+            sorted((ctx.get("rope_scaling") or {}).items()))
+    else:
+        _rb, _ry = float(ctx.get("rope_theta", 10000)), ()
+    _rk = ("rap", int(pos.numel()), int(pos.data_ptr()), int(n), str(pos.device),
+           int(ctx["rope_dim"]), _rb, _ry)
+    _hit = _rop_pos_get(_rk)
+    if _hit is not None and _hit[0] is pos:
+        return _hit[1], _hit[2]
+    cos_full, sin_full = _rope_cos_sin(n, ctx, device)
+    p = _as_dtype(pos, torch.long)          # T-042：已是 int64 就不转换（index_select 要求 int64）
+    _val = _rop_pos_put(_rk, (pos, cos_full.index_select(0, p),
+                              sin_full.index_select(0, p)))
+    return _val[1], _val[2]
+
+
+def _comp_rope_tables(n, ratio, ctx, device, row_off=0):
+    """压缩行（p = 0..n-1，绝对行号从 row_off 起）的 rope 表：**位置 = p × ratio**（组首 token 位置）。
+
+    `row_off`：命中模式下尾部压缩行的**绝对行号起点**（= 前缀压缩行数 off//ratio）。
+
+    ★ 实测反推（用官方 comp_latent 逐位一致、comp_kv 逐一比对）：
+      位置取 `p`（稠密压缩序号）误差 9.1e-2 ❌；取 `p×ratio` 误差 1.7e-4 ✅（= 我 CPU 实现的精度）
+      —— 官方注释 "C2A Compressor uses group positions in c2a" 指的就是这个；
+      c1a 的 ratio=1 时二者相同（per-token ✓）。
+    """
+    _ratio = max(1, int(ratio))
+    if dg_on():
+        # decode 图：表按 L_full 一次建满；每步只把 row_off 对应的 n 行拷进固定缓冲。
+        _n = int(n)
+        _ro0 = int(row_off)
+        lmax = max(int(ctx.get("L_full", 0) or 0) + _ratio + 1,
+                   ((_n - 1 + _ro0) * _ratio + 1) if _n else 1, 1)
+        key = ("comprope_step", _n, _ratio, lmax, int(ctx["rope_dim"]), str(device),
+               tuple(sorted((ctx.get("rope_scaling") or {}).items())))
+        full = _CS_STEP.get(key)
+        if full is None:
+            full = _rope_cos_sin(lmax, ctx, device, 0)
+            _CS_STEP[key] = full
+        fc, fs = full
+
+        def _cfill(buf, p, tab):
+            ro = int(p) // _ratio
+            q = (torch.arange(_n, device=device, dtype=torch.long) + ro) * _ratio
+            buf.copy_(tab.index_select(0, q))
+
+        def _cbuild(tab):
+            q = ((torch.arange(_n, device=device, dtype=torch.long) + _ro0) * _ratio)
+            return tab.index_select(0, q).contiguous()
+
+        cos = dg_meta(("comp_cos_step", key), lambda: _cbuild(fc),
+                      lambda b, p: _cfill(b, p, fc))
+        sin = dg_meta(("comp_sin_step", key), lambda: _cbuild(fs),
+                      lambda b, p: _cfill(b, p, fs))
+        return cos, sin
+    pos = _meta(("comprope_pos", int(n), int(row_off), max(1, int(ratio)), str(device)),
+                lambda: (torch.arange(n, device=device, dtype=torch.long) + int(row_off))
+                * max(1, int(ratio)))
+    # ★★ 2026-10-17 修：表必须覆盖到**最大位置索引** = (n-1+row_off)×ratio（不是 n 行 ✗）。
+    #   之前按 n 行建表、index_select 到 n×ratio 处 → 越界读（NPU 不报错，读到邻近显存当 cos/sin）
+    #   → 压缩 KV 的 rope 从**第 4097 个压缩行（token ≈8195）**起全错。
+    #   行级证据：层 3/4/5 与官方参考"行 0..8194 逐位一致、行 ≥8195 全部不同"（8192 = T/2 = 压缩行数）。
+    #   ratio=1 时 need == n+row_off（与旧值相同）→ c1a 层零变化 ✓；prefill 低位置也零变化 ✓。
+    need = ((int(n) - 1 + int(row_off)) * max(1, int(ratio)) + 1) if n else 1
+    # ★ 2026-10-31（CP4 空泡）：gather 结果是 (n, row_off, ratio, 表参数, device) 的
+    #   **纯函数** —— 值是常量，缓存后每层零 GatherV2。表参数按 `_rope_cos_sin` 的选择
+    #   口径原样入键（base/yarn 取决于 ctx["ratio"]，不是本函数入参 ratio）。
+    _dim = int(ctx["rope_dim"])
+    if int(ctx.get("ratio", 0) or 0) > 0:
+        _base = float(ctx.get("compress_rope_theta", 160000))
+        _yarn = tuple(sorted((ctx.get("rope_scaling") or {}).items()))
+    else:
+        _base = float(ctx.get("rope_theta", 10000))
+        _yarn = ()
+    _ck = ("crt", int(n), int(row_off), _ratio, max(int(need), 1), _dim,
+           str(device), _base, _yarn)
+    _hit = _rop_pos_get(_ck)
+    if _hit is not None:
+        return _hit[0], _hit[1]
+    cos_full, sin_full = _rope_cos_sin(max(need, 1), ctx, device)
+    _val = _rop_pos_put(_ck, (cos_full.index_select(0, pos),
+                              sin_full.index_select(0, pos)))
+    return _val[0], _val[1]
+
+
+_CS = {}
+_CS_STEP: dict = {}          # decode 图：按 L_full 建满的 rope 表（cos/sin 缓冲从这里切片）
+# ★★ 2026-10-31（CP4 空泡）：rope 表的**按位置 gather 结果**缓存。
+#   `_rope_cos_sin` 只缓存整表，`cos_full.index_select(0, pos)` 每次调用仍是 2 个 GatherV2
+#   （CP4 trace：GatherV2 175/forward，其中 ~60 来自这里；`_idx_k_rows_cp` 每块 2 个、
+#   `_kv_compress_pk` 每段 2 个、`_idx_k_cache` 每层 2 个）。pos 全是**几何量** ⇒ 结果
+#   逐位静止。两种键：
+#     · ("rap", …ptr…)   `_rope_at_pos`：额外**强引用 pos**，用 `is` 判等 → 地址复用不可能串味
+#     · ("crt", n, row_off, …) `_comp_rope_tables`：纯值键（值完全由这些参数决定）
+#   容量上限 64，超了整体清空（条目都是小的 [n,1,1,64] bf16）。
+_ROPEPOS: dict = {}
+
+
+def _rop_pos_get(key):
+    return _ROPEPOS.get(key)
+
+
+def _rop_pos_put(key, val):
+    if len(_ROPEPOS) >= 64:
+        _ROPEPOS.clear()
+    _ROPEPOS[key] = val
+    return val
+
+_HIT_WARN: set = set()      # 命中路径的"提示一次"去重（压缩起点未对齐 ratio 等）
+
+
+def _rope_cos_sin(T, ctx, device=None, start=0):
+    """cos/sin[T,1,1,rope_dim] = 表中**第 start .. start+T-1 行**（命中时 start = L-T_main）。
+
+    逐字对齐官方 `DeepseekV41YarnRotaryEmbedding`；表按 start+T 行建、再切尾部
+    （官方 hit 里 `cos_sin` 是全长 L 张表，query 取 absolute position 行）。
+
+    ★ 两处必须照抄（之前都错了 ✗，症状是"量级正常、数值全错"）：
+      1. **排列**：官方 `cos.repeat_interleave(2, dim=-1)`（**交错**），
+         不是 `cat((freqs, freqs))`（半半）✗ —— 旋错维度对，所有层都错（含 win 层）
+      2. **YaRN**：comp 层（`original_max_position_embeddings > 0`，本模型 =65536）走
+         `inv_freq = freq_inter*(1-mask) + freq_extra*mask`；win 层（0）就是普通 RoPE。
+         base 也分层：win=rope_theta(10000)，comp=compress_rope_theta(160000)。
+      3. **在哪台设备上算**：官方在 **CPU** 上建表（`_init_rope` 不传 device），再整块搬到 NPU ✗
+         不能在 NPU 上建（差 1 ULP，见下）。
+    """
+    if device is None:
+        device = torch.npu.current_device() if ctx.get("device") is None else ctx["device"]
+    dim = int(ctx["rope_dim"])
+    base = float(ctx.get("rope_theta", 10000))
+    yarn = {}
+    if ctx.get("ratio", 0) > 0:
+        base = float(ctx.get("compress_rope_theta", 160000))
+        yarn = dict(ctx.get("rope_scaling") or {})
+    start = max(0, int(start))
+    n = start + int(T)                      # 表的总行数（命中：全长 L）
+    key = (n, dim, str(device), base, tuple(sorted(yarn.items())))
+    if key in _CS:
+        full_cos, full_sin = _CS[key]
+        if start == 0:
+            return full_cos, full_sin
+        return (full_cos[start:start + int(T)].contiguous(),
+                full_sin[start:start + int(T)].contiguous())
+
+    import math
+    # ★★ 表必须在 **CPU** 上算完再搬到 device（照抄官方的构造路径，见 :276 注 3）：
+    #   官方 `_init_rope`（common_modules.py:558-601）建 `DeepseekV41YarnRotaryEmbedding` 时**不传 device**
+    #   → 基类 `__init__`（:247-263）里 inv_freq、`_set_cos_sin_cache(device=self.inv_freq.device)` 全在 CPU 上
+    #   算，之后模型 `.to(npu)`/`.npu()` 只是把**算好的 fp32 表整块搬过去**（值逐位不变）。
+    #   之前在 NPU 上算：Ascend 的 pow/outer/polar 与 CPU 差 1 个 fp32 ULP，T=16384 的表 1048576 个元素里
+    #   cos 387270 / sin 382954 个不同（max|d|=9.77e-4）→ rope 尾 64 维偏 1 ULP → q 有 1956 个元素跨 bf16
+    #   舍入边界（实测：同一份 pre-rope q，用官方表旋转 = 官方 dump 逐位一致 16777216/16777216，
+    #   用 mini 的 NPU 表旋转 = mini dump 逐位一致）→ 再经 wo_a/wo_b 放大 2.5e-3 → MoE 路由翻转 → 层输出 1e-2。
+    cpu = torch.device("cpu")
+    i = torch.arange(0, dim, 2, dtype=torch.float32, device=cpu) / dim
+    freq_extra = 1.0 / (base ** i)
+    orig = int(yarn.get("original_max_position_embeddings", 0) or 0)
+    if orig > 0:
+        factor = float(yarn.get("factor", 1.0) or 1.0)
+        freq_inter = 1.0 / (factor * base ** i)
+
+        def _corr_dim(n_rot, dim_, base_, max_pos):
+            return (dim_ * math.log(max_pos / (n_rot * 2 * math.pi))) / (2 * math.log(base_))
+
+        low = math.floor(_corr_dim(float(yarn.get("beta_fast", 32)), dim, base, orig))
+        high = math.ceil(_corr_dim(float(yarn.get("beta_slow", 1)), dim, base, orig))
+        low, high = max(low, 0), min(high, dim - 1)
+        if low == high:
+            high += 0.001
+        ramp = torch.clamp((torch.arange(dim // 2, dtype=torch.float32, device=cpu) - low)
+                           / (high - low), 0, 1)
+        mask = 1.0 - ramp
+        inv_freq = freq_inter * (1 - mask) + freq_extra * mask
+    else:
+        inv_freq = freq_extra
+
+    freqs = torch.outer(torch.arange(n, dtype=torch.float32, device=cpu), inv_freq)
+    # ★ 交错布局（官方 repeat_interleave(2)）
+    # ★ 保持 **fp32**：官方 `DeepseekV41RotaryEmbedding.forward`（common_modules.py:277-287）建
+    #   缓存时写死 `dtype=torch.float32`，`cos_sin["win"]` 交给 inplace_partial_rotary_mul 的是
+    #   fp32 表。之前 `.to(torch.bfloat16)` → 表被量化到 bf16（1 ULP=1.95e-3 的错），
+    #   q/kv 的 rope 维（尾 64）整段偏 → 池字节、注意力的残差 ~1.5% 全从这里来。
+    # ★ 还要用官方的同一算式 `torch.polar(ones, freqs)`（fp32 complex 的实/虚部 = cos/sin），
+    #   `torch.cos/sin` 与它差 1 个 fp32 ULP（5.96e-8）——这点差会让 q 少数元素越 bf16 舍入边界
+    #   （q rel_fro 6.3e-5），再经 wo_a/wo_b 放大到 2.5e-3 → MoE 路由同分翻转 → 层输出 1e-2。
+    freq_cis = torch.polar(torch.ones_like(freqs), freqs)
+    cos = freq_cis.real.repeat_interleave(2, dim=-1).view(n, 1, 1, -1).to(device).contiguous()
+    sin = freq_cis.imag.repeat_interleave(2, dim=-1).view(n, 1, 1, -1).to(device).contiguous()
+    _CS[key] = (cos, sin)
+    if start == 0:
+        return cos, sin
+    return (cos[start:].contiguous(), sin[start:].contiguous())
+
+
+def _rope_cos_sin_step(T, ctx, device, start):
+    """decode 图专用：cos/sin 住**固定地址**缓冲；表按 L_full 一次建满，每步只换切片。
+
+    非 DG 模式完全走 `_rope_cos_sin`（逐位不变）。
+    """
+    if not dg_on():
+        return _rope_cos_sin(T, ctx, device, start)
+    dim = int(ctx["rope_dim"])
+    base = float(ctx.get("rope_theta", 10000))
+    yarn = {}
+    if int(ctx.get("ratio", 0) or 0) > 0:
+        base = float(ctx.get("compress_rope_theta", 160000))
+        yarn = dict(ctx.get("rope_scaling") or {})
+    _T = int(T)
+    lmax = max(int(ctx.get("L_full", 0) or 0) + _T + 1,
+               int(start) + _T, 2)
+    key = ("rope_step", lmax, dim, str(device), base,
+           tuple(sorted(yarn.items())))
+    full = _CS_STEP.get(key)
+    if full is None:
+        full = _rope_cos_sin(lmax, ctx, device, 0)
+        _CS_STEP[key] = full
+    full_cos, full_sin = full
+
+    def _fill(buf, p, tab):
+        s = min(max(0, int(p)), lmax - _T)
+        buf.copy_(tab.narrow(0, s, _T))
+
+    # ★ 2026-10-20 P3：build 必须 **clone**，不能只 `.contiguous()`。narrow 出来的
+    #   T 行切片本身已连续 → contiguous() 返回**同一块 storage 的视图**；T>1 时
+    #   dg_update 在相邻 pos 上 copy 的范围会与视图**部分重叠** → PyTorch 报
+    #   "some elements ... refer to a single memory location"（T=1 只重叠整行，
+    #   恰好是 exact self-copy 所以没暴露）。
+    cos = dg_meta(("rope_cos_step", key),
+                  lambda: full_cos.narrow(0, min(int(start), lmax - _T), _T).clone(),
+                  lambda b, p: _fill(b, p, full_cos))
+    sin = dg_meta(("rope_sin_step", key),
+                  lambda: full_sin.narrow(0, min(int(start), lmax - _T), _T).clone(),
+                  lambda b, p: _fill(b, p, full_sin))
+    return cos, sin
+
+
+# ★★ T-043 ①：wo_a 的 transposeQMM「参数缓存」—— 只能省**我们自己**的两次 dtype view。
+#   实测证据（64K@97 eager trace，2 forward / 80 次调用，rank0）：
+#     · `npu::npu_transpose_quant_batchmatmul` host 跨度 **avg 238 µs / 次**（med 242）；
+#       但我们的代码在它里面只有 `empty_tensor` 2.7 µs + `aten::view` 3.4/2.9 µs，
+#       aclnn 调用本身 4.6 µs；余下 ~231 µs 落在 torch_npu 绑定内部（Python 进不去）。
+#     · 官方 light trace 同一算子 host 182 µs/次、aclnn 4.0 µs ⇒ 与我们的封装无关，
+#       是 CANN/torch_npu 这一层的固定成本（图捕获或 aclrt 直发才能去掉）。
+#   ⇒ 这里缓存 `WS.view(float8_e8m0fnu)`（~1-3 µs/次）与 `_packed` 查找；
+#     预期 40 层合计 **−0.1~0.2 ms/forward**（噪声级），不要指望那 0.23 ms。
+_ENV_WOA_PLAN = os.environ.get("DS41M_WOA_PLAN_CACHE", "1").strip().lower() in (
+    "1", "on", "true", "yes")
+_WOA_PLAN: dict = {}
+_WOA_STATS = {"hit": 0, "miss": 0}
+
+
+# ★ T-043 ④（**实验**，默认关）：wo_a 的算子换成 `deep_gemm.fp8_einsum`。
+#   为什么可能快：
+#     · 现状 `npu_transpose_quant_batchmatmul` host **238 µs/次**（上条注释），其中
+#       ~231 µs 在 torch_npu/CANN 绑定里，Python 侧无解；
+#     · `deep_gemm.fp8_einsum("bhr,hdr->bhd")` 走 DeepGEMM 自己的 aclrt 直发路径
+#       （和 mega_moe 同类），host 只剩 wrapper + 一次布局检查 ⇒ 估计省 ~0.2 ms/层
+#       ⇒ 40 层 **~8 ms/forward**，这是本任务里唯一能吃掉那 9 ms 的手段。
+#     · A 侧量化**不动**（仍 `npu_dynamic_mx_quant`，数值逐位不变），只把 e8m0 标量
+#       按 `_pack_pairs` 打成 int16；B 侧权重/标量在 pack 期一次性准备好。
+#       `_C.pyi` 明确：sfA/sfB 可为 "fp32 or short (packed ue8m0), **in any major**"。
+#   ★★ 2026-10-26 上卡实测（T-043D，单卡微基准，这次补丁就是按实测改的）：
+#     ① 打包序 ✓ 正确：einsum 输出 vs 反量化参考 relL2 = 3.4e-05（T=2106, 真形状）。
+#     ② **SF 必须 k-major**（`_C.pyi` 说的 "any major" 是文档口径，实现不吃）：
+#        `layout.hpp:check_sf_layout` 的快速路要求 int16 + gran_mn==1 +
+#        `stride(-2)==1` + `stride(-1)==size(-2)`（batched 还要
+#        `stride(-3)==size(-2)*size(-1)`）。mn-major 会掉进
+#        `transform_sf_into_required_layout` 的 JIT 编译，而本机 deep_gemm 的
+#        `include/deep_gemm/transform_sf.hpp:19` 用了未声明的 `ascendc_assert`
+#        （同 mqa_logits 那个坑，见 rt/deepgemm-src/PATCHES.md 第 4 条）⇒ 编译失败、
+#        **整个跑测挂掉**（不是回退）。⇒ 两侧标量都按 k-major 准备（见两个函数）。
+#     ③ host：`fp8_einsum` 裸调用 **21 µs**/次（对照 transposeQMM 238 µs）；
+#        A 侧全链路（quant 17.7 + 打包/k-major 17.4 + einsum 21）≈ 56 µs/层。
+#        ⇒ 40 层约 **−7 ms/forward**。
+#   ⇒ 打包/调用出任何异常都**永久回退**到 transposeQMM（见 `_wo_a`），不会把跑测打挂。
+# ★★ 2026-10-26（T-054，本机 8 卡）：默认改 **开**。
+#   Wv 的 `transpose_quant_batchmatmul` 换成 `deep_gemm.fp8_einsum`：
+#   交错 4 臂（各 8 轮）关 118.52/114.86 vs 开 **108.92/108.19** ⇒ **−8.1 ms（−7.0%）**，
+#   四臂 `[packed-digest] sha1=08443723284dd9ed` 完全相同 ⇒ 逐位不变。
+#   （D 早前在旧栈上只测到 −2.5 ms：TQMM 的 ~200 µs/次 在旧栈里被其他停顿盖住了。）
+_ENV_WOA_EINSUM = os.environ.get("DS41M_WOA_EINSUM", "1").strip().lower() in (
+    "1", "on", "true", "yes")
+_WOA_EINSUM_STATS = {"call": 0, "fallback": 0, "err": 0}
+_WOA_EINSUM_DEAD = False        # 首次调用失败后置 True：永久回退（不再每层重试/重抛）
+# 子项 host 记账（T-043D）：host 表的 wo_a 是"整个算子"，看不出换掉的是哪一段。
+# 这里把两个候选 dispatch **本身**单独记一笔（wo_a.einsum / wo_a.tqmm），
+# 单次 = 合计 / 调用数 —— 探针判据"fp8_einsum 单次 ≤30µs"就看这个。
+_ENV_HOSTTIME_SUB = bool(os.environ.get("DS41M_HOSTTIME"))
+_WOA_TQMM_N = {"n": 0}          # 基线 dispatch（transposeQMM）被记账的次数
+
+
+def woa_einsum_pack(w, ws, o_groups=None, o_lora=None, head_dim_per_group=None):
+    """einsum 版 wo_a 权重对：`(W[h,d,r] 原始 ND view, SF[h,d,r/32] int16 配对)`。
+
+    与 `pack_wo_a` **不同**：不做 transpose/转置/NZ —— `"hdr"` 就要求 r 在最后一维，
+    `w.view(g, o_lora, grp)` 恰好就是（`_C.pyi: fp8_einsum` 的 b 项 `[h, d, r]`）。
+
+    SF 形状对齐 `recipe=(1,1,32)`：**逐行**权重标量（checkpoint 的 [8192,128] 直接
+    view 成 [8,1024,128]，d 不复用/不折叠）。DeepInfer 的融合路径在 recipe (1,1,32)
+    下正是 `repeat_interleave(gran, dim=1)` 把 block-32 标量展开成逐行 [8,1024,128]
+    （attn.py:126-131）；我们用原生的逐行标量，少一次展开。
+    再用 `_pack_pairs` 沿 r 配对（与 mega_moe 同一套 packed ue8m0，低字节在前）。
+    末尾转成 **k-major**（mn=d 必须是最快变化的维）：见上面 ②，mn-major 会掉进
+    坏掉的 transform_sf JIT。打包期做一次，热路径零成本。
+    """
+    o_groups = int(o_groups or O_GROUPS)
+    o_lora = int(o_lora or O_LORA)
+    grp = int(head_dim_per_group or (N_HEADS * HEAD_DIM // max(1, o_groups)))
+    w3 = w.reshape(o_groups, o_lora, grp)          # 只接受连续 ND；否则 reshape 拷贝
+    ws_u8 = ws.view(torch.uint8).reshape(o_groups, o_lora, grp // 32)
+    import exec_moe                                 # noqa: PLC0415（本仓模块都是平铺导入）
+    sf3 = exec_moe._pack_pairs(ws_u8.contiguous())  # [g, d, r/64] int16（mn-major）
+    sf3 = sf3.transpose(1, 2).contiguous().transpose(1, 2)   # → k-major（底层 [g, r/64, d]）
+    return w3, sf3
+
+
+def _woa_einsum(o, plan):
+    """A=[T,g,r] fp8 → `"bhr,hdr->bhd"` → [T,g,d] bf16。"""
+    import deep_gemm                                # noqa: PLC0415（只在开关打开时 import）
+    import exec_moe                                 # noqa: PLC0415
+    T = int(o.shape[0])
+    G = int(o.shape[1])
+    oq, os_ = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+    # [T,g,r/32] e8m0 → int16 配对（与 B 侧同一套打包）
+    sf_a = exec_moe._pack_pairs(os_.view(torch.uint8).reshape(T, G, -1))
+    # k-major：C++ 侧会把 A 的 SF permute({1,0,2}) 成 [g, T, r/64]，要求 T 维最快
+    sf_a = sf_a.permute(1, 2, 0).contiguous().permute(2, 0, 1)   # [T, g, r/64]，底层 [g, r/64, T]
+    W3, SF3 = plan
+    y = torch.empty((T, G, int(W3.shape[1])),
+                    dtype=torch.bfloat16, device=o.device)
+    _t0 = time.perf_counter() if _ENV_HOSTTIME_SUB else 0.0
+    deep_gemm.fp8_einsum("bhr,hdr->bhd", (oq, sf_a), (W3, SF3), y,
+                         recipe=(1, 1, 32))
+    if _t0:
+        HOSTTIME["wo_a.einsum"] = HOSTTIME.get("wo_a.einsum", 0.0) + (
+            time.perf_counter() - _t0)
+    return y
+
+
+def _woa_packed(w):
+    """(W, WS_e8m0)：`WS.view(float8_e8m0fnu)` 按**打包对象身份**缓存。
+
+    键里的 `id/data_ptr` 只做分桶，命中还要求 `is` 同一对象（allocator 会复用地址）。
+    缓存持有 W/WS 引用（`_packed` 跨 pass 常驻）⇒ 不会悬空，也不会让 id 被复用。
+    `DS41M_WOA_PLAN_CACHE=0` 逐字回到旧行为（每次现 view）。
+    """
+    W, WS = w["_packed"]["attn.wo_a.weight"]
+    if not _ENV_WOA_PLAN:
+        return W, WS.view(torch.float8_e8m0fnu)
+    k = (id(W), W.data_ptr(), tuple(WS.shape), str(WS.device))
+    p = _WOA_PLAN.get(k)
+    if p is None or p[0] is not W or p[1] is not WS:
+        p = (W, WS, WS.view(torch.float8_e8m0fnu))
+        _WOA_PLAN[k] = p
+        _WOA_STATS["miss"] += 1
+    else:
+        _WOA_STATS["hit"] += 1
+    return p[0], p[2]
+
+
+@op("wo_a")
+def _wo_a(st, ctx, w):
+    """官方 modeling_deepseek.py:1291 → npu_transpose_quant_batchmatmul（o_groups=8）。"""
+    T = st["x"].shape[0]
+    if "attn_out" in st:
+        o = st["attn_out"]                        # [T, 64, 512]（= 32768）
+    elif st.get("_allow_placeholder"):
+        # ⚠️ 占位：mqsmla 还没接上（Tier B）。形状对、数值无意义 —— 只用于打通算子图/出 trace。
+        st["_placeholder_used"].add("wo_a")
+        o = _contig(st["q"])                      # [T,64,512]=32768/层 → view [T,8,4096] ✓（T-042 短路）
+    else:
+        raise RuntimeError("没有 attn_out（mqsmla 未执行）；如只为出 trace 可加 --allow-placeholder")
+    # ★ 官方 attn_post（modeling_deepseek.py:1266-1269）：**注意力输出在 wo_a 之前先做一次逆 rope**
+    #   `o = self.apply_rope(o, attn_metadata, inverse=True)`（sin 取负、cos 用本层 rope 表）——
+    #   作用在 512 维尾部 64 维（partial_slice=[448,512]），逐头。漏掉 = 头尾 64 维整体错位。
+    if os.environ.get("DS41M_NO_INVROPE"):        # 调试开关：关掉逆 rope 做二分
+        pass
+    else:
+        # ★★ 2026-10-16（命名病 N 的第三个根因）：必须传**本段起始绝对位置** ✗。
+        #   命中 stage B 的 token 在绝对位置 15744..16383，逆 rope 若用 start=0 的表
+        #   → **每一行都用错角度去旋** → attn_out 整段错（实测：与 prefill 比，
+        #   行 ≥127 的逐元素 |Δ| = 6.45，而**旋之前**该键逐位为 0 ✓；
+        #   下游隐藏态 → 门控输入 → logits 出现 ~+3.0 的偏移与"分布被压扁"）。
+        #   前缀（stage A, off=0）与全量 prefill 不受影响 ✓ → 逐位回归安全。
+        # ★ 与正向 rope 同一实现（packed 用绝对位置对全长表 gather；单序列走切片）
+        cos, sin = _rope_tables(ctx, T, o.device)
+        _rope_dump(2, o.unsqueeze(2), cos, _neg_sin(sin),
+                   [o.shape[-1] - ctx["rope_dim"], o.shape[-1]], "interleave", ctx)
+        torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
+            o.unsqueeze(2), cos, _neg_sin(sin), rotary_mode="interleave",
+            partial_slice=[o.shape[-1] - ctx["rope_dim"], o.shape[-1]])
+    o = o.reshape(T, O_GROUPS, -1)                # [T, 8, 4096]：4096 = 头数×head_dim/组（官方同式）
+    # ★ T-043 ④（实验，默认关）：einsum 版。pack 期没准备好就**回退**（不抛）；
+    #   调用期抛一次 → 置 _WOA_EINSUM_DEAD 永久回退（否则 40 层每层都炸）。
+    if _ENV_WOA_EINSUM and not _WOA_EINSUM_DEAD:
+        _plan = (w.get("_packed") or {}).get("attn.wo_a.weight.einsum")
+        if _plan is not None:
+            try:
+                _y = _woa_einsum(o, _plan)
+            except Exception as _e:              # 后端/布局不支持 → 永久回退
+                globals()["_WOA_EINSUM_DEAD"] = True
+                _WOA_EINSUM_STATS["err"] += 1
+                print(f"  ⚠ wo_a einsum 调用失败（后续永久回退 transposeQMM）："
+                      f"{type(_e).__name__}: {str(_e)[:160]}", flush=True)
+            else:
+                _WOA_EINSUM_STATS["call"] += 1
+                st["o_lora"] = _y.reshape(T, -1)
+                if _ENV_RELEASE_Q_ATTN:
+                    st["attn_out"] = None
+                return
+        _WOA_EINSUM_STATS["fallback"] += 1
+    oq, os_ = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+    W, WSv = _woa_packed(w)                         # 已按官方 permute（见 pack_wo_a；T-043 ①）
+    _t0 = time.perf_counter() if _ENV_HOSTTIME_SUB else 0.0
+    y = torch_npu.npu_transpose_quant_batchmatmul(
+        oq, W, dtype=torch.bfloat16, x1_scale=os_.view(torch.float8_e8m0fnu),
+        x2_scale=WSv, group_sizes=(0, 0, 32),
+        perm_x1=(1, 0, 2), perm_x2=(0, 1, 2), perm_y=(1, 0, 2))
+    if _t0:
+        HOSTTIME["wo_a.tqmm"] = HOSTTIME.get("wo_a.tqmm", 0.0) + (
+            time.perf_counter() - _t0)
+        _WOA_TQMM_N["n"] += 1
+    st["o_lora"] = y.reshape(T, -1)               # [T, 8192]，喂给 wo_b（不动残差流 st["x"]）
+    if _ENV_RELEASE_Q_ATTN:
+        st["attn_out"] = None
+
+
+@op("wo_b")
+def _wo_b(st, ctx, w):
+    """wo_b：把 o_lora（[T, o_groups×o_lora_rank]）投回 hidden，写入残差流。"""
+    st["x"] = _qmm(st["o_lora"], "attn.wo_b.weight", w, ctx)
+
+
+@op("gate")
+def _gate(st, ctx, w):
+    """官方 modeling_deepseek.py:522 → npu_fused_matmul(fused_op_type="16cast32")。"""
+    # npu_fused_matmul(x1[M,K], x2[K,N])：gate 权重在 checkpoint 里是 [N,K]，转置在**加载期**做
+    # （pack_layer_weights 写进 _packed 的 "ffn.gate.weight.T"）——以前每层现转，白送 1 Transpose + 1 Copy
+    gw = (w.get("_packed") or {}).get("ffn.gate.weight.T")
+    if gw is None:
+        gw = w["ffn.gate.weight"].t().contiguous()
+    st["logits"] = torch_npu.npu_fused_matmul(
+        st["x"].view(-1, ctx["H"]), gw, fused_op_type="16cast32")
+
+
+@op("topk_gate")
+def _topk_gate(st, ctx, w):
+    """官方 op_impls/gate_topk_tilelang.py:32 → tile_kernels.moe.moe_topk_gate（prefill 路径）。
+
+    本机 aclnn 里没有 MoeGatingTopKHash（ascendc 变体跑不了），而 trace 里的
+    `moe_topk_gate_forward_kernel_asc_kernel` 正是 tilelang 变体的 Ascend 后端 ✓。
+    """
+    # ★ T-042：logits 本来就是 fp32+连续（npu_fused_matmul 16cast32 的输出），
+    #   `_contig` 保证"不复制"这件事不依赖上游实现的偶然布局；bias 同理
+    #   （真权重/合成权重都在打包期给了 `ffn.gate.bias.f32`）。
+    ti, tw = _topk_gate_fn()(
+        _contig(st["logits"].float()), num_topk=ctx["topk"],
+        use_shared_as_routed=False, num_shared_experts=0,
+        routed_scaling_factor=ctx["routed_scaling_factor"], ep_rank=0,
+        bias=(lambda b: b if b is not None else
+              _contig(w["ffn.gate.bias"].float()))(
+            (w.get("_packed") or {}).get("ffn.gate.bias.f32")),
+        image_bias=None, image_token_mask=None)
+    st["topk_weight"], st["topk_idx"] = tw, ti
+    # ★ 合成权重模式（无真实 token id）→ 路由 id 换成**强均**分布：
+    #   真实权重里 gate 是训练出来的（有自己的 ffn 负载分布），而随机 logits 的 top-6 会让
+    #   mega_moe 的 dispatch/combine 负载不均 —— 实测同一算子：强均路由 1.36 ms/次
+    #   （≈官方同点 1.30 ms），随机 logits 路由 3.54 ms/次。合成权重本来就"没有分布的含义"，
+    #   用强均才能和官方那个点做时间对齐。DS41M_NO_BALROUTE=1 可关。
+    #   （= 官方 `force_eplb=True` / gen_force_eplb_topk_idx 的等价物，口径简称 elb。）
+    # ★ DS41M_FORCE_BALROUTE=1：即使给了真 ids 也强制强均路由（**仅时延 A/B**，会改数值）。
+    #   用途：把"真权重 vs 合成"的 MoE 负载差异拿掉，单独比较权重/搬运侧的开销。
+    _force_bal = os.environ.get("DS41M_FORCE_BALROUTE", "").strip().lower() in (
+        "1", "on", "true", "yes")
+    if (_force_bal or ctx.get("input_ids") is None) and not os.environ.get("DS41M_NO_BALROUTE"):
+        _E = int(st["logits"].shape[-1])
+        _T, _K, _dev = int(st["logits"].shape[0]), int(ctx["topk"]), st["logits"].device
+        # ★ 缓存（只跟 T/K/E 有关）：以前每层现造，白送 arange/mul/add/mod/cast 5 个 kernel ×40 层
+        # ★ 2026-10-30：默认用**本地序号** t（历史口径）。CP 下同一全局 token 在不同
+        #   cp_size 下 t 不同 ⇒ 路由不同 ⇒ hidden 不同 ⇒ CP1/CP2/CP4 的数值对比全部失真。
+        #   `DS41M_BALROUTE_ABS=1` 改用**绝对位置**（pos_offset + t），只影响合成权重口径的
+        #   可比性（真权重走 input_ids 路由，不受影响）。
+        _abs_on = os.environ.get("DS41M_BALROUTE_ABS", "").strip().lower() in (
+            "1", "on", "true", "yes")
+        # CP 下**逐行绝对位置**：优先 cp_abs_positions（= cplan.abs_positions），
+        # 其次 cp_positions + pos_offset；都没有才退化成 pos_offset + arange（只对 head 块正确）。
+        _base = None
+        _bkey = 0
+        if _abs_on:
+            _pp = ctx.get("cp_abs_positions")
+            if not torch.is_tensor(_pp):
+                _pp = ctx.get("cp_positions")
+                if torch.is_tensor(_pp):
+                    _pp = _pp + int(ctx.get("pos_offset", 0) or 0)
+            if torch.is_tensor(_pp) and int(_pp.numel()) == _T:
+                _base = _pp.to(device=_dev, dtype=torch.int64)
+                _pi = _pp.to(torch.int64)
+                _bkey = ("perrow", int(_pi.shape[0]), int(_pi[0]), int(_pi[-1]),
+                         int(_pi.sum()))
+            else:
+                _bkey = int(ctx.get("pos_offset", 0) or 0)
+
+        def _build_balroute():
+            _balroute_log(_T, _K, _E)
+            if _base is not None:
+                _t = _base
+            else:
+                _t = torch.arange(_T, device=_dev) + int(_bkey)
+            if os.environ.get("DS41M_BALROUTE_ABS"):
+                try:
+                    print(f"  [balroute-abs] rank={os.environ.get('RANK')} idx={ctx.get('idx')} "
+                          f"T={_T} base={'perrow' if _base is not None else int(_bkey)} "
+                          f"first={int(_t[0])} last={int(_t[-1])} "
+                          f"min={int(_t.min())} max={int(_t.max())} "
+                          f"zeros={int((_t == 0).sum())} "
+                          f"has_cp_pos={torch.is_tensor(ctx.get('cp_positions'))} "
+                          f"has_cp_abs={torch.is_tensor(ctx.get('cp_abs_positions'))}", flush=True)
+                except Exception:                 # noqa: BLE001
+                    pass
+            return (((_t.unsqueeze(1) * _K) + torch.arange(_K, device=_dev)) % _E).to(torch.int32)
+
+        st["topk_idx"] = _meta(("balroute", _T, _K, _E, _bkey, str(_dev)), _build_balroute)
+
+
+_BALROUTE_LOGGED = [False]
+
+
+def _balroute_log(T, K, E):
+    """把"强均路由（elb）已生效"打进日志 —— 每个进程只打一次，便于采完核对当时的口径。"""
+    if not _BALROUTE_LOGGED[0]:
+        _BALROUTE_LOGGED[0] = True
+        print(f"[elb/balroute] 强均路由 ON：topk_idx=(t*{K}+k)%{E}，T={T}"
+              f"（合成权重口径，等价官方 force_eplb）", flush=True)
+
+
+def _hold(st):
+    """跨层共享张量的存放处（runner 传 st["_shared"]）。"""
+    return st.get("_shared") if isinstance(st.get("_shared"), dict) else st
+
+
+def _sfx(ctx, kind):
+    """池/缓存的"拥有者后缀"（`DS41M_PERLAYER_CACHE=1` 时非空；默认空字符串 ⇒ 与旧行为逐位相同 ✓）。
+
+    见 run.py:ctx_for 的长注释：命中 stage B 读前缀时，只按 ratio 分的共享池里是 stage A
+    **最后一个写者**的数据 ✗（压缩池 = 源 14、窗口池 = 层 39）⇒ 必须按"产生者"分池。
+    kind: "win"（窗口池，按本层）/ "cmp"（压缩 KV 池，按 kv 源层）/ "idx"（索引器稀疏缓存，按索引源层）。
+    """
+    key = {"win": "suffix_win", "cmp": "suffix_cmp", "idx": "suffix_idx"}[kind]
+    return str((ctx or {}).get(key) or "")
+
+
+def _shared_get(st, name):
+    return _hold(st).get(name)
+
+
+def rebase_window_pool(st, ctx, T_old: int, W: int) -> int:
+    """边界层截断后，把每条序列窗口 scratch 的**最后 W 行**搬到该序列起始 W 槽。
+
+    这样后续 `_mqsmla` 仍用段内局部位置 0..W-1 读池（无需新增 win_base 索引），
+    同时 `ctx["pos_offset"]` 用绝对位置给 rope/seqused。返回搬移的序列数。
+    """
+    pool = _shared_get(st, "_full_pool" + _sfx(ctx, "win"))
+    if pool is None:
+        return 0
+    BS = 128
+    nseq = int(ctx.get("n_seqs", 1) or 1)
+    cu = ctx.get("cu_seqlens") or []
+    moved = 0
+    if nseq <= 1:
+        R = int(T_old)
+        if W < R:
+            vals = pool.narrow(0, BS + R - W, W).clone()
+            pool.narrow(0, BS, W).copy_(vals)
+            moved = 1
+        return moved
+    P = batch_layout.rows_blocks_per_seq(ctx, BS)
+    for sid in range(nseq):
+        R = int(cu[sid + 1]) - int(cu[sid])
+        if W >= R:
+            continue
+        base = (sid * P + 1) * BS
+        vals = pool.narrow(0, base + R - W, W).clone()
+        pool.narrow(0, base, W).copy_(vals)
+        moved += 1
+    return moved
+
+
+_KV_MGR = None
+_KV_ON = os.environ.get("DS41M_KV_MANAGER", "1").strip().lower() not in (
+    "0", "off", "false", "no")
+
+
+def set_kv_manager(cfg):
+    """KV 管理（`kv_manager.KVCacheManager`）：进程级单例，统一池分配/寻址几何。
+
+    `DS41M_KV_MANAGER=0` 退回原 inline 分配（A/B 用；两者语义/几何逐位一致）。
+    """
+    global _KV_MGR
+    if not _KV_ON or cfg is None:
+        _KV_MGR = None
+        return
+    import kv_manager as _kvm
+    _KV_MGR = _kvm.get_manager(cfg)
+
+
+def _cache_buf(st, name, rows, row_elems, device, dtype=torch.uint8):
+    """`st["_shared"]` 里跨层复用同一块（避免每层 ZerosLike/Fill 进 trace）。
+
+    惰性分配 PA cache：行 = 量化数据 + scale（scale 占若干"元素"槽位）。
+    op 对 dtype 有硬约束：mxfp8_bf16 要 float8_e4m3fn、mxfp4_bf16 要 uint8。
+    mxfp8 行 544 = 512 数据 + 32 scale（fp8 元素计）✓ 与参考 trace 的 `384,544` 一致。
+
+    ★ 走 `kv_manager`（DeepInfer cache_engine 结构）：池按名字/几何统一管理；
+      `DS41M_KV_MANAGER=0` 时走下面等价的 inline 实现。
+    """
+    hold = _hold(st)
+    if _KV_MGR is not None:
+        return _KV_MGR.get_pool(hold, name, rows, row_elems, device, dtype)
+    buf = hold.get(name)
+    if buf is None or buf.shape[0] < rows or buf.dtype != dtype:
+        buf = torch.zeros(rows, row_elems, dtype=dtype, device=device)
+        hold[name] = buf
+    return buf
+
+
+@op("kv_epilog")
+def _kv_epilog(st, ctx, w):
+    """共享 KV 的两块写入（每层 A/B 各一次，84 = 2×40 + 4 ✓）。
+
+    官方 modeling_deepseek.py:1139 update_win_kv → kv_compress_epilog_v2；
+    行 544 = 512 数据(fp8) + 16×2 scale（每 32 元素一个，官方 get_kv_cache_dim 同式）。
+    A = 持久窗口池（384 槽）；B = prefill 全长临时池 [1+ceil(T/128),128,1,544]，
+    **block 0 留空**（官方 build_prefill_full_kv_metadata 的约定），槽 <128 的写 -1 跳过。
+    """
+    if os.environ.get("DS41M_SKIP_KV"):     # 调试开关：不写池（池保持零），用于二分
+        st.pop("_cp_kv_pre", None)          # 丢掉侧流预取句柄（结果不用）
+        return
+    T = st["kv"].shape[0]
+    device, BS = st["kv"].device, 128
+    off = int(ctx.get("pos_offset", 0))            # 命中：本层 token 的**绝对起始位置**
+    L_full = int(ctx.get("L_full", off + T))       # 全序列长度（池子按它开；前缀行=缓存内容）
+    kv = st["kv"].view(-1, ctx["head_dim"])
+
+    # ★ CP（Step 2，DeepInfer 口径）：本 rank 只算了自己的 head-tail 行；先把本地
+    #   kv all-gather 成全局顺序，再用 full_ctx 写 A/B 两块池。q 仍是本地行，
+    #   由 _mqsmla 用 cp_positions 的全局窗口索引去读 full pool。
+    _cp = _cp_of(ctx)
+    if _cp is not None:
+        # ★ 2026-10-28：优先消费 `_rope` 里侧流发起的 gather（只等事件，与 q 投影并行）；
+        #   张量身份/CP 状态对不上则回退同步 gather（用另一块缓冲，避免和可能仍在写的
+        #   侧流缓冲打架）。两条路径是同一条 all-gather，逐位不变。
+        _pre = st.pop("_cp_kv_pre", None)
+        _gathered = None
+        if _pre is not None:
+            _pf, _ev, _pfx, _pfc = _pre
+            if _pfx is st.get("kv") and _pfc is _cp and _ev is not None:
+                try:
+                    _cur = torch.npu.current_stream()
+                    _cur.wait_event(_ev)
+                    _pf.record_stream(_cur)      # 跨流生命周期：告诉 allocator 主流也在用
+                    _gathered = _pf
+                except Exception as exc:          # noqa: BLE001
+                    if _CP_KV_PRE_ERR[0] <= 3:
+                        print(f"  ⚠️ [cp-kv-prefetch] wait 失败，回退同步："
+                              f"{type(exc).__name__}: {exc}", flush=True)
+                    _gathered = None
+        kv = (_gathered if _gathered is not None
+              else _cp.merge_global(kv, buf_key=("kv_epilog_fb" if _pre is not None
+                                                else "kv_epilog")))
+        ctx = _cp.full_ctx(ctx)
+        T = int(kv.shape[0])
+        off = 0
+        L_full = T
+
+    # A：持久窗口池（保留最后 window+回退 个 token；T 比它短时就写 T 个）
+    # ★ DeepInfer `slot_mapping_store_swa` 同款：swa_block_size = window + max_backtracking，
+    #   多存回退余量，DSpark/next-n 回退后仍能读到完整窗口（读取侧窗口仍是 S=128）。
+    wa = min(int(ctx.get("win_keep") or ctx["S"]), T)
+    cache_a = _cache_buf(st, "_win_pool", WIN_SLOTS, KV_ROW_W, device, torch.float8_e4m3fn)
+    _slot_a = (
+        _meta(("winpool_slot", int(wa), int(off), str(device)),
+              lambda: ((torch.arange(wa, dtype=torch.int32, device=device) + off) % WIN_SLOTS))
+        if not dg_on() else
+        dg_meta(("winpool_slot_step", int(wa), str(device)),
+                lambda: ((torch.arange(wa, dtype=torch.int32, device=device) + off) % WIN_SLOTS),
+                lambda b, p: b.copy_((torch.arange(wa, dtype=torch.int32, device=device) + p)
+                                     % WIN_SLOTS)))
+    # ★ T-042：`kv[-wa:]` 是首维切片、kv 本身连续 → 这个切片就连续，短路掉 contiguous()
+    torch.ops.custom.kv_compress_epilog_v2(
+        cache_a.view(-1, cache_a.shape[-1]), _contig(kv[-wa:]), _slot_a,
+        quant_group_size=32, quant_mode="mxfp8_bf16", round_scale=True)
+
+    # B：本步 scratch（官方 hit：窗口跑在 per-step scratch 上，索引重定基）
+    #   ★★ 2026-10-16（第二修）：槽位一律用**段内局部位置**（off 不进槽位公式），池按 T 开。
+    #      与 `_win_indices` 的局部索引成对：写局部、读局部 → 自洽 ✓；
+    #      窗口**永不读前缀** = 官方语义（持久窗口不落盘，replay 段重建）✓。
+    #      全量 prefill 时 off==0 → 局部==绝对 → 与本修改前**逐位一致** ✓（回归安全）。
+    #      `DS41M_WIN_ABS=1` 复现旧的绝对槽位行为（A/B 用）。
+    _abs = (bool(ctx.get("win_abs"))
+            or os.environ.get("DS41M_WIN_ABS", "").strip().lower() in ("1", "on", "true", "yes"))
+    _sw = _sfx(ctx, "win")
+    # ── packed 真 batch：每条序列用自己的一段物理块（block_table 逐请求映射）──
+    # ★ 2026-10-20：窗口 scratch 一律用**请求内行号**（不含 pos_offset）——
+    #   与单序列 hit 的"重定基到段内局部坐标"同口径（官方 adaptlib/hit.py:293-304）。
+    #   off==0（全量 prefill）时行号 == 绝对位置，与旧行为逐位相同。
+    _lrow, _sid = batch_layout.local_rows(ctx, T, device)
+    if _lrow is not None:
+        _P = batch_layout.rows_blocks_per_seq(ctx, BS)
+        nblk = _P * int(ctx["n_seqs"])
+        pool = _cache_buf(st, "_full_pool" + _sw, (1 + nblk) * BS, KV_ROW_W,
+                          device, torch.float8_e4m3fn)
+        # 槽位 = (序列基块 + 1 + 行块号)*BS + 块内偏移（每条序列从自己的块 1 开始）
+        slot = _meta(("fullpool_slot_pk", int(T), int(_P), str(device)),
+                     lambda: ((_sid * _P + 1 + _lrow // BS) * BS + _lrow % BS).to(torch.int32))
+    else:
+        nblk = ((L_full if _abs else T) + BS - 1) // BS
+        pool = _cache_buf(st, "_full_pool" + _sw, (1 + nblk) * BS, KV_ROW_W,
+                          device, torch.float8_e4m3fn)
+        if dg_on():
+            def _fp(p):
+                return (torch.arange(T, dtype=torch.int32, device=device)
+                        + (p if _abs else 0))
+            pos = dg_meta(("fullpool_pos_step", int(T), str(device), int(bool(_abs))),
+                          lambda: _fp(off), lambda b, p: b.copy_(_fp(p)))
+            slot = dg_meta(("fullpool_slot_step", int(T), str(device), int(bool(_abs))),
+                           lambda: (1 + pos // BS) * BS + pos % BS,
+                           lambda b, p: b.copy_((1 + _fp(p) // BS) * BS + _fp(p) % BS))
+        else:
+            pos = _meta(("fullpool_pos", int(T), int(off), str(device)),
+                        lambda: torch.arange(T, dtype=torch.int32, device=device)
+                        + (off if _abs else 0))
+
+            # ★ 池：**整段序列都从 block 1 开始装**（block 0 恒空是官方的池约定）。
+            #   之前把 pos<128 写成 -1 是错的 —— 那样短序列（T<128）一个 KV 都写不进去。
+            slot = _meta(("fullpool_slot", int(T), int(off), str(device)),
+                         lambda: (1 + pos // BS) * BS + pos % BS)
+    torch.ops.custom.kv_compress_epilog_v2(
+        pool.view(-1, pool.shape[-1]), kv, slot,
+        quant_group_size=32, quant_mode="mxfp8_bf16", round_scale=True)
+    _hold(st)["_full_pool_nblk" + _sfx(ctx, "win")] = nblk
+
+
+# ── 2026-10-31（208 agent 要求）：rope 调用实参 dump ──────────────────────
+#   hit + CP2 的 pass2 在 aclnnInplacePartialRotaryMul 崩 507035（vector core）。
+#   每次调用前把实参落盘，用于 pass1 vs pass2 对照。写文件（--pure-log 吞 stdout）。
+def _rope_dump(site, x, cos, sin, partial, mode, ctx=None):
+    import json as _j
+    import os as _o
+    _d = _o.environ.get("DS41M_ROPE_DUMP", "").strip()
+    if not _d:
+        return
+    try:
+        _o.makedirs(_d, exist_ok=True)
+        _c = ctx or {}
+        _rec = {
+            "site": int(site),
+            "pass": int(getattr(_CORE, "PASS_NO", 0) or 0) if _CORE else 0,
+            "pid": _o.getpid(),
+            "x_shape": list(x.shape), "x_stride": list(x.stride()),
+            "x_dtype": str(x.dtype), "x_contig": bool(x.is_contiguous()),
+            "x_numel": int(x.numel()), "x_ptr": int(x.data_ptr()),
+            "cos_shape": list(cos.shape), "cos_stride": list(cos.stride()),
+            "cos_numel": int(cos.numel()), "cos_ptr": int(cos.data_ptr()),
+            "cos_contig": bool(cos.is_contiguous()),
+            "sin_shape": list(sin.shape), "sin_stride": list(sin.stride()),
+            "sin_numel": int(sin.numel()), "sin_ptr": int(sin.data_ptr()),
+            "sin_contig": bool(sin.is_contiguous()),
+            "partial": list(partial) if partial else None,
+            "mode": str(mode),
+            "idx": int(_c.get("idx", -1) or -1),
+            "off": int(_c.get("pos_offset", 0) or 0),
+            "T": int(_c.get("T", 0) or 0),
+            "L_full": int(_c.get("L_full", 0) or 0),
+            "alias_x_cos": int(x.data_ptr()) == int(cos.data_ptr()),
+            "alias_x_sin": int(x.data_ptr()) == int(sin.data_ptr()),
+            # 关键判据：cos 表行数是否覆盖 x 的行数
+            "cos_rows": int(cos.shape[0]) if cos.dim() else 0,
+            "x_rows": int(x.shape[0]) if x.dim() else 0,
+            "rows_ok": (int(cos.shape[0]) >= int(x.shape[0]))
+                       if (cos.dim() and x.dim()) else None,
+        }
+        _f = _o.path.join(_d, "rope_%d_s%d.jsonl" % (_rec["pid"], _rec["site"]))
+        with open(_f, "a") as _fh:
+            _fh.write(_j.dumps(_rec) + "\n")
+    except Exception:
+        pass
+
+
+def _cmp_state_of(st, ctx, ratio, D, device):
+    """压缩 state ring（与 `_kv_compress` 内联创建同一 key/几何；两条路径共用一块）。"""
+    _sb = max(int(ratio), int(ctx.get("state_block")
+                              or os.environ.get("DS41M_CMP_STATE_BLOCK", "0") or 0))
+    key = f"_cmp_state_L{ctx['idx']}"
+    _nb = max(2, int(ctx.get("_cmp_sb", 1) or 1) + 1)
+    stc = _hold(st).get(key)
+    if stc is not None and int(stc.shape[1]) != _sb:
+        stc = None
+    if stc is None:
+        if _KV_MGR is not None:
+            stc = _KV_MGR.cmp_state(_hold(st), int(ctx["idx"]), _sb, D, device, nblocks=_nb)
+        else:
+            stc = torch.zeros(_nb, _sb, 2, D, dtype=torch.float32, device=device)
+            _hold(st)[key] = stc
+    elif int(stc.shape[0]) < _nb:
+        if _KV_MGR is not None:
+            stc = _KV_MGR.cmp_state(_hold(st), int(ctx["idx"]), _sb, D, device, nblocks=_nb)
+        else:
+            grow = torch.zeros(_nb - int(stc.shape[0]), _sb, 2, D, dtype=torch.float32, device=device)
+            stc = torch.cat([stc, grow], 0)
+            _hold(st)[key] = stc
+    return stc
+
+
+def _cp_gather_2seg(x, cp):
+    """官方 `gather_cp_segments`：每 rank 送两段（本地 head/tail），按全局段序拼回。
+
+    直接走 CP 组的 `all_gather`——`cp.merge_global` 会校验"行数 == plan.local_rows"，
+    不适合"每段一行"的小载荷。
+    """
+    import torch.distributed as _d
+    c = int(cp.plan.cp_size)
+    if c <= 1:
+        return x.contiguous()
+    x = x.contiguous()
+    outs = [torch.empty_like(x) for _ in range(c)]
+    _d.all_gather(outs, x, group=cp.group)
+    idx = [(b, 0) if b < c else (2 * c - 1 - b, 1) for b in range(2 * c)]
+    # ★ 入参必须是 [2, R, ...]（R=每段行数，段末一行时 R=1）；输出 [2c·R, ...]。
+    #   stack（不是 cat）：cat 会把每段切成的一维行拼成 [2c·H] 向量，下游取 [i] 变 0 维。
+    st = torch.stack([outs[r][h] for r, h in idx], 0)     # [2c, R, ...]
+    return st.flatten(0, 1)
+
+
+def _kv_compress_cp_segments(st, ctx, w, cp):
+    """DeepInfer `compressor.forward_cp` 的**计算**部分（官方口径，性能与数值同官方）。
+
+    本 rank 的 zigzag 两段**各自**调压缩器（各自的 start_pos / seqused / 独立 state block）；
+    段起点不是 ratio 整数倍时，用**上一段的末 hidden** 投影出 carry 写进本段 state
+    （官方 `gather_remainders` + `write_remainder_state`）——这样每段的结果与
+    CP1 的全序列压缩逐位相同，且不需要 gather hidden / 每 rank 全量复算。
+
+    ★ 与官方一致的另两点随后补：①压缩行量化后 `gather_cp_segments` + 散写（本函数目前
+      依赖各自写池，随后由 `_cp_cmp_gather_rows` 统一收齐）；②`sync_cp_state`。
+    """
+    import torch.nn.functional as _F
+    ratio = max(1, int(ctx["ratio"]))
+    H = int(ctx["H"])
+    D = int(ctx["head_dim"])
+    L_full = int(ctx.get("L_full") or cp.plan.total_q)
+    off0 = int(getattr(cp, "pos_offset", 0) or 0)
+    x = st["x"].reshape(-1, H)
+    blocks = [b for b in cp.plan.local_blocks() if int(b[2]) > 0]
+    if not blocks:
+        return
+    _dbg = os.environ.get("DS41M_CP_SEG_DBG", "").strip().lower() in ("1", "on", "true", "yes")
+    # 段末 hidden：每段一行 → 全 rank 收齐（官方 gather_remainders 的 bf16 载荷，≤2 行/rank）
+    tails_all = None
+    if ratio > 1 and len(blocks) > 1:
+        tails = torch.stack([x[int(ls) + int(nv) - 1] for ls, gs, nv in blocks]).contiguous()
+        if _dbg:
+            print(f"  [cp-seg] tails local{tuple(tails.shape)} ratio={ratio} "
+                  f"blocks={[(int(a), int(b), int(c)) for a, b, c in blocks]}", flush=True)
+        tails_all = _cp_gather_2seg(tails.view(2, 1, -1), cp)
+    _ps = int(blocks[0][2])                     # 每段行数（zigzag 等长，末段可能少 1）
+    if ratio > 1:
+        # 先按段数一次开够 state 块（增长语义：保留已有块里的前缀 carry）
+        _cmp_state_of(st, dict(ctx, _cmp_sb=len(blocks)), ratio, D, x.device)
+    lat_parts, kv_parts = [], []
+    for i, (ls, gs, nv) in enumerate(blocks):
+        ls, gs, nv = int(ls), int(gs), int(nv)
+        abs_start = off0 + gs
+        _gb = gs // max(1, _ps)                 # 全局段号（carry/overlap 判定用）
+        st2 = dict(st)
+        # ★★ 2026-10-30 修（carry 的干净解法）：段起点不是 ratio 整数倍时，把**上一段末
+        #   token** 的 hidden 拼到本段最前面、start_pos 提前 1 —— 让算子自己把边界组算完整，
+        #   不依赖 state carry 的投影口径。行数/分组与 CP1 完全一致（多出来的只有算子的
+        #   末尾 carry 行，本来就不写池）。与官方 write_remainder_state 数值等价。
+        # ★ 默认关（2026-10-30 实测负结果：overlap 后 latent 从第 0 行起分叉 361/480，
+        #   行/组对齐被破坏，比 carry 投影更差）。保留开关供后续排查。
+        _ov = (os.environ.get("DS41M_CP_SEG_OVERLAP", "0").strip().lower() not in
+               ("0", "off", "false", "no"))
+        _use_ov = bool(_ov and ratio > 1 and tails_all is not None
+                       and _gb > 0 and (abs_start % ratio))
+        _xs = x[ls:ls + nv]
+        _p0 = abs_start
+        _t2 = nv
+        if _use_ov:
+            _prev_row = tails_all[_gb - 1].view(1, -1).to(_xs.dtype)
+            _xs = torch.cat([_prev_row, _xs], 0).contiguous()
+            _p0 = abs_start - 1
+            _t2 = nv + 1
+        _f_sb = int(os.environ.get("DS41M_CP_SEG_SB", "0") or 0)   # 诊断：强制 state 块号
+        ctx2 = dict(ctx, T=_t2, pos_offset=_p0, L_full=L_full,
+                    cu_seqlens=[0, _t2], seq_lens=[L_full], row_lens=[_t2], n_seqs=1,
+                    _cmp_T=_t2, _cmp_sb=(_f_sb or (1 + i)), _cp_full=1)
+        ctx2.pop("cp_positions", None)
+        ctx2.pop("cp_total_q", None)
+        st2["x"] = _xs
+        # ── 官方 write_remainder_state：段起点非 ratio 对齐 → 上一段末 hidden 投影成 carry ──
+        # ★ 全局第 0 段：前一个 token 在**前缀**里（stage A 已写进 state 池），
+        #   不能拿本段末 hidden 顶替（会覆盖前缀 carry）。
+        _carry_on = os.environ.get("DS41M_CP_SEG_CARRY", "1").strip().lower() not in (
+            "0", "off", "false", "no")
+        if (not _use_ov) and _carry_on and ratio > 1 and tails_all is not None \
+                and (abs_start % ratio) and _gb > 0:
+            _sb = max(int(ratio), int(ctx.get("state_block")
+                                      or os.environ.get("DS41M_CMP_STATE_BLOCK", "0") or 0))
+            stc = _cmp_state_of(st, ctx2, ratio, D, x.device)
+            prev = tails_all[_gb - 1].float()
+            # ★ 官方 `write_remainder_state`（compressor.py:255）的顺序：
+            #   state = cat([linear(source, wkv), linear(source, wgate)]) → dim0=wkv、dim1=wgate。
+            _lat_s = _F.linear(prev, w["attn.compressor.wkv.weight"].float())
+            _sc_s = _F.linear(prev, w["attn.compressor.wgate.weight"].float())
+            _row = (abs_start - 1) % _sb
+            _sbw = int(os.environ.get("DS41M_CP_SEG_SB", "0") or 0) or (1 + i)
+            if os.environ.get("DS41M_CP_SEG_SENTINEL", "").strip().lower() in (
+                    "1", "on", "true", "yes"):
+                # 哨兵：把整行填成大常数，用来证实算子读的是不是这一 (block,row)
+                stc[_sbw, _row, :, :] = 100.0
+            else:
+                stc[_sbw, _row, 0, :] = _lat_s
+                stc[_sbw, _row, 1, :] = _sc_s
+        if _dbg:
+            print(f"  [cp-seg] i={i} gs={gs} nv={nv} off={abs_start} "
+                  f"align={abs_start % ratio == 0} sb={1 + i}", flush=True)
+        kv_compress(st2, ctx2, w)
+        if _dbg and ratio > 1:
+            # 诊断：算子写进 state 的那一行 vs 我们用 hidden 投影算出的值（判定投影口径）
+            try:
+                import torch.nn.functional as _F2
+                _sb2 = max(int(ratio), int(ctx.get("state_block")
+                                          or os.environ.get("DS41M_CMP_STATE_BLOCK", "0") or 0))
+                _stc2 = _hold(st).get(f"_cmp_state_L{ctx['idx']}")
+                _last = x[ls + nv - 1].float()
+                _wkv = _F2.linear(_last, w["attn.compressor.wkv.weight"].float())
+                _wgt = _F2.linear(_last, w["attn.compressor.wgate.weight"].float())
+                _row2 = (abs_start + nv - 1) % _sb2
+                _s0 = _stc2[1 + i, _row2, 0, :].float()
+                _s1 = _stc2[1 + i, _row2, 1, :].float()
+                print(f"  [cp-seg-state] i={i} row={_row2} "
+                      f"d0_wkv={( _s0-_wkv).abs().max().item():.4g} d0_wgt={(_s0-_wgt).abs().max().item():.4g} "
+                      f"d1_wkv={(_s1-_wkv).abs().max().item():.4g} d1_wgt={(_s1-_wgt).abs().max().item():.4g} "
+                      f"|s0|sum={float(_s0.abs().sum()):.4g} wkv_sum={float(_wkv.abs().sum()):.4g}", flush=True)
+            except Exception as _e3:                  # noqa: BLE001
+                print(f"  [cp-seg-state] 失败 {type(_e3).__name__}: {_e3}", flush=True)
+        _lat = st2.get("cmp_latent")
+        _kv = st2.get("cmp_kv")
+        if _dbg:
+            print(f"  [cp-seg] i={i} out lat_rows={0 if _lat is None else int(_lat.shape[0])} "
+                  f"kv_rows={0 if _kv is None else int(_kv.shape[0])} "
+                  f"T={ctx2.get('T')} off={ctx2.get('pos_offset')}", flush=True)
+        if _lat is not None:
+            lat_parts.append(_lat)
+        if _kv is not None:
+            kv_parts.append(_kv)
+    # ★★ 2026-10-31（208 agent 指定的形状隔离实验）：DS41M_CMP_SHAPE_ISO=1
+    #   段 0（gs=0、无 carry）理论上应与全量逐位相同。这里同进程再跑一次全量，
+    #   比段 0 覆盖的行，判定"分段调用是否改变数值"。
+    if (os.environ.get("DS41M_CMP_SHAPE_ISO", "").strip().lower()
+            in ("1", "on", "true", "yes") and ratio > 1 and len(blocks) >= 1
+            and int(ctx.get("idx", -1)) == int(os.environ.get("DS41M_SHAPE_ISO_LAYER", "2"))):
+        try:
+            _x_full = cp.merge_global(x)
+            _tot = int(_x_full.shape[0])
+            st_iso = dict(st)
+            st_iso["x"] = _x_full
+            # ★ 用独立 state 块（3），否则会覆盖段 0 正在用的块 1，对照全被污染
+            c_iso = dict(ctx, pos_offset=off0, L_full=L_full, T=_tot, _cmp_T=_tot,
+                         _cmp_sb=3, _cp_full=1, cu_seqlens=[0, _tot],
+                         seq_lens=[L_full], row_lens=[_tot], n_seqs=1)
+            c_iso.pop("cp_positions", None)
+            c_iso.pop("cp_total_q", None)
+            kv_compress(st_iso, c_iso, w)
+            _lf_iso = st_iso.get("cmp_latent")
+            _ls0 = lat_parts[0] if lat_parts else None
+            if torch.is_tensor(_lf_iso) and torch.is_tensor(_ls0):
+                # 段 0 的官方行数（floor）
+                _gs0 = int(blocks[0][1])
+                _nv0 = int(blocks[0][2])
+                _lo = (off0 + _gs0) // ratio
+                _n0 = (off0 + _gs0 + _nv0) // ratio - _lo
+                _n0 = min(_n0, int(_ls0.shape[0]), int(_lf_iso.shape[0]) - _lo)
+                _a = _ls0[:_n0].float()
+                _b = _lf_iso[_lo:_lo + _n0].float()
+                _dd = (_a - _b).abs()
+                _eq = bool(torch.equal(_ls0[:_n0], _lf_iso[_lo:_lo + _n0]))
+                _rows = torch.nonzero((_a != _b).any(-1)).flatten().tolist()
+                print(f"  [shape-iso] idx={ctx.get('idx')} rank={cp.plan.cp_rank} "
+                      f"seg0_rows={_n0} equal={_eq} diff_rows={len(_rows)} "
+                      f"max|d|={float(_dd.max()):.6g} "
+                      f"mean|d|={float(_dd.mean()):.6g} rows[:12]={_rows[:12]}",
+                      flush=True)
+                print(f"  [shape-iso] VERDICT: "
+                      f"{'shape-invariant (seg 实现有 bug)' if _eq else 'shape-dependent (官方固有)'}",
+                      flush=True)
+        except Exception as _e6:                    # noqa: BLE001
+            print(f"  [shape-iso] 失败 {type(_e6).__name__}: {_e6}", flush=True)
+
+    if lat_parts:
+        # ★ 保留**逐段本地 latent**：索引 K 的行级 gather（官方 update_cp_indexer_cache）
+        #   要按段在本地算 K 再收行，不能只留 gather 后的全量 latent。
+        st["_cp_seg_latents"] = list(lat_parts)
+        st["_cp_seg_blocks"] = [(int(a), int(b), int(c)) for a, b, c in blocks]
+        st["cmp_latent"] = torch.cat(lat_parts, 0)
+    if kv_parts:
+        st["cmp_kv"] = torch.cat(kv_parts, 0)
+    # ── 官方 #1：压缩行 **量化后** gather（320 B/行）→ 按绝对压缩行号散写 ──
+    #    不再 gather hidden、不再每 rank 全量复算。
+    if os.environ.get("DS41M_CP_SEG_GATHER", "1").strip().lower() not in ("0", "off", "false", "no"):
+        _cp_cmp_gather_rows(st, ctx, cp, blocks, off0, L_full, ratio, _ps, D, lat_parts)
+    if _dbg:
+        print(f"  [cp-seg] rank={os.environ.get('RANK')} lat_rows={int(st['cmp_latent'].shape[0])} "
+              f"(CP1 全量应为 {L_full // max(1, ratio)})", flush=True)
+    # ── 诊断（DS41M_CP_SEG_AB=1）：同进程再走一遍旧的全量复算，逐行比 latent ──
+    #    用来判定"分段调用算子"与"全量调用"本身是否等价（排除跨进程 fake 池差异）。
+    if os.environ.get("DS41M_CP_SEG_AB", "").strip().lower() in ("1", "on", "true", "yes"):
+        try:
+            st3 = dict(st)
+            x_full = cp.merge_global(st["x"].reshape(-1, H))
+            tot = int(x_full.shape[0])
+            st3["x"] = x_full
+            cf = dict(ctx, pos_offset=off0, L_full=L_full, T=tot, _cmp_T=tot,
+                      _cp_full=1, cu_seqlens=[0, tot], seq_lens=[L_full],
+                      row_lens=[tot], n_seqs=1)
+            cf.pop("cp_positions", None)
+            cf.pop("cp_total_q", None)
+            kv_compress(st3, cf, w)
+            _lf = st3.get("cmp_latent")
+            _lg = st.get("cmp_latent")
+            if torch.is_tensor(_lf) and torch.is_tensor(_lg):
+                # ★ 2026-10-31（208 agent 口径）：按**全局压缩行号**对齐。
+                #   full 走 packed 路径，产出 = n_real + n_pad（多 1 行 pad）；
+                #   seg 已按 ke//r-qs//r 正确筛掉 pad。
+                #   ⇒ 比 full[:n_valid] vs seg[:n_valid]，不是 min(两臂行数)。
+                _nv_ab = max(0, (off0 + int(cp.plan.total_q)) // max(1, ratio)
+                             - off0 // max(1, ratio))
+                n = min(_nv_ab, int(_lf.shape[0]), int(_lg.shape[0]))
+                _dd_ab = os.environ.get("DS41M_SEG_AB_DUMP", "").strip()
+                if _dd_ab and int(ctx.get("idx", -1)) == 2:
+                    try:
+                        os.makedirs(_dd_ab, exist_ok=True)
+                        torch.save(dict(
+                            full_lat=_lf.detach().cpu(),
+                            seg_lat=_lg.detach().cpu(),
+                            blocks=[(int(a), int(b), int(c)) for a, b, c in blocks],
+                            off0=int(off0), L_full=int(L_full), ratio=int(ratio),
+                            ps=int(_ps), D=int(D), T_full=int(cp.plan.total_q),
+                            cp_size=int(cp.plan.cp_size), rank=int(cp.plan.cp_rank),
+                        ), os.path.join(_dd_ab, f"segab_L{ctx.get('idx')}_r{cp.plan.cp_rank}.pt"))
+                        print(f"  [cp-seg-ab-dump] saved L{ctx.get('idx')} r{cp.plan.cp_rank}",
+                              flush=True)
+                    except Exception as _e5:          # noqa: BLE001
+                        print(f"  [cp-seg-ab-dump] 失败 {type(_e5).__name__}: {_e5}",
+                              flush=True)
+                print(f"  [cp-seg-ab-geom] idx={ctx.get('idx')} "
+                      f"full_rows={int(_lf.shape[0])} seg_rows={int(_lg.shape[0])} "
+                      f"aligned_n={n} (n_valid={_nv_ab})", flush=True)
+                d = (_lf[:n].float() != _lg[:n].float()).any(-1)
+                _bad = torch.nonzero(d).flatten()
+                _first = int(_bad[0]) if _bad.numel() else -1
+                _md = float((_lf[:n].float() - _lg[:n].float()).abs().max())
+                print(f"  [cp-seg-ab] idx={ctx.get('idx')} rows={n} diff={int(d.sum())} "
+                      f"first={_first} max|d|={_md:.4g} full_rows={int(_lf.shape[0])} "
+                      f"seg_rows={int(_lg.shape[0])}", flush=True)
+                # ★ 差异行清单 + 分布（判定"整段型 vs 离散型"、是否只在段首）
+                try:
+                    _rows = [int(x) for x in _bad[:200]]
+                    print(f"  [cp-seg-ab-rows] idx={ctx.get('idx')} "
+                          f"n_diff={int(d.sum())} rows[:60]={_rows[:60]}", flush=True)
+                    _ps_seg = int(blocks[0][2]) if blocks else 1
+                    _ps_cmp = max(1, _ps_seg // max(1, ratio))
+                    _mod_seg = {}
+                    _mod_cmp = {}
+                    for _r in [int(x) for x in _bad]:
+                        _mod_seg[_r % _ps_seg] = _mod_seg.get(_r % _ps_seg, 0) + 1
+                        _mod_cmp[_r % _ps_cmp] = _mod_cmp.get(_r % _ps_cmp, 0) + 1
+                    _top_seg = sorted(_mod_seg.items(), key=lambda kv: -kv[1])[:6]
+                    _top_cmp = sorted(_mod_cmp.items(), key=lambda kv: -kv[1])[:6]
+                    print(f"  [cp-seg-ab-dist] idx={ctx.get('idx')} "
+                          f"ps_seg={_ps_seg} ps_cmp={_ps_cmp} "
+                          f"top(row%ps_seg)={_top_seg} top(row%ps_cmp)={_top_cmp}",
+                          flush=True)
+                except Exception as _e4:              # noqa: BLE001
+                    print(f"  [cp-seg-ab-rows] 失败 {type(_e4).__name__}: {_e4}", flush=True)
+        except Exception as _e:                       # noqa: BLE001
+            print(f"  [cp-seg-ab] 失败 {type(_e).__name__}: {_e}", flush=True)
+
+
+def _cp_cmp_gather_rows(st, ctx, cp, blocks, off0, L_full, ratio, ps, D, lat_parts=None):
+    """把各 rank 的压缩行收齐并散写回本地池（官方 `gather_cp_segments` + `scatter_cache_rows`）。
+
+    载荷 = 量化后的压缩行（`CMP_ROW_W`=320 B/行），与官方同量级；
+    比 gather hidden（~10 KB/token）+ 每 rank 全量复算省 ~30–60× 通信、省 ×cp 算力。
+    ★ 命中 replay 段的抑制行（pos < cut）**不参与** gather/scatter（官方同样不写）。
+    """
+    hold = _hold(st)
+    _sfx_cmp = _sfx(ctx, "cmp")
+    nblk = int(hold.get(f"_cmp_nblk_r{ratio}" + _sfx_cmp) or 0)
+    if nblk <= 0:
+        return
+    dev = st["x"].device
+    pool = _cache_buf(st, f"_cmp_pool_r{ratio}" + _sfx_cmp,
+                      (1 + nblk) * BS, CMP_ROW_W, dev, torch.uint8).view(-1, CMP_ROW_W)
+    R = int(-(-ps // max(1, ratio))) + 1          # 每段压缩行上界（含余数行）
+    _rep = int(ctx.get("hit_replay_tail") or 0)
+    _cut = ((off0 + _rep) // ratio) if (off0 > 0 and _rep > 0) else -1
+
+    def _rows_of(gs, nv):
+        # ★★ 2026-10-31（CP4 空泡）：`(p, slot)` 只跟 (n, pos0, BS, device) 有关，是**几何量**
+        #   —— 每层每段重发 Range/Add/FloorDiv/Mul/FloorMod/Add 6 个 AIV 算子毫无意义。
+        #   缓存进 `_meta`（几何变才清）。
+        pos0 = (off0 + int(gs)) // ratio
+        n = max(0, min(R, (off0 + int(gs) + int(nv)) // ratio - pos0))
+        if n <= 0:
+            return None, 0, 0, 0
+        p, slot = _meta(
+            ("cmpseg_rows", int(n), int(pos0), int(BS), str(dev)),
+            lambda: (torch.arange(n, device=dev) + pos0,
+                     (1 + (torch.arange(n, device=dev) + pos0) // BS) * BS
+                     + (torch.arange(n, device=dev) + pos0) % BS))
+        # replay 抑制：p 是**连续区间** [pos0, pos0+n) ⇒ "p >= cut" 等价于 host 侧下标
+        #   `lo = max(0, cut-pos0)` 之后的切片。旧写法发 GreaterEqual/ones_like +
+        #   `int(sel.sum())`（**设备 reduce + 同步**）+ boolean-mask 索引（NonZero/Index）
+        #   共 5 个算子 × 每段，CP4 每 forward 10 段 ≈ 50 个任务 + 10 次 host 同步。
+        lo = max(0, int(_cut) - int(pos0)) if _cut >= 0 else 0
+        m = max(0, n - lo)
+        return slot, lo, m, n
+
+    pad = torch.zeros(2 * R, CMP_ROW_W, dtype=torch.uint8, device=dev)
+    for i, (ls, gs, nv) in enumerate(blocks):
+        slot, lo, m, n = _rows_of(gs, nv)
+        if m > 0:
+            pad[i * R:i * R + m] = pool.index_select(0, slot[lo:lo + m])
+    all_rows = _cp_gather_2seg(pad.view(2, R, -1), cp)   # [2·cp·R, W] 全局段序
+    total = int(2 * cp.plan.cp_size)
+    for b in range(total):
+        gs_b = b * int(ps)
+        nv_b = max(0, min(int(ps), int(cp.plan.total_q) - gs_b))
+        if nv_b <= 0:
+            continue
+        slot, lo, m, n = _rows_of(gs_b, nv_b)
+        if m > 0:
+            pool.index_copy_(0, slot[lo:lo + m], all_rows[b * R:b * R + m])
+    if os.environ.get("DS41M_CP_SEG_DBG", "").strip().lower() in ("1", "on", "true", "yes"):
+        kb = int(2 * cp.plan.total_q) // max(1, ratio) * CMP_ROW_W // 1024
+        print(f"  [cp-seg] gather rows R={R} segs={total} payload={kb} KB (320B/row)", flush=True)
+    # ── latent 行 gather（过渡）：让索引 K 写侧拿到**全量 latent**（与 CP1 同源）──
+    #    ★ 这是 Stage 2 的临时形态；官方是 gather **K 行(68B/行)**，见 WORKPLAN E2/E3.2。
+    if lat_parts:
+        _dt = lat_parts[0].dtype
+        lat_pad = torch.zeros(2 * R, D, dtype=_dt, device=dev)
+        for i, _l in enumerate(lat_parts[:2]):
+            m = min(R, int(_l.shape[0]))
+            lat_pad[i * R:i * R + m] = _l[:m]
+        lat_all = _cp_gather_2seg(lat_pad.view(2, R, -1), cp)
+        outs = []
+        for b in range(total):
+            gs_b = b * int(ps)
+            nv_b = max(0, min(int(ps), int(cp.plan.total_q) - gs_b))
+            if nv_b <= 0:
+                continue
+            _slot, _lo, _m, n = _rows_of(gs_b, nv_b)
+            if n > 0:
+                outs.append(lat_all[b * R:b * R + n])
+        if outs:
+            st["cmp_latent"] = torch.cat(outs, 0)
+
+
+def _kv_compress_cp_deepinfer(st, ctx, w, cp):
+    """CP 压缩的 DeepInfer 口径（`DS41M_CP_CMP_KERNEL=deepinfer`，**非默认**）：
+
+    本地投影（Gate→score, A→latent，fp32，DeepInfer `use_fp32_output` 同口径）
+    → CP all-gather projected KV（4 KB/token，替代 hidden 的 10 KB/token）
+    → `thirdparty/deepinfer_compress_asc.py` 在全序列上做组内 softmax 加权 + state 更新
+    → 复用 `_kv_compress` 的 norm/rope/池写后半段（`_cmp_pre` 钩子）。
+
+    ★ 与厂商融合算子不逐位（实测 bf16 ULP 级），默认关；1M profiling 备选。
+    """
+    import torch.nn.functional as _F
+    import deepinfer_compress as _dic
+    ratio = max(1, int(ctx["ratio"]))
+    H, D = int(ctx["H"]), int(ctx["head_dim"])
+    tot = int(cp.plan.total_q)
+    if int(getattr(cp, "pos_offset", 0) or 0) > 0:
+        # ★ 2026-10-28：命中 stage B（段起点 L-R）时该 kernel 没有"进位 state / 非 0 起点"口径
+        #   ⇒ 显式报错，不许出近似数。命中 stage A（off=0）照常可用。
+        raise RuntimeError(
+            "DS41M_CP_CMP_KERNEL=deepinfer 不支持命中段的非 0 起点（pos_offset>0）；"
+            "请用默认逐位路径（不设该环境变量）")
+    x = st["x"].reshape(-1, H)
+    wkv = w["attn.compressor.wkv.weight"]
+    if ratio > 1:
+        W = torch.cat([w["attn.compressor.wgate.weight"], wkv], 0).to(torch.float32)
+    else:
+        W = wkv.to(torch.float32)
+    proj = _F.linear(x.to(torch.float32), W).contiguous()     # [local, 2D | D] fp32
+    pf = cp.merge_global(proj)                                 # 全局序 [tot, ...]
+    nc = tot // ratio
+    out = torch.empty(nc, D, dtype=torch.bfloat16, device=x.device)
+    if ratio > 1:
+        stc = _cmp_state_of(st, ctx, ratio, D, x.device)
+        t32 = torch.int32
+        cu_q = _meta(("di_cu_q", tot), lambda: torch.tensor([0, tot], dtype=t32, device=x.device))
+        cu_k = _meta(("di_cu_k", tot), lambda: torch.tensor([0, tot], dtype=t32, device=x.device))
+        cu_c = _meta(("di_cu_c", nc), lambda: torch.tensor([0, nc], dtype=t32, device=x.device))
+        cbm = _meta(("di_cbm", nc), lambda: torch.zeros(nc, dtype=t32, device=x.device))
+        sbt = _meta(("di_sbt",), lambda: torch.tensor([1], dtype=t32, device=x.device))
+        _dic.compress_prefill(pf[:, :D], pf[:, D:], stc, out, cu_q, cu_k, cu_c, cbm,
+                              sbt, ratio=ratio)
+    else:
+        out = pf.to(torch.bfloat16)                            # c1：latent 直通（DeepInfer 同）
+    st2 = dict(st)
+    st2["_cmp_pre"] = out
+    # ★ 2026-10-28（命中 + CP）：绝对位置口径（stage A 段起点 0、池按全局 L 开；
+    #   stage B 的段起点 >0 该 kernel 不支持，已在上方显式拦掉）
+    ctx2 = dict(ctx, pos_offset=int(getattr(cp, "pos_offset", 0) or 0),
+                L_full=int(ctx.get("L_full") or tot), T=tot, _cmp_T=tot, _cp_full=1)
+    ctx2.pop("cp_positions", None)
+    ctx2.pop("cp_total_q", None)
+    _kv_compress(st2, ctx2, w)
+    for _k in ("cmp_kv", "cmp_latent"):
+        if st2.get(_k) is not None:
+            st[_k] = st2[_k]
+
+
+@op("kv_compress")
+def _kv_compress(st, ctx, w):
+    """真压缩：官方 `Compressor.forward`（compressor.py:178）—— **不是**拿滑窗 kv 写池。
+
+        ① prolog（compressor.py:107-176）：
+             ratio>1: kv = ds41.compressor(x, wkv.weight, wgate.weight, seqused, start_pos,
+                                          cmp_ratio, cu_seqlens, state_cache.flatten(-2),
+                                          state_block_table)     ← 融合压缩算子
+             ratio==1: kv = F.linear(x, wkv.weight)              ← 普通 bf16 线性
+             kv = npu_rms_norm(kv, compressor.norm.weight, eps)
+             latent = kv.clone()                                 ← 给索引器做 K（逆 rope 之前）
+             rope(kv, c{ratio}a 表, partial_slice=[448,512])     ← 单请求 start_pos=0 → 位置 0..n-1
+        ② epilog（compressor.py:98-104）：kv_compress_epilog_v2(cmp_cache, kv, slot, mxfp4, group16)
+    """
+    # ★ CP Step 3（DeepInfer 口径：先把 KV 侧凑成**全序列**再压）：本 rank 只有
+    #   head-tail 行，压缩必须跑在全局 hidden 上（压缩行是跨 token 分组的）；
+    #   这里 gather hidden → 用 off=0/L_full=total_q 的全长路径**复算一遍**，写满
+    #   full 压缩池 / state / 索引 K 缓存（各 rank 复算同值，无额外通信）。
+    #   通信量：hidden bf16 = total_q×H×2B（DeepInfer 是 gather projected KV，
+    #   更省；先正确后优化，见 NOTES/2026-10-23-cp-deepinfer-implementation.md）。
+    _cp_cmp = _cp_of(ctx)
+    # ★ 2026-10-30：分段路径**暂只用于命中段**（pos_offset>0）。plain（off=0）下 8k 分段
+    #   会出现 aicore exception（507015/507035，第二遍 forward 起）——未定位，先不启用；
+    #   `DS41M_CP_SEG_PLAIN=1` 可强制打开做复现。
+    _seg_ok = (int(ctx.get("pos_offset", 0) or 0) > 0
+               or os.environ.get("DS41M_CP_SEG_PLAIN", "").strip().lower() in
+               ("1", "on", "true", "yes"))
+    # ★ 2026-10-30 决策 A（用户拍板）：以**官方 CP 流程**为准 —— 命中段的压缩默认走
+    #   `seg`（两段各自压缩 + 行 gather/散写 + 官方 carry 投影）。边界组与 CP1 的
+    #   "算子内部进位"不保证逐位（官方设计本身如此），对拍基准改为官方 CP 产物。
+    #   plain 段暂不启用（507015/507035 aicore 异常未定位），由 `_seg_ok` 拦住。
+    _flow = os.environ.get("DS41M_CP_CMP_FLOW", "").strip().lower() or "seg"
+    if _cp_cmp is not None and _seg_ok and _flow in ("seg", "official", "deepinfer"):
+        # ★ 2026-10-30（官方口径，`NOTES/2026-10-30-cp-official-flow.md`）：
+        #   本 rank 两段各自压缩 + 跨段 carry（余数），再 gather 压缩行散写。
+        return _kv_compress_cp_segments(st, ctx, w, _cp_cmp)
+    if _cp_cmp is not None and os.environ.get("DS41M_CP_CMP_KERNEL", "").strip().lower() in (
+            "deepinfer", "di"):
+        # 可选：DeepInfer 口径（本地投影→gather projected→他们的 TileLang kernel）。
+        return _kv_compress_cp_deepinfer(st, ctx, w, _cp_cmp)
+    if _cp_cmp is not None:
+        # 默认（逐位）：gather hidden → 厂商融合算子全量复算。
+        H0 = int(ctx["H"])
+        # ★ 侧流预取（runner._cp_maybe_prefetch_cmp）：同一条 all-gather 提前发起，
+        #   这里只等事件；x 张量身份 / CP 状态不一致则回退正常路径（逐位不变）。
+        _pre = st.pop("_cp_cmp_pre", None)
+        x_full = None
+        if _pre is not None:
+            _pf, _ev, _pfx, _pfc = _pre
+            if _pfx is st.get("x") and _pfc is _cp_cmp:
+                try:
+                    _cur = torch.npu.current_stream()
+                    _cur.wait_event(_ev)
+                    # 跨流生命周期：告诉了 allocator 主流也在用（否则侧流池会提前复用）
+                    _pf.record_stream(_cur)
+                    x_full = _pf
+                except Exception:                       # noqa: BLE001
+                    x_full = None
+        if x_full is None:
+            x_full = _cp_cmp.merge_global(st["x"].reshape(-1, H0),
+                                          buf_key="cmp_hidden")
+        tot = int(x_full.shape[0])
+        st2 = dict(st)
+        st2["x"] = x_full
+        # ★ 2026-10-28（命中 + CP）：全量复算必须落在**绝对位置**上——
+        #   stage B 的段起点 off=L-R，压缩池/state 的池行号与 rope 都按它算
+        #   （= CP1 非 CP 路径的 pos_offset 口径）；L_full 用**全局 L**，
+        #   否则 stage A 建的压缩池几何（nblk 由 L//ratio 决定）会被 stage B 重建 ⇒ 前缀丢失。
+        _Lg = int(ctx.get("L_full") or tot)
+        if os.environ.get("DS41M_CMP_XSHA"):
+            try:
+                import hashlib as _hx2
+                _xf2 = os.environ.get("DS41M_CMP_XSHA_FILE", "").strip()
+                _sh2 = _hx2.sha1(x_full[:4].detach().float().cpu().numpy().tobytes()).hexdigest()[:16]
+                _stc = _hold(st).get(f"_cmp_state_L{ctx['idx']}")
+                _ssum = float(_stc.float().sum()) if torch.is_tensor(_stc) else None
+                _l2 = (f"[cmp-x] rank={os.environ.get('RANK')} idx={ctx.get('idx')} "
+                       f"rows={int(tot)} off={int(getattr(_cp_cmp, 'pos_offset', 0) or 0)} "
+                       f"L={_Lg} T={int(tot)} cu={[0, int(tot)]} sl=[{_Lg}] "
+                       f"sb={ctx.get('_cmp_sb')} ssum={_ssum} cpfull=1(merged) sha={_sh2}")
+                print("  " + _l2, flush=True)
+                if _xf2:
+                    with open(_xf2, "a") as _fh2:
+                        _fh2.write(_l2 + "\n")
+            except Exception as _e2:              # noqa: BLE001
+                print(f"  [cmp-x] 失败 {type(_e2).__name__}: {_e2}", flush=True)
+        # ★★ 2026-10-28（命中 + CP 的最后一块）：gather 后的全局 hidden 必须走**与 CP1
+        #   相同的 packed 压缩实现**。以前这里直接调 `_kv_compress`（non-packed legacy），
+        #   plain 下两条实现逐位等价（所以 plain CP 一直是对的），但命中段（off>0）不等价：
+        #   实测层 2 的 `cmp_kv` 首个分叉、下游全错。ctx2 按 CP1 的单序列 packed 几何摆好。
+        ctx2 = dict(ctx, pos_offset=int(getattr(_cp_cmp, "pos_offset", 0) or 0),
+                    L_full=_Lg, T=tot, _cp_full=1,
+                    cu_seqlens=[0, int(tot)], seq_lens=[int(_Lg)],
+                    row_lens=[int(tot)], n_seqs=1)
+        ctx2.pop("cp_positions", None)
+        ctx2.pop("cp_total_q", None)
+        if os.environ.get("DS41M_CMP_ARGDBG"):
+            print(f"  [cmp-cp] rank={os.environ.get('RANK')} local={tuple(st['x'].shape)} merged={tot} "
+                  f"off={ctx2.get('pos_offset')} L={ctx2.get('L_full')} packed=True", flush=True)
+        kv_compress(st2, ctx2, w)
+        if os.environ.get("DS41M_CMP_DET"):
+            # 诊断：同一份 x、同一 ctx 连跑两次压缩 —— 判定算子是否确定性
+            try:
+                _l1 = st2.get("cmp_latent")
+                _kv1 = st2.get("cmp_kv")
+                st3 = dict(st)
+                st3["x"] = st2["x"]
+                _kv_compress(st3, dict(ctx2), w)
+                _l2 = st3.get("cmp_latent")
+                _d = int((_l1.float() != _l2.float()).any(-1).sum()) if (
+                    torch.is_tensor(_l1) and torch.is_tensor(_l2)) else -1
+                _md = float((_l1.float() - _l2.float()).abs().max()) if (
+                    torch.is_tensor(_l1) and torch.is_tensor(_l2)) else -1.0
+                print(f"  [cmp-det] rank={os.environ.get('RANK')} idx={ctx.get('idx')} "
+                      f"lat_diff_rows={_d} max|d|={_md:.4g}", flush=True)
+            except Exception as _e:               # noqa: BLE001
+                print(f"  [cmp-det] 失败 {type(_e).__name__}: {_e}", flush=True)
+        for _k in ("cmp_kv", "cmp_latent"):
+            if st2.get(_k) is not None:
+                st[_k] = st2[_k]
+        return
+    T = int(ctx.get("_cmp_T") or st["x"].shape[0])
+    if os.environ.get("DS41M_CMP_ARGDBG"):
+        print(f"  [cmp-plain] rank={os.environ.get('RANK')} idx={ctx.get('idx')} T={T} xrows={st['x'].shape[0]} "
+              f"off={ctx.get('pos_offset')} L={ctx.get('L_full')} cpfull={ctx.get('_cp_full')}", flush=True)
+    device, H, D = st["x"].device, ctx["H"], ctx["head_dim"]
+    ratio = max(1, int(ctx["ratio"]))
+    # ★ packed 真 batch：压缩器/索引器**逐请求**各调一次（契约最稳，非热点）；
+    #   逐请求的池用独立物理块（与窗口池同一约定）。
+    off = int(ctx.get("pos_offset", 0))            # 命中：本层 token 的绝对起始位置
+    if off and off % ratio and int(ctx.get("hit_replay_tail") or 0) > 0:
+        # 只对 **hit replay 段**提示：stage A/B 的进位 state 对不齐（近似而非等价）；
+        # 普通增量 decode 的奇数位置由 state_cache 精确进位，不再打这条提示。
+        _warn = _HIT_WARN
+        if (ratio, off) not in _warn:
+            _warn.add((ratio, off))
+            print(f"  [hit] ⚠️ 压缩起点 {off} 不是 ratio={ratio} 的整数倍："
+                  f"前缀末组的进位 state 无法精确复原（数值为近似）", flush=True)
+    L_full = int(ctx.get("L_full", off + T))       # 全序列长度（压缩池按它开）
+    d = _d41()                                     # BS 用模块全局（model_spec.block_size）
+    if os.environ.get("DS41M_CMP_XSHA"):
+        # 诊断：压缩器输入 x 的指纹（判定 CP1 与 CP2 全量/分段的输入是否真的相同）
+        try:
+            import hashlib as _hx
+            _xr = st["x"].reshape(-1, H)
+            _sh = _hx.sha1(_xr[:4].detach().float().cpu().numpy().tobytes()).hexdigest()[:16]
+            _line = (f"[cmp-x] rank={os.environ.get('RANK')} idx={ctx.get('idx')} "
+                     f"rows={int(_xr.shape[0])} off={int(off)} T={int(T)} "
+                     f"cpfull={ctx.get('_cp_full')} sha={_sh}")
+            print("  " + _line, flush=True)
+            _xf = os.environ.get("DS41M_CMP_XSHA_FILE", "").strip()
+            if _xf:
+                with open(_xf, "a") as _fh:     # 文件落盘：不受日志过滤影响
+                    _fh.write(_line + "\n")
+        except Exception as _e:                   # noqa: BLE001
+            print(f"  [cmp-x] 失败 {type(_e).__name__}: {_e}", flush=True)
+
+    _pre = st.get("_cmp_pre")      # 外部 kernel 算好的 pre-norm 压缩 KV（deepinfer 路径）
+    if _pre is not None:
+        kv = _pre
+    elif ratio > 1:
+        # 官方 create_state_cache：(1, block_size=ratio, 2, head_dim) fp32；
+        # 块号从 1 起（0 = 空块，官方 RingCache 约定）。state 跨层会写脏 → 按层号分配
+        # ★ DSpark：verify 一次吃 T=B+1 个 token，ring 必须 ≥ 该窗口，否则
+        #   `pos % ratio` 会把同一行重写（官方 get_state_block_size = next_n+1）。
+        _sb = max(int(ratio), int(ctx.get("state_block")
+                                  or os.environ.get("DS41M_CMP_STATE_BLOCK", "0") or 0))
+        _sb_id = int(ctx.get("_cmp_sb", 1) or 1)
+        _nb = max(2, _sb_id + 1)
+        stc = _hold(st).get(f"_cmp_state_L{ctx['idx']}")
+        if stc is not None and int(stc.shape[1]) != _sb:
+            stc = None                    # 请求级 ring 尺寸变化 → 重建（reset 会 pop）
+        if stc is None:
+            # ★ 与 KV 池同一约定：**块 0 恒空**、请求占块 1 → 缓存必须至少 2 块
+            #   （曾只分配 1 块而块表写 1 → 算子按块号寻址越界，前 512 压缩行恰好正常、
+            #     之后全错：症状就是"分歧从 token 1023（= 第 512 个压缩行）开始"）
+            if _KV_MGR is not None:
+                stc = _KV_MGR.cmp_state(_hold(st), int(ctx["idx"]), _sb, D, device, nblocks=_nb)
+            else:
+                stc = torch.zeros(_nb, _sb, 2, D, dtype=torch.float32, device=device)
+                _hold(st)[f"_cmp_state_L{ctx['idx']}"] = stc
+        elif int(stc.shape[0]) < _nb:
+            # ★ 每段一块（官方 forward_cp）：**增长**而不是重建，保住 stage A 的前缀 carry
+            if _KV_MGR is not None:
+                stc = _KV_MGR.cmp_state(_hold(st), int(ctx["idx"]), _sb, D, device, nblocks=_nb)
+            else:
+                grow = torch.zeros(_nb - int(stc.shape[0]), _sb, 2, D,
+                                   dtype=torch.float32, device=device)
+                stc = torch.cat([stc, grow], 0)
+                _hold(st)[f"_cmp_state_L{ctx['idx']}"] = stc
+        def _ct(name, value, dtype=torch.int32):
+            if dg_on():
+                return dg_const(name, value, dtype, device)
+            # ★ 2026-10-21 hostbound：`torch.tensor(list, device=npu)` 是一次**阻塞 H2D**
+            #   （同步拷贝要等设备队列排空；trace 里层 8/14 那两次 20ms `aten::to` 就落在
+            #   _kv_compress 里，紧跟 kv_epilog×2 + zeros）。这些元数据每次调用取值完全相同
+            #   → 按值缓存设备张量，稳态零 H2D；值不变 ⇒ 逐位不变 ✓。
+            _v = tuple(value) if isinstance(value, (list, tuple)) else int(value)
+            if os.environ.get("DS41M_NO_CT_CACHE", "").strip().lower() in (
+                    "1", "on", "true", "yes"):
+                return torch.tensor(value, dtype=dtype, device=device)   # A/B：关缓存
+            key = ("ct", name, _v, dtype, str(device))
+            return _meta(key, lambda: torch.tensor(value, dtype=dtype, device=device))
+
+        # ★★ 2026-10-20（DSpark verify 因果泄漏根因）：多 token chunk（T=6）在
+        #   **奇数相位**（如 start_pos=17/ratio=2）时算子没有用 state 里的 carry，
+        #   把组配成 (17,18) 而不是 (16,17) ⇒ 因果压缩行 8 吃进 draft 的 d1
+        #   （实测 fake id 0/5 的 L2 行和不同；QLI/QSLI future=0，泄漏只在压缩值）。
+        #   修法：verify 的压缩器改成**逐 token 调用**（与已验证的 T=1 decode 同口径，
+        #   carry 链正确），再用固定形状 gather 选出"完成组"的行（T=6、ratio=2 ⇒ 3 行）。
+        #   6 次算子的序列与相位无关（只有 start_pos/选择索引的 fill 逐 replay 变）⇒ 仍可入图。
+        _per_row_cmp = (int(off) > 0 and 1 < int(T) <= 32
+                        and int(T) % int(ratio) == 0
+                        and int(ctx.get("n_seqs", 1) or 1) == 1
+                        and os.environ.get("DS41M_CMP_PER_ROW", "1") != "0")
+        if _per_row_cmp:
+            _rows = []
+            for _i in range(int(T)):
+                _sp = (dg_meta(
+                            ("cmp_start_row", int(_i), str(device)),
+                            lambda _i=_i: torch.tensor([int(off) + _i],
+                                                       dtype=torch.int32, device=device),
+                            lambda b, p, _i=_i: b.fill_(int(p) + _i))
+                       if dg_on() else
+                       torch.tensor([int(off) + _i], dtype=torch.int32, device=device))
+                _rows.append(d.compressor(
+                    x=st["x"].view(-1, H)[_i:_i + 1],
+                    wkv=w["attn.compressor.wkv.weight"],
+                    wgate=w["attn.compressor.wgate.weight"],
+                    seqused=_ct(("cmp_seqused1", 1), [1]),
+                    start_pos=_sp,
+                    cmp_ratio=ratio,
+                    cu_seqlens=_ct(("cmp_cu1", 1), [0, 1]),
+                    state_cache=stc.flatten(-2),
+                    state_block_table=_ct(("cmp_sbt", _sb_id), [_sb_id])))
+            _all = torch.cat(_rows, dim=0)          # [T, D]：每步的组结果或 carry
+            _sel_list = [i for i in range(int(T)) if (int(off) + i + 1) % int(ratio) == 0]
+            _sel = (dg_meta(
+                        ("cmp_sel_rows", int(T), int(ratio), str(device)),
+                        lambda: torch.tensor(_sel_list, dtype=torch.int64, device=device),
+                        lambda b, p: b.copy_(torch.tensor(
+                            [i for i in range(int(T)) if (int(p) + i + 1) % int(ratio) == 0],
+                            dtype=torch.int64, device=device)))
+                    if dg_on() else
+                    torch.tensor(_sel_list, dtype=torch.int64, device=device))
+            kv = _all.index_select(0, _sel)         # [T//ratio, D]（固定形状）
+        else:
+            # 诊断（DS41M_CMP_ARGDBG=1）：比较 packed/非 packed 喂给压缩器的实参
+            if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+                    and int(ctx.get("idx", -1)) == 2 and int(os.environ.get("RANK", "0")) == 0):
+                try:
+                    _x = st["x"]
+                    import hashlib as _hl3
+                    def _h3(t):
+                        if not isinstance(t, torch.Tensor):
+                            return "none"
+                        return _hl3.sha1(t.detach().float().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]
+                    print(f"  [cmp-args nonpk] x{tuple(_x.shape)} {_x.dtype} stride={_x.stride()} "
+                          f"fmt={torch_npu.get_npu_format(_x)} stc{tuple(stc.shape)} "
+                          f"stc_sum={float(stc.float().sum()):.3e} off={int(off)} T={int(T)} "
+                          f"ratio={int(ratio)} wkv={_h3(w['attn.compressor.wkv.weight'])} "
+                          f"wgate={_h3(w['attn.compressor.wgate.weight'])} "
+                          f"fmt_wkv={torch_npu.get_npu_format(w['attn.compressor.wkv.weight'])} "
+                          f"fmt_wgate={torch_npu.get_npu_format(w['attn.compressor.wgate.weight'])}", flush=True)
+                except Exception as _e:                # noqa: BLE001
+                    print(f"  [cmp-args nonpk] err {_e}", flush=True)
+            kv = d.compressor(
+                x=st["x"].view(-1, H),
+                wkv=w["attn.compressor.wkv.weight"],
+                wgate=w["attn.compressor.wgate.weight"],
+                seqused=_ct(("cmp_seqused", int(T)), [int(T)]),
+                # ★★ 2026-10-16 深夜（病C 第二候选）：命中时压缩器传 `start_pos=0` 而不是段基址 ✗。
+                #   证据：`kv_compress` 输入全有限、输出却整行 NaN（rank7 快照）⇒ NaN 在算子内部 ✗；
+                #   且崩层恒为 L14、prefill（start_pos 恒 0）从不崩 ⇒ 疑算子用 start_pos 推 ring
+                #   块号/相位时在 2 块 state 上越界（代码注释里早记载过同类"块号越界"陷阱 ✗）。
+                #   段起点与 ratio 组对齐时（15744%2==0 ✓）相位与 0 等价 ⇒ 数值应无损 ✓。
+                #   开关：DS41M_CMP_STARTPOS=0（默认不设 = 仍传段基址 ✓）。
+                start_pos=(
+                    dg_meta(("cmp_start_step", str(device)),
+                            lambda: torch.tensor(
+                                [0 if (off > 0 and os.environ.get("DS41M_CMP_STARTPOS", "").strip() == "0")
+                                 else off], dtype=torch.int32, device=device),
+                            lambda b, p: b.fill_(
+                                0 if (int(p) > 0 and os.environ.get("DS41M_CMP_STARTPOS", "").strip() == "0")
+                                else int(p)))
+                    if dg_on() else _ct(
+                        ("cmp_start", int(off),
+                         os.environ.get("DS41M_CMP_STARTPOS", "").strip() == "0"),
+                        [0 if (off > 0 and os.environ.get("DS41M_CMP_STARTPOS", "").strip() == "0") else off])),
+                cmp_ratio=ratio,
+                cu_seqlens=_ct(("cmp_cu", int(T)), [0, int(T)]),
+                state_cache=stc.flatten(-2),
+                state_block_table=_ct(("cmp_sbt", _sb_id), [_sb_id]))
+    else:
+        kv = torch.nn.functional.linear(st["x"].view(-1, H),
+                                        w["attn.compressor.wkv.weight"])
+    if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+            and int(ctx.get("idx", -1)) == 2 and int(os.environ.get("RANK", "0")) == 0):
+        import hashlib as _hl7
+        print(f"  [cmp-out nonpk] kv{tuple(kv.shape)} "
+              f"{_hl7.sha1(kv.detach().float().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]}",
+              flush=True)
+    # ★ 压缩行数 = 算子**实际输出**的行数（c2a: 满组 T/2 + 余数 1 = T/2+1；c1a: T）
+    #   不能自己按 T//ratio 算 —— 实测 T=16384/ratio=2 时算子出 8193 行
+    n = int(kv.shape[0])
+    # ★★ 2026-10-20（与官方奇数位置 carry 对齐）：算子最后一行是 **carry**（部分组的
+    #   状态，已由 state_cache 保存），**不能写进压缩 KV 池**。官方口径：
+    #   `generate_compressed_position_ids` 的 compressed_len =
+    #   (start_pos + seq_used_q)//ratio - start_pos//ratio；carry 行被映射到
+    #   slot_mapping_pad_value（-1）。以前我们把 n 行全写进池：prefill T=18 会多写
+    #   第 10 行（位置 9，属于尚未完成的组 [18,20)），decode 偶数位置也会写 carry；
+    #   现在只写前 n_valid 行，奇数位置的 carry 完全交给 state_cache（与官方一致）。
+    n_valid = (min(n, max(0, (off + T) // ratio - off // ratio))
+               if ratio > 1 else n)
+    # decode 图：写入行数必须与 pos 奇偶无关（T=1 时 n_valid ∈ {0,1}）。
+    # 固定写 n_valid+1 行：多出来的那一行是 carry，slot=-1（算子跳过），数值无影响。
+    n_w = min(n, n_valid + 1) if dg_on() else n_valid
+    if os.environ.get("DS41M_CP_SEG_DBG") and ratio > 1:
+        print(f"  [cmp-rows] idx={ctx.get('idx')} n={n} n_valid={n_valid} "
+              f"n_w={n_w} dg_on={dg_on()} off={off} T={T} ratio={ratio} "
+              f"cpfull={ctx.get('_cp_full')}", flush=True)
+    # ★ 官方 process_weights_after_loading 把 compressor.norm 权重 cast 成 **fp32**
+    #   （modeling_deepseek.py:2646-2649）；checkpoint 里是 bf16 → 直接喂 bf16 会和官方差一截
+    # ★ 2026-10-19：加载期在 pack_layer_weights 里备好（真权重 4 层 × 每 pass 曾现做 Cast+Copy）
+    cnw = (w.get("_packed") or {}).get("attn.compressor.norm.weight.f32")
+    if cnw is None:
+        cnw = w["attn.compressor.norm.weight"].to(torch.float32).contiguous()
+    if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+            and int(ctx.get("idx", -1)) == 2 and int(os.environ.get("RANK", "0")) == 0):
+        import hashlib as _hl5
+        print(f"  [cmp-cnw nonpk] {_hl5.sha1(cnw.detach().float().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]} "
+              f"{cnw.dtype} {cnw.device}", flush=True)
+    kv = torch_npu.npu_rms_norm(kv, cnw, EPS)[0]
+    # ★★ 2026-10-21（统一路径 A/B 抓到的**老路径真 bug**）：官方 `compressed_len =
+    #   (start+seq)//ratio - start//ratio`，压缩器输出里超出 compressed_len 的 **carry 行
+    #   slot 恒为 -1**（attention_data.py:359-369 / 408）⇒ carry 行**从不写索引缓存**。
+    #   旧代码把整个 latent（含 carry，其值是算子工作区残留、**每次调用都不同**，实测单进程
+    #   连续 3 次调用前 T/ratio 行逐位相同、只有最后一行在变）交给 indexer_prologue_k，
+    #   并用恒等槽位写到 row0+n_valid。该行虽在 seq_k 之外，仍会被内核在块边界扫到 ⇒
+    #   同一点位 3 个 pass 的 `idx_sparse` 三次都不同（packed 路径把 pad 行标 -1 ⇒ 稳定）。
+    #   只保留 n_valid 行 ⇒ 与官方/packed 同口径；索引侧数值本应不变（多余行不可见）。
+    #   （n_valid=0 的 decode 奇数相位保持旧行为：那 1 行就是本步 carry，另有用处。）
+    st["cmp_latent"] = (kv[:n_valid].clone()
+                        if (ratio > 1 and n_valid > 0) else kv.clone())
+    # 压缩 rope：ratio>0 → comp 表（YaRN，base=160000）；位置 = p×ratio（组首 token）
+    # 命中：尾部压缩行的绝对行号从 off//ratio 起（前缀的压缩行已缓存）
+    cos, sin = _comp_rope_tables(int(kv.shape[0]), ratio, ctx, device, row_off=off // max(1, ratio))
+    _rope_dump(3, kv.view(-1, 1, 1, D), cos, sin,
+               [D - ctx["rope_dim"], D], "interleave", ctx)
+    torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
+        kv.view(-1, 1, 1, D), cos, sin, rotary_mode="interleave",
+        partial_slice=[D - ctx["rope_dim"], D])
+    st["cmp_kv"] = kv                                 # rope 之后、量化之前的压缩 KV（对照用）
+    # 诊断（因果泄漏）：本 chunk 写出的**因果行**数值是否随未来 draft token 变化。
+    #   fake id 0 vs 5 两次请求，同一层/同一行号的 sum 必须逐位相同。
+    if (os.environ.get("DS41M_CMP_CHECK") and int(T) > 1 and int(off) > 0
+            and int(os.environ.get("RANK", "0")) == 0 and not dg_on()):
+        try:
+            _vv = st["cmp_kv"][:int(n_valid)].float()
+            _rows = [round(float(_vv[i].sum()), 6) for i in range(int(_vv.shape[0]))]
+            print(f"  [cmp-check] L{ctx['idx']} ratio={ratio} off={int(off)} "
+                  f"n={int(n)} nv={int(n_valid)} rowsum={_rows}", flush=True)
+        except Exception as _e:                        # noqa: BLE001
+            print(f"  [cmp-check] 失败 {type(_e).__name__}: {_e}", flush=True)
+    # epilog 写池：与窗口池同一槽位约定（块号从 1 起、块 0 恒空）→ 读侧同约定 ✓
+    # 命中：池按**全序列**压缩行数开（前缀行保持池初值），尾部行写在绝对压缩行号处
+    # ★★ 2026-10-16（残余病C 的强候选根因）：**池必须多算压缩器输出的 carry 行** ✗。
+    #   压缩器输出 n = T//ratio + 1 行（多一行 carry，见本函数下方注释）→ 槽位
+    #   `(1 + pos//BS)*BS + pos%BS` 的最大 pos = L//ratio（= 8192 @16k/ratio2）
+    #   → 最大槽位 = (1+64)*128 + 0 = **8320**，而按 `L_full//ratio` 开的池只有
+    #   (1+64)*128 = **8320 行（下标 0..8319）** ⇒ **越界写 1 行** ✗。
+    #   越界落到谁头上取决于**分配器布局** ⇒ 完美解释"间歇性"：`--layers 15`（权重少、
+    #   布局不同）6 跑 0 崩 ✓，40 层则 ~1/3 崩 ✗（NaN 断言在 c2a_source 层）。
+    #   修：把 carry 行算进池 → nblk = ceil((L//ratio + 1)/BS) = 65 块 = 8448 行 ✓ 全覆盖。
+    n_full = max(n, L_full // max(1, ratio) + 1)
+    nblk = max(1, (n_full + BS - 1) // BS)
+    if os.environ.get("DS41M_CMP_NANDBG"):
+        print(f"  [cmp-pool-seq] L{int(ctx.get('idx', -1))} ratio={ratio} n={n} "
+              f"L_full={L_full} off={ctx.get('pos_offset')} n_full={n_full} nblk={nblk} "
+              f"pool_rows={(1 + nblk) * BS}", flush=True)
+    pool = _cache_buf(st, f"_cmp_pool_r{ratio}" + _sfx(ctx, "cmp"),
+                      (1 + nblk) * BS, CMP_ROW_W, device, torch.uint8)
+    if dg_on():
+        _nw = int(n_w)
+
+        def _cp(p):
+            return torch.arange(_nw, dtype=torch.int32, device=device) + int(p) // ratio
+
+        def _cs(p):
+            nv = (min(_nw, max(0, (int(p) + T) // ratio - int(p) // ratio))
+                  if ratio > 1 else _nw)
+            s = (1 + _cp(p) // BS) * BS + _cp(p) % BS
+            if nv < _nw:
+                s = torch.where(torch.arange(_nw, device=device) < nv, s,
+                                torch.full_like(s, -1))
+            return s
+
+        pos = dg_meta(("cmppool_pos_step", _nw, int(ratio), str(device)),
+                      lambda: _cp(off), lambda b, p: b.copy_(_cp(p)))
+        slot = dg_meta(("cmppool_slot_step", _nw, int(ratio), str(device)),
+                       lambda: _cs(off), lambda b, p: b.copy_(_cs(p)))
+    else:
+        pos = _meta(("cmppool_pos", int(n_valid), int(off // max(1, ratio)), str(device)),
+                    lambda: torch.arange(n_valid, dtype=torch.int32, device=device)
+                    + off // max(1, ratio))
+        slot = _meta(("cmppool_slot", int(n_valid), int(off // max(1, ratio)), str(device)),
+                     lambda: (1 + pos // BS) * BS + pos % BS)
+    # ★★ 2026-10-16（病 N 的收尾一处，官方 hit.py 明文规则）：
+    #   "the replay rows' compressed-KV / indexer writes are suppressed (slot -1):
+    #    [0, H) is reused from stage A"。
+    #   命中 stage B 的前 rep 个 token（绝对位置 < H = off+rep）与 stage A 算过的是**同一批位置**；
+    #   它们的隐藏态在 stage B 里是"截断窗口"算出来的（天然与全量 prefill 不同 ✗）——
+    #   若照写，就会用这批略偏的值**覆盖 stage A 已写对的压缩行** ✗，而压缩行随后被
+    #   **所有** token 的压缩注意力读到 → 误差一路传到末 token（实测：不抑制时
+    #   末 token 的 ' that' 分数 18.625 vs ',' 19.125，差 0.5，top1 仍是 ',' ✗）。
+    #   → 这些行一律**不写**（slot = -1，算子对负槽位跳过），保留 stage A 的值 ✓。
+    _rep = int(ctx.get("hit_replay_tail") or 0)
+    if off > 0 and _rep > 0 and not dg_on():
+        _cut = (off + _rep) // max(1, ratio)                # 重放段的压缩行上界（对齐 ratio ✓）
+        slot = torch.where(pos < _cut, torch.full_like(slot, -1), slot)
+    # ★ 只写完整组：n_valid 行（carry 行留给 state_cache；官方映射到 pad slot -1）。
+    if n_w:
+        torch.ops.custom.kv_compress_epilog_v2(
+            pool.view(-1, pool.shape[-1]), kv[:n_w].reshape(-1, D), slot,
+            quant_group_size=16, quant_mode="mxfp4_bf16", round_scale=True, x_scale=1.0)
+    if os.environ.get("DS41M_CMP_STATE_DUMP"):
+        try:
+            _dd = os.environ["DS41M_CMP_STATE_DUMP"]
+            os.makedirs(_dd, exist_ok=True)
+            _st = _hold(st).get(f"_cmp_state_L{ctx['idx']}")
+            if torch.is_tensor(_st):
+                torch.save(_st.detach().cpu(), os.path.join(
+                    _dd, f"st_L{int(ctx['idx'])}_r{os.environ.get('RANK','0')}.pt"))
+        except Exception:                        # noqa: BLE001
+            pass
+    _hold(st)[f"_cmp_nblk_r{ratio}" + _sfx(ctx, "cmp")] = nblk
+    # ★ 给注意力的 cmp 长度口径 = 官方 `compressed_seq_lens = actual_seq_k // ratio`
+    #   （attention_data.py:763）：是**满组数**（8192），不是算子输出行数（8193，多一行 carry）
+    #   命中：用 off+T（= 本段结束位置）而非 L_full
+    #   ★★ 2026-10-16（命名病 C 的根因）：原来写 `L_full // ratio` ✗ —— stage A 只写了
+    #      前缀 [0,H) 的压缩行，却对注意力声明 L//ratio 行有效 → **读未写入的池行**；
+    #      池是零初始化，fp8 的 **scale 字节 = 0** → 反量化 0/0 = **NaN** → 门控断言
+    #      "moe_topk_gate_forward input contains nan"（崩在 c2a_source 层，非确定性
+    #      取决于索引器选中的行）。纯 prefill@15872 不崩正是因为它的 L_full = 15872 ✓。
+    #   off+T 同时满足两段：stage A → H//ratio ✓（= 一次 H token 的正常 prefill 口径）；
+    #      stage B → L//ratio ✓（= 官方 hit 的 compressed_seq_lens，前缀行已由 stage A 落盘）。
+    _hold(st)[f"_cmp_len_r{ratio}" + _sfx(ctx, "cmp")] = (off + T) // ratio
+    if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+            and int(ctx.get("idx", -1)) == 2 and os.environ.get("RANK", "0") == "0"):
+        print(f"  [cmp-len-write] nonpk off={off} T={T} val={(off+T)//ratio} "
+              f"sfx={_sfx(ctx,'cmp')!r}", flush=True)
+    if os.environ.get("DS41M_DEBUG"):
+        print(f"      [kv_compress] ratio={ratio} n={n} n_valid={n_valid} nblk={nblk} "
+              f"absmax={kv.float().abs().max().item():.4f} latent_absmax="
+              f"{st['cmp_latent'].float().abs().max().item():.4f}", flush=True)
+
+
+def _packed_pos(ctx, T, device):
+    """兼容包装：布局算术的单一事实源在 `batch.py`。"""
+    return batch_layout.local_positions(ctx, T, device)
+
+
+def _packed_blocks_per_seq(ctx, BS):
+    """兼容包装：见 batch.blocks_per_seq。"""
+    return batch_layout.blocks_per_seq(ctx, BS)
+
+
+def _win_indices_packed(local_pos, BS):
+    """兼容包装：见 batch.win_indices。"""
+    return batch_layout.win_indices(local_pos, BS)
+
+
+def _win_indices(T, device, BS=None, off=0, abs_=False):
+    BS = int(BS or globals().get("BS", 128))
+    """窗口稀疏索引 + 有效长度（官方 attention_data.py:333 generate_win_topk_ids）。
+
+    形状 [T,1,128] int32；值是**本段 scratch 内的局部位置**（off=0 时即绝对位置），
+    无效列 -1，有效列靠前；长度 = min(局部 p+1, 128) → [T,1] int32。
+
+    ★★ 2026-10-16（第二修，根因）：命中时**必须重定基到段内局部坐标**。
+    官方 `adaptlib/hit.py:293-304`（窗口重定基）与 `:399-404`（seqused_ori_kv）写明：
+
+        local = win_topk_ids - pos_base_rows;  local[local < 0] = -1
+        win_topk_length = (local >= 0).sum(dim=1)
+        attn_kwargs["seqused_ori_kv"] = seq_used_q        # = R（本段长），不是 L
+
+    理由（同文件 53-58 行注释）：**窗口注意力跑在"本步 scratch"上，持久窗口永不读**
+    ——产品侧窗口缓存不持久，replay 段（128 token）就是为了**重建窗口缓存**而存在的。
+    压缩 KV / 索引器缓存才保持全局跨度（`compressed_seq_lens = L//ratio`）。
+
+    ⇒ 绝对位置索引 = 给只有 R 行的 scratch 喂 L 级位置 ✗：`adaptlib/hit.py:370-372`
+      "Absolute positions would index the per-step scratch out of range"。
+      实测（2026-10-16，真权重 16k h=0.96875 尾段 640 行 vs 全量 prefill）：
+      绝对索引版 `attn_out` 全 640 行**整段错**（逐行均值 |Δ|≈3.0、相关系数 0.17）；
+      改局部后行 ≥window-1=127 与 prefill **逐位相同** ✓（前 127 行为官方口径下的
+      截断窗口，天然与全量 prefill 不同 —— 只有末行决定 next token，不受影响 ✓）。
+    """
+    if dg_on():
+        idx = dg_meta(
+            ("win_idx_step", int(T), int(BS), str(device), int(bool(abs_))),
+            lambda: _win_indices_build(int(T), device, int(BS), int(off), bool(abs_))[0],
+            lambda b, p: b.copy_(
+                _win_indices_build(int(T), device, int(BS), int(p), bool(abs_))[0]))
+        length = dg_meta(
+            ("win_len_step", int(T), int(BS), str(device), int(bool(abs_))),
+            lambda: _win_indices_build(int(T), device, int(BS), int(off), bool(abs_))[1],
+            lambda b, p: b.copy_(
+                _win_indices_build(int(T), device, int(BS), int(p), bool(abs_))[1]))
+        return idx, length
+    return _meta(("win", int(T), int(BS), int(off), str(device), int(bool(abs_))),
+                 lambda: _win_indices_build(int(T), device, int(BS), int(off), bool(abs_)))
+
+
+def _win_indices_from_pos(pos, BS=None):
+    """CP 用：按**每行全局位置**生成窗口稀疏索引，索引直接指向 full pool。
+
+    `_win_indices` 假设位置是连续的 arange(T)+off；CP 的本地行是 head-tail 两块，
+    位置不连续，必须逐行传 `cp_positions`。
+    """
+    BS = int(BS or globals().get("BS", 128))
+    pos = pos.to(torch.int64).reshape(-1)
+
+    def _build():
+        p = pos.unsqueeze(1)
+        cols = torch.arange(BS, device=pos.device).unsqueeze(0)
+        start = torch.clamp(p - (BS - 1), min=0)
+        idx = start + cols
+        idx = torch.where(idx > p, torch.full_like(idx, -1), idx)
+        length = torch.clamp(p + 1, max=BS).to(torch.int32)
+        return idx.to(torch.int32).unsqueeze(1), length
+
+    key = ("win_cp", int(pos.numel()), BS, int(pos.data_ptr()), str(pos.device))
+    return _meta(key, _build)
+
+
+def _win_indices_build(T, device, BS, off, abs_=False):
+    cols = torch.arange(BS, device=device).unsqueeze(0)
+    # 段内局部位置（官方 hit 的重定基）；off>0 时**不加** off。
+    # DS41M_WIN_ABS=1 仅用于 A/B 复现旧（错）行为。
+    # ★ 2026-10-17：`DS41M_PERLAYER_CACHE=1` 时本层窗口池已含**本层**在 stage A 写的前缀
+    #   ⇒ 命中改走**绝对位置**（读得到自己层的前缀 ✓，见 run.py:ctx_for）。
+    _abs = (bool(abs_)
+            or os.environ.get("DS41M_WIN_ABS", "").strip().lower() in ("1", "on", "true", "yes"))
+    pos = (torch.arange(T, device=device) + (off if _abs else 0)).unsqueeze(1)
+    start = torch.clamp(pos - (BS - 1), min=0)
+    idx = start + cols                                # [T,128]
+    # ★ 无效列必须放在**尾部**（内核按"有效前缀 w=topk_length"取 tile；
+    #   把 -1 放在前面会让内核读到负位置 → aicore 异常，实测踩过）
+    idx = torch.where(idx > pos, torch.full_like(idx, -1), idx)
+    length = torch.clamp(pos + 1, max=BS).to(torch.int32)            # [T,1] = min(p+1,128)
+    return idx.to(torch.int32).unsqueeze(1), length
+
+
+# ── A4-2（2026-10-26）：`_mqsmla` 热路径的 env 快照（kill switch `DS41M_ENV_HOIST=0`）──
+# 事实：torch_npu 在 import 时把 `os.environ.get` 换成 Python 包装
+#   （torch_npu/utils/patch_getenv.py:26 `_patched_environ_get` = `key in os.environ` + 原 get + `_log_once`），
+#   CPU 微基准 **1.75 µs/次**（键不存在）/ 0.84（命中且非空）；普通 dict.get **0.065 µs/次**
+#   （`tmp/a4_tree/analysis/env_bench.log`，`bench_mq_glue.py` 产）。
+#   `_mqsmla` 每次调用读 **16.8 次**、40 次/forward（cProfile：`_patched_environ_get` 全进程 8705 次/4 forward，
+#   其中调用方 `_mqsmla` 2688 次 ⇒ 672/forward）⇒ 快照后省 16.8×(1.75−0.065)≈28 µs/次 ≈ **1.1 ms/forward**。
+# 为什么能快照：这 11 个键全部是启动期常量。运行期确实会被改的 env 只有
+#   `DS41M_DECODER_REPLAY`（core/runner.py:953,969；core/points_runner.py:250）、`DS41M_MOE_CHUNK`
+#   （runner.py:607,949,2113）、`DS41M_PERLAYER_CACHE`(2110)、`DS41M_AC_CACHE_N`(2548,2560)、
+#   `DS41M_MOEMODE`(2820)——都不在本函数读取之列；`DS41M_DECODER_REPLAY` 是**点位级**变量，
+#   本文件一律现场读、不上提（纪律）。
+# 运行中若要改上述调试键：置 `DS41M_ENV_HOIST=0`（完全不快照，逐字节回到原行为），或调 refresh_env_snapshot()。
+_ENV_SNAP = {}
+_ENV_HOIST = os.environ.get("DS41M_ENV_HOIST", "1").strip().lower() not in ("0", "off", "false", "no")
+_ENV_KEYS_MQ = ("DS41M_MQ_SUB", "DS41M_NO_CMP", "DS41M_CP_NO_CMP", "DS41M_DEBUG",
+                "DS41M_FAKE_Q", "DS41M_CMP_SPARSE", "DS41M_MQ_CHECK", "DS41M_MQ_DBG_PK",
+                "DS41M_MQ_DUMP_IN", "DS41M_MQ_DUMP_DIR", "RANK",
+                # ★ A4-4 扩容：_hc_pre/_hc_post/_qmm（exec_ops）与 _mega_moe（exec_moe）读的启动期常量键。
+                #   **不含** DS41M_MOEMODE / DS41M_MOE_CHUNK —— 这两个 runner 会在运行期改
+                #   （core/runner.py:607,949,2113,2820），必须现场读。
+                "DS41M_HC_DUMP", "DS41M_HC_DUMP_LAYER",
+                "DS41M_MOE_TP", "DS41M_TP_DECODE_ONLY", "DS41M_DECODE_LAYOUT",
+                "DS41M_MOE_BARRIER", "DS41M_MOE_SUBTIME")
+
+
+def refresh_env_snapshot():
+    """重读快照（运行中改了上述调试键时调用；`DS41M_ENV_HOIST=0` 时无操作）。"""
+    if _ENV_HOIST:
+        _ENV_SNAP.clear()
+        _ENV_SNAP.update({k: v for k, v in os.environ.items() if k in _ENV_KEYS_MQ})
+
+
+def _oenv(k, d=None):
+    """`os.environ.get(k, d)` 的快照版（0.065 µs vs 1.75 µs/次）；语义完全相同。"""
+    if _ENV_HOIST:
+        return _ENV_SNAP.get(k, d)
+    return os.environ.get(k, d)
+
+
+if _ENV_HOIST:
+    refresh_env_snapshot()
+
+
+# ★ 2026-10-29（绑定直发）：q 常驻缓冲 —— vendor 绑定按**地址**复用，q 每层新分配会把
+#   绑定 key 打散；抄进按形状缓存的常驻缓冲即可跨层稳定。**默认开**；`=0` 回退。
+#   安全性：单流顺序执行，第 N 层读 q 先于第 N+1 层写同一缓冲（run-ahead 只影响入队顺序）。
+#   decode（T=1）不走拷贝（小张量，绑定也不生效）。
+_QBUF_ON = os.environ.get("DS41M_MQ_QBUF", "1").strip().lower() in (
+    "1", "on", "true", "yes")
+_QBUF_MAX = int(float(os.environ.get("DS41M_MQ_QBUF_MAX_MB", "64") or 64) * 1024 * 1024)
+_QBUF_CACHE: dict = {}
+
+
+def _qbuf(q):
+    key = (tuple(q.shape), q.dtype, str(q.device))
+    b = _QBUF_CACHE.get(key)
+    if b is None:
+        b = torch.empty(tuple(q.shape), dtype=q.dtype, device=q.device)
+        _QBUF_CACHE[key] = b
+    b.copy_(q)
+    return b
+
+
+@op("mqsmla")
+def _mqsmla(st, ctx, w):
+    """MQSMLA（ds41 版）—— 官方 modeling_deepseek.py:1235 的 sparse_attn 核心。
+
+    走官方 prefill 口径：ori_kv = 全长临时池（PA_BBND，uint8 视图），
+    sparse_indices = 因果窗口内 128 个**逻辑 token 位置**，metadata 由官方 metadata 算子生成。
+    ratio>0 的层必须给 cmp 三件套（ds41 host 强校验）：本程序还没接 indexer，
+    所以给"空索引"（全 -1 + topk_length=0）—— 官方明确支持这种配置（该行不读压缩 KV）。
+    """
+    d = _d41()
+    if _oenv("DS41M_MQ_SUB"):
+        _t0 = time.perf_counter()
+    T, dev = st["q"].shape[0], st["q"].device
+    # ★ 2026-10-29（bind 原型）：q → 常驻缓冲（见 `_qbuf` 注释）。只对小块生效，
+    #   大 T（stage A 的 256k q 有几百 MB）保持原样，避免无谓拷贝。
+    if (_QBUF_ON and int(T) >= 32
+            and st["q"].numel() * st["q"].element_size() <= _QBUF_MAX):
+        st["q"] = _qbuf(st["q"])
+    ratio = ctx["ratio"]
+    _nseq = int(ctx.get("n_seqs", 1) or 1)
+    _no_cmp_env = _oenv("DS41M_NO_CMP", "").strip().lower() in ("1", "on", "true", "yes")
+    # packed 真 batch：压缩池/索引已按逐请求实现（`_kv_compress_packed` + idx 逐序列），
+    # cmp 三件套走下面的 packed 分支（块表 [B,Pc]、seqused_cmp_kv [B]、长度按局部位置）
+    has_cmp = (ratio > 0) and not _no_cmp_env
+    # ★ CP Step 3：压缩 KV/索引在**全局**上算（源层 gather hidden 复算 → full 池 +
+    #   本地行索引），本地 q 的 cmp 路径只是"按逐行全局位置读 full 池"，可以开。
+    #   `DS41M_CP_NO_CMP=1` 退回 Step 2 口径（只跑 SWA）供二分。
+    _cp = _cp_of(ctx)
+    if _cp is not None and _oenv("DS41M_CP_NO_CMP", "").strip().lower() in (
+            "1", "on", "true", "yes"):
+        has_cmp = False
+    _dbg = _oenv("DS41M_DEBUG")
+    if _dbg:
+        _qf = st["q"].float()
+        print(f"      [mq 1] q {tuple(st['q'].shape)} contig={int(st['q'].is_contiguous())} "
+              f"absmax={_qf.abs().max().item():.4e} nan={int(_qf.isnan().sum())} "
+              f"inf={int(_qf.isinf().sum())}", flush=True)
+    if _oenv("DS41M_FAKE_Q"):
+        st["q"] = torch.randn(T, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    # ★ T-042：q 是 wo_b/rope 出来的连续张量，reshape 即视图 → 短路掉整块拷贝
+    q = _contig(st["q"].reshape(T, N_HEADS, HEAD_DIM))
+    if _dbg:
+        print("      [mq 2] q ok", flush=True)
+    # ★ 2026-10-20：packed 窗口读侧与写侧同口径 —— **请求内行号**（不含 pos_offset），
+    #   池按本 pass 行数开。见 _kv_epilog 同处注释（packed-hit 的 NaN/trap 根因）。
+    _loc, _sid = batch_layout.local_rows(ctx, T, dev)
+    if _cp is not None:
+        # CP：窗口池是 full 的；块数取 _kv_epilog 写的 full nblk。
+        _loc = None
+        nblk = (_shared_get(st, "_full_pool_nblk" + _sfx(ctx, "win"))
+                or ((int(_cp.plan.total_q) + BS - 1) // BS))
+    elif _loc is not None:                     # packed：每条序列一段物理块
+        _P = batch_layout.rows_blocks_per_seq(ctx, BS)
+        nblk = _P * _nseq
+    else:
+        nblk = _shared_get(st, "_full_pool_nblk" + _sfx(ctx, "win")) or ((T + BS - 1) // BS)
+    pool = _shared_get(st, "_full_pool" + _sfx(ctx, "win"))[: (1 + nblk) * BS].view(1 + nblk, BS, 1, KV_ROW_W).view(torch.uint8)
+    if _dbg:
+        print("      [mq 3] pool ok", flush=True)
+    if _cp is not None:
+        # 本地 q 行是 head-tail 两块，位置不连续 → 按逐行全局位置生成窗口索引。
+        idx, length = _win_indices_from_pos(_cp.local_positions, BS)
+    elif _loc is not None:
+        idx, length = _win_indices_packed(_loc, BS)     # 逻辑位置 = 序列内局部
+    else:
+        idx, length = _win_indices(T, dev, BS, int(ctx.get("pos_offset", 0)),
+                                   bool(ctx.get("win_abs")))
+    if _oenv("DS41M_MQ_SUB"):
+        _t4 = time.perf_counter()
+        _MQ_SUB["pre"] = _MQ_SUB.get("pre", 0.0) + (_t4 - _t0)
+    if _dbg:
+        print("      [mq 4] idx ok", flush=True)
+    if _cp is not None:
+        # 本地 q 仍按一个 packed 段喂；块表是 full 的连续块（块 1..nblk）。
+        cu = _meta(("cu_q_cp", int(T), str(dev)),
+                   lambda: torch.tensor([0, T], dtype=torch.int32, device=dev))
+        bt = _meta(("fullpool_bt_cp", int(nblk), str(dev)),
+                   lambda: torch.arange(1, 1 + nblk, dtype=torch.int32, device=dev).unsqueeze(0))
+    elif _loc is not None:
+        cu = _meta(("cu_q_pk", int(T), int(_nseq)),
+                   lambda: torch.tensor(ctx["cu_seqlens"], dtype=torch.int32, device=dev))
+        # 每请求一段块：[B, P]，第 b 行 = b*P+1 .. (b+1)*P
+        bt = _meta(("fullpool_bt_pk", int(_P), int(_nseq)),
+                   lambda: (torch.arange(_P, dtype=torch.int32, device=dev).unsqueeze(0)
+                            + (torch.arange(_nseq, dtype=torch.int32, device=dev).unsqueeze(1) * _P + 1)))
+    else:
+        cu = _meta(("cu_q", int(T), str(dev)),
+                   lambda: torch.tensor([0, T], dtype=torch.int32, device=dev))
+        bt = _meta(("fullpool_bt", int(nblk), str(dev)),
+                   lambda: torch.arange(1, 1 + nblk, dtype=torch.int32, device=dev).unsqueeze(0))
+    if _oenv("DS41M_MQ_SUB"):
+        _tA = time.perf_counter()
+        _MQ_SUB["A_kw"] = _MQ_SUB.get("A_kw", 0.0) + (_tA - _t4)
+    kwargs = dict(quant_mode=1, ori_kv=pool, ori_sparse_indices=idx, ori_block_table=bt,
+                  cu_seqlens_q=cu, ori_topk_length=length,
+                  sinks=w.get("attn.attn_sink"), metadata=None,
+                  softmax_scale=HEAD_DIM ** -0.5, layout_q="TND", layout_kv="PA_BBND",
+                  return_softmax_lse=False)
+    # ★ 2026-10-18 对齐官方 `prepare_fa_kwargs`：官方传 seqused_ori_kv =
+    #   position_ids[:, -1] + 1（window 的实际 KV 长度）；mini 之前没传。
+    if _cp is not None:
+        # 本地 q 是 head-tail 两块，拼成一个 packed 段；window 的可见 KV 是**原序列**
+        # 长度（compact 段同 CP1 的 pos_offset+T 口径 = L，不是 compact 行数）。
+        _tot = int(ctx.get("cp_total_q") or _cp.plan.total_q)
+        _seq_ori = _meta(("seq_ori_cp", _tot, str(dev)),
+                         lambda: torch.tensor([_tot], dtype=torch.int32, device=dev))
+    elif _loc is not None:
+        _seq_ori = _meta(("seq_ori_pk", int(T), int(_nseq)),
+                         lambda: torch.tensor(ctx["seq_lens"], dtype=torch.int32, device=dev))
+    else:
+        if dg_on():
+            _seq_ori = dg_meta(
+                ("seq_ori_step", int(T), str(dev)),
+                lambda: torch.tensor([int(ctx.get("pos_offset", 0)) + int(T)],
+                                     dtype=torch.int32, device=dev),
+                lambda b, p: b.fill_(int(p) + int(T)))
+        else:
+            _seq_ori = _meta(("seq_ori", int(T), int(ctx.get("pos_offset", 0)), str(dev)),
+                             lambda: torch.tensor([int(ctx.get("pos_offset", 0)) + int(T)],
+                                                  dtype=torch.int32, device=dev))
+    kwargs["seqused_ori_kv"] = _seq_ori
+    if _oenv("DS41M_MQ_SUB"):
+        _tB = time.perf_counter()
+        _MQ_SUB["B_kwargs"] = _MQ_SUB.get("B_kwargs", 0.0) + (_tB - _tA)
+    if has_cmp:
+        # ★ 跨层共享（官方把索引放在 kv_cache.shared_idx 里逐层传）：源层写、消费者层读，
+        #   且必须**按 ratio 分开**（c1a/c2a 的压缩池和索引是两套）
+        _pk_mode = _loc is not None
+        cnblk = _shared_get(st, f"_cmp_nblk_r{ratio}" + _sfx(ctx, "cmp")) or 1
+        _clv = _shared_get(st, f"_cmp_len_r{ratio}" + _sfx(ctx, "cmp"))
+        if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+                and int(ctx.get("idx", -1)) == 2 and os.environ.get("RANK", "0") == "0"):
+            print(f"  [cmp-len-read] key='_cmp_len_r{ratio}{_sfx(ctx,'cmp')}' "
+                  f"val={_clv if isinstance(_clv,int) else (tuple(_clv.shape), _clv.reshape(-1)[:2].cpu().tolist())} "
+                  f"shared_id={id(_hold(st))}", flush=True)
+        # packed：`_cmp_len_r` 是逐请求张量 [B]；单序列：int
+        cmp_len = int(_clv) if isinstance(_clv, int) else (T // ratio)
+        Pc = int(_shared_get(st, f"_cmp_pc_r{ratio}" + _sfx(ctx, "cmp")) or 0) if _pk_mode else 0
+        # 与 _kv_compress 的写侧同约定：池 = (1+nblk) 块，块号 1..nblk（块 0 恒空），
+        # 槽位 = (1+p//BS)*BS + p%BS。索引器给的 cmp_sparse_indices 是**零基压缩行号**（官方
+        # prepare_fa_kwargs 注释："only the FA input uses zero-based [T,1,K] indices"）✓
+        cpool = _shared_get(st, f"_cmp_pool_r{ratio}" + _sfx(ctx, "cmp"))[: (1 + cnblk) * BS].view(1 + cnblk, BS, 1, 320)
+        # ★ cmp 侧索引：索引器（idx_prolog/qli）跑过就用**真实** top-k（exec_indexer 写到 st 的
+        #   cmp_sparse_indices/cmp_topk_length）；没有就退回"空索引"（全 -1 + len 0，
+        #   官方明确支持的配置：该行不读压缩 KV）。
+        # 调试：用官方 dump 的 sparse 索引喂本层注意力（证明"唯一残差=索引顺序"）
+        _ov = _oenv("DS41M_CMP_SPARSE")
+        if _ov:
+            _d = torch.load(_ov, map_location="cpu", weights_only=False)["t"]
+            _d = _d.reshape(T, -1).to(torch.int32).to(dev)
+            _shared_get(st, "_x")  # noop
+            ci = _d.unsqueeze(1)
+        if not _ov:
+            ci = _shared_get(st, f"_cmp_sparse_r{ratio}" + _sfx(ctx, "idx"))  # 张量不能用 or（truthiness 歧义）
+        # ★ 官方 `_prepare_cmp_topk_lengths`（attention_data.py:741-753）：有效长度是
+        #   **位置驱动** `min((pos+1)//ratio, index_topk)`，不是"索引里非 -1 的个数"。
+        #   （因果正确时两者相等，实测 mini 的 [0,1,1,2,…] 与公式逐项一致；这里直接用公式）
+        if _cp is not None:
+            # CP：本地行是 head-tail 两块，压缩有效长度按**逐行全局位置**算
+            # （`cp_positions` 已含全局 token 号），公式同官方/其余路径。
+            # ★ pad 行（非整除 L）必须 cl=0：它们的 ci 是 -1，若 cl>0 内核会按 -1
+            #   寻址（实测 L=1000 CP8 在层 21 设备挂死；8192 无 pad 所以没暴露）。
+            _cpos = _cp.abs_positions.to(torch.int64).view(-1)   # 绝对位置（compact 段含 pos_offset）
+            _cval = _cp.valid.view(-1, 1)
+
+            def _cl_cp():
+                v = ((_cpos + 1) // max(1, ratio)).clamp_max(
+                    int(ctx["index_topk"])).to(torch.int32).view(-1, 1)
+                return torch.where(_cval, v, torch.zeros_like(v))
+
+            _cpk = ("cmp_cl_cp", int(T), int(ratio), int(ctx["index_topk"]),
+                    int(_cpos.data_ptr()), str(dev), bool(getattr(_cp, "has_pads", False)))
+            # ★★ 2026-10-31（CP4 空泡归因）：`cl` 只跟 (abs_positions, valid, ratio,
+            #   index_topk, device) 有关 —— 同一 CpState 生命周期内全是常量。
+            #   旧代码在 `has_pads`（CP4/L=65536 每段都有 tail pad）时**每层现造**：
+            #   6 个 AIV 小算子（Add_INT64/FloorDiv/ClipByValue/Cast/ZerosLike/SelectV2）
+            #   × 40 层 = 240 任务/forward，trace 里 `SelectV2 → Mqsmla` 的空隙
+            #   （22.35 ms/fwd、37 次）就落在这里。key 含 abs_positions 指针
+            #   （CpState 对象跨层不变）⇒ 每 forward 每状态只建一次（几何变才清 META）。
+            #   有 pad 时 where 不是恒等，但**值同样是常量**，缓存逐位不变。
+            cl = _meta(_cpk, _cl_cp)
+        elif _pk_mode:
+            # packed：`_loc` 是**请求内行号**（窗口用）；压缩有效长度必须用**绝对位置**
+            # （官方 `_prepare_cmp_topk_lengths`: min((pos+1)//ratio, index_topk)），
+            # 即 `_loc + pos_offset`。压缩池/索引缓存按绝对压缩行号开（与写侧一致）。
+            _cl_off = int(ctx.get("pos_offset", 0) or 0)
+            # ★ 2026-10-21（逐序列几何）：各批起始位置不同 → 逐 token 取所属请求的 off_i
+            _po = [int(v) for v in (ctx.get("pos_offsets") or [])]
+            if _po and len(_po) == int(_nseq):
+                _off_row = _meta(("off_row_pk", tuple(_po), int(T), str(dev)),
+                                 lambda: torch.tensor(_po, dtype=torch.long, device=dev)[_sid])
+                _cl_key = tuple(_po)
+            else:
+                _off_row = _cl_off
+                _cl_key = int(_cl_off)
+            cl = _meta(("cmp_cl_pk", int(T), int(_nseq), int(ratio),
+                        int(ctx["index_topk"]), _cl_key, str(dev)),
+                       lambda: ((_loc + _off_row + 1) // max(1, ratio))
+                       .clamp_max(int(ctx["index_topk"])).to(torch.int32).view(-1, 1))
+        else:
+            if dg_on():
+                def _cl_build(p):
+                    return (((torch.arange(T, dtype=torch.int64, device=dev) + int(p)) + 1)
+                            // max(1, ratio)).clamp_max(int(ctx["index_topk"])
+                                                       ).to(torch.int32).view(-1, 1)
+                cl = dg_meta(("cmp_cl_step", int(T), int(ratio),
+                              int(ctx["index_topk"]), str(dev)),
+                             lambda: _cl_build(ctx.get("pos_offset", 0)),
+                             lambda b, p: b.copy_(_cl_build(p)))
+            else:
+                cl = _meta(("cmp_cl", int(T), int(ctx.get("pos_offset", 0)), int(ratio),
+                            int(ctx["index_topk"]), str(dev)),
+                           lambda: (((torch.arange(T, dtype=torch.int64, device=dev)
+                                      + int(ctx.get("pos_offset", 0))) + 1) // max(1, ratio))
+                           .clamp_max(int(ctx["index_topk"])).to(torch.int32).view(-1, 1))
+        if ci is None and not _ov:           # 兼容：索引器写在 st 的旧键
+            ci = st.get("cmp_sparse_indices")
+        if os.environ.get("DS41M_CMP_NANDBG") and int(ctx.get("idx", -1)) in (2, 20):
+            # ★ 2026-10-31（主控定位 NaN）：cmp 索引 vs 池的实际关系。
+            #   · ci 是零基压缩行号；池槽位 = (1+p//BS)*BS + p%BS
+            #   · 打印每行块的 ci 范围、越界槽位数、被引用行的"全零"数（fake 前缀）
+            try:
+                _rows = cpool.reshape(-1, cpool.shape[-1])
+                _zero_row = (_rows.abs().sum(dim=1) == 0)
+                _cap = int(_rows.shape[0])
+                if ci is None or cl is None:
+                    print(f"  [cmpndbg] L{int(ctx.get('idx'))} T={int(T)} has_cmp={has_cmp} "
+                          f"ci=None cl={'None' if cl is None else 'ok'} "
+                          f"off={ctx.get('pos_offset')} ratio={ratio} "
+                          f"pool_zero_rows={int(_zero_row.sum())}/{_cap}", flush=True)
+                else:
+                    _ci = ci.detach().reshape(int(T), -1).to(torch.int64)
+                    _ok = _ci >= 0
+                    _p = _ci.clamp_min(0)
+                    _slot = (1 + _p // BS) * BS + _p % BS
+                    _oob = int(((_slot >= _cap) & _ok).sum())
+                    _ref_zero = int(_zero_row[_slot[_ok]].sum()) if bool(_ok.any()) else 0
+                    _nref = int(_ok.sum())
+                    print(f"  [cmpndbg] L{int(ctx.get('idx'))} T={int(T)} "
+                          f"ci=[{int(_ci[_ok].min())},{int(_ci[_ok].max())}] nref={_nref} "
+                          f"cl_max={int(cl.reshape(-1).max()) if torch.is_tensor(cl) else cl} "
+                          f"cap_rows={_cap} oob={_oob} ref_zero_rows={_ref_zero} "
+                          f"pool_zero_rows={int(_zero_row.sum())}/{_cap}", flush=True)
+            except Exception as _e:                    # noqa: BLE001
+                print(f"  [cmpndbg] 失败 {type(_e).__name__}: {_e}", flush=True)
+        if _oenv("DS41M_NO_CMP"):        # 调试：强制空索引（判定索引 vs 压缩KV值）
+            ci = cl = None
+        if ci is not None and cl is not None:
+            # 防御性归一：算子硬校验是 int32 + [T1,1,512] / [T1,1]，索引器端只要语义对，
+            # 形状/dtype 由这里兜（实测踩过 "cmp_topk_length must be an int32 tensor of shape [T1,N2]"）
+            if (os.environ.get("DS41M_CMP_ARGDBG") and int(ctx.get("idx", -1)) == 2
+                    and ci.numel() != int(T) * int(ci.shape[-1])):
+                _hk = f"_cmp_sparse_r{ratio}" + _sfx(ctx, "idx")
+                _hv = _shared_get(st, _hk)
+                print(f"  [mq-ci] T={int(T)} ci={tuple(ci.shape)} hold_key={_hk!r} "
+                      f"hold={None if _hv is None else tuple(_hv.shape)} "
+                      f"st_has={'cmp_sparse_indices' in st} off={ctx.get('pos_offset')}", flush=True)
+            ci = ci.reshape(T, 1, -1).to(torch.int32)
+            cl = cl.reshape(T, 1).to(torch.int32)
+            real = True
+            # ★ 2026-10-20 DSpark T>1 verify：MQSMLA 在 layer 8 报 aicore
+            #   "VEC 访问 UB 越界"（plog: kernel_MqsmlaKernel, errcode 341）。
+            #   索引器 seqused_k 已按 (off+T)//ratio 声明，但 carry 行仍可能被选中；
+            #   把 >= seqused_cmp_kv 的索引一律降为 -1（它们本就不可见）。
+            _oob = 0
+            # ★ 只对**小 T**（DSpark verify T=6）做；hit stage B 的 T≈数千 保持
+            #   原单 batch 路径（与既有 hit 基准/PARAMS replay_tail=128 逐位一致）。
+            # ★★ CP 例外：compact 段的本地行可能 ≤32（140 行 mirror 后每 rank 18 行），
+            #   但它是**正常 prefill 块**、ci 是绝对压缩行号（可 ≥ index_topk），这里
+            #   的 `ci < cl` 只是 DSpark 的"未来行"判据，会误杀 → 跳过。
+            if 1 < int(T) <= 32 and _cp is None:
+                # 上界必须用**逐行**的 cmp_topk_length（`cl`），不能用 Python 的
+                # 全局 cmp_len：DG（P3 verify 图）里 cmp_len 是捕获步常量，
+                # replay 到后面的 pos 会把合法索引误清掉；`cl` 是 dg 缓冲，逐 replay 刷新。
+                _ci_bad = (ci < -1) | (ci >= cl.reshape(int(T), 1, 1))
+                if _oenv("DS41M_MQ_CHECK"):
+                    _oob = int(_ci_bad.sum())      # 仅诊断时同步
+                # 纯设备侧 where（默认不做 host 同步，否则 P3 verify 图无法捕获）
+                ci = torch.where(_ci_bad, torch.full_like(ci, -1), ci)
+                # ★★ 2026-10-20 DSpark 因果泄漏修（fake id=0 vs 5 实证）：
+                #   QLI 对多查询块把**未来压缩行**也排进了 top-k（row0 cl=9 却拿到
+                #   行 9/10，它们由 draft token 18..21 生成）。仅把越界行标 -1 不够：
+                #   未来行占据前 cl 个槽位，会把合法因果行挤到第 cl 位之后 →
+                #   row0 的可见集合随 draft 变化（logits 差 1.75，389↔32487）。
+                #   这里按行**稳定重排**：合法的（0 <= ci < cl）保持原相对顺序排到前面，
+                #   无效/未来行全部压到尾部；再把 cl 收紧到合法行数，保证前缀里没有 -1。
+                _lim = cl.reshape(int(T), 1, 1)
+                _ok = (ci >= 0) & (ci < _lim)
+                _K = int(ci.shape[-1])
+                # ★ 2026-10-22：ArgSort 的 NPU kernel 不支持 int32/int64，torch_npu 会退回
+                #   AiCPU（打 "ArgSort ... running on AiCpu" 并同步），DSpark verify（T=6）
+                #   每层都踩一次。这里 key 是 0..2K 的整数（K=index_topk，通常 512；
+                #   ≤2^24 时 float32 可精确表示），转 float32 后走 AiCore，排序结果逐位不变。
+                _key = (~_ok).to(torch.float32) * (_K + 1) + torch.arange(
+                    _K, dtype=torch.float32, device=dev)
+                _order = torch.argsort(_key, dim=-1)
+                ci = torch.gather(ci, -1, _order)
+                cl = torch.minimum(cl, _ok.sum(-1, keepdim=True).reshape(int(T), 1)
+                                   .to(torch.int32))
+            if _oenv("DS41M_MQ_CHECK") and 1 < int(T) <= 32:
+                _ci_cpu = ci.reshape(int(T), -1).cpu()
+                _neg_pref = int((_ci_cpu[:, :int(cl.max())] < 0).sum())
+                print(f"  [mq-check] L{ctx.get('idx')} T={int(T)} "
+                      f"off={ctx.get('pos_offset')} cmp_len={int(cmp_len)} "
+                      f"idx_max={int(_ci_cpu.max()) if _ci_cpu.numel() else -1} "
+                      f"oob={_oob} neg_in_prefix={_neg_pref} "
+                      f"cl={[int(v) for v in cl.reshape(-1).cpu().tolist()]} "
+                      f"ori_len={[int(v) for v in length.reshape(-1).cpu().tolist()]}",
+                      flush=True)
+        else:
+            # ★ 2026-10-28（P0-2）：这两个是**常量**（全 -1 / 全 0）且只作只读输入，
+            #   按 `_meta` 缓存复用，省掉每层 2 个 Fill/ZerosLike 的分配与下发。
+            #   常量不会变 ⇒ 不需要复位；key 含 T/topk/device。`DS41M_HOST_OPT=0` 回退。
+            if _HOST_OPT:
+                ci = _meta(("cmp_ci_const", int(T), int(ctx["index_topk"]), str(dev)),
+                           lambda: torch.full((T, 1, ctx["index_topk"]), -1,
+                                              dtype=torch.int32, device=dev))
+                cl = _meta(("cmp_cl_const", int(T), str(dev)),
+                           lambda: torch.zeros((T, 1), dtype=torch.int32, device=dev))
+            else:
+                ci = torch.full((T, 1, ctx["index_topk"]), -1, dtype=torch.int32, device=dev)
+                cl = torch.zeros((T, 1), dtype=torch.int32, device=dev)
+            real = False
+        if _dbg:
+            print(f"      [mq] cmp 索引: {'真实（索引器产出）' if real else '空（未接索引器）'}"
+                  f" 有效行={int((cl > 0).sum())}", flush=True)
+        # ★ 这两个是**每次现造**的 device 张量（host 各 ~0.3-0.5 ms + 1~2 个 kernel/次），
+        #   值只跟 cnblk / cmp_len 有关 → 缓存（实测这一段占 mqsmla 胶水的 99%：1.28 ms/次）
+        if _pk_mode:
+            # 逐请求块表 [B, Pc]：第 b 行 = b*Pc+1 .. (b+1)*Pc（与 `_kv_compress_packed` 写侧同约定）
+            bt_c = _meta(
+                ("cmp_bt_pk", int(Pc), int(_nseq), str(dev)),
+                lambda: (torch.arange(Pc, dtype=torch.int32, device=dev).unsqueeze(0)
+                         + (torch.arange(_nseq, dtype=torch.int32, device=dev).unsqueeze(1) * Pc + 1)))
+            su_c = (_clv.to(torch.int32) if isinstance(_clv, torch.Tensor)
+                    else torch.tensor([cmp_len], dtype=torch.int32, device=dev))
+        else:
+            bt_c = _meta(
+                ("cmp_bt", int(cnblk), str(dev)),
+                lambda: torch.arange(1, 1 + cnblk, dtype=torch.int32,
+                                     device=dev).unsqueeze(0))
+            if isinstance(_clv, torch.Tensor):
+                # ★★ 2026-10-28（命中 + CP 的最后一块）：压缩器写的是**逐请求可见长度**
+                #   张量 [off//ratio + rows//ratio]（全局口径，如 4095）；这里以前一律按
+                #   `T//ratio`（CP 的 **本地**行数，如 480//2=240）构造 seqused_cmp_kv
+                #   ⇒ 压缩注意力只看到一半的压缩行。CP1 走 packed 分支直接用张量，所以只有
+                #   命中+CP 错。直接透传张量（不引入 host 同步）。
+                su_c = _clv.to(torch.int32)
+                # ★★ 2026-10-28（P0-1）：这里原来有一行 `cmp_len = int(su_c[...].item())`——
+                #   它在热路径上无条件执行、**结果只在下面的调试打印里用到**，而 `.item()`
+                #   会等整条 NPU 队列排空（同文件 `_meta` 注释：单次 170~260ms 量级）。
+                #   删除后在热路径零同步；调试打印里按需现算（见 DS41M_CMP_ARGDBG 分支）。
+                #   `DS41M_HOST_OPT=0` 可回退到旧行为（只为 A/B 归因）。
+                if not _HOST_OPT:
+                    cmp_len = int(su_c.reshape(-1)[0].item())
+            elif dg_on():
+                su_c = dg_meta(
+                    ("cmp_seqlen_step", int(T), int(ratio), str(dev)),
+                    lambda: torch.tensor([cmp_len], dtype=torch.int32, device=dev),
+                    lambda b, p: b.fill_((int(p) + int(T)) // max(1, ratio)))
+            else:
+                su_c = _meta(
+                    ("cmp_seqlen", int(cmp_len), str(dev)),
+                    lambda: torch.tensor([cmp_len], dtype=torch.int32, device=dev))
+        if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+                and int(ctx.get("idx", -1)) == 2 and int(os.environ.get("RANK", "0")) == 0):
+            import hashlib as _hlA
+            _hA = lambda t: _hlA.sha1(t.detach().float().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]
+            print(f"  [mq-cmp] T={int(T)} off={ctx.get('pos_offset')} "
+                  f"cmp_len={int(su_c.reshape(-1)[0].item()) if torch.is_tensor(su_c) else int(su_c)} cnblk={cnblk} "
+                  f"su_c={su_c.reshape(-1)[:1].cpu().tolist()} ci={_hA(ci)} cl={_hA(cl)} "
+                  f"pool={_hA(cpool)} seq_ori={_seq_ori.reshape(-1)[:1].cpu().tolist()}", flush=True)
+        kwargs.update(cmp_kv=cpool, cmp_sparse_indices=ci,
+                      cmp_block_table=bt_c, seqused_cmp_kv=su_c,
+                      cmp_topk_length=cl)
+        # packed cmp 几何自证（`DS41M_MQ_DBG_PK=1`，rank0）：崩层排查用。
+        #   ★ 只要出现 `neg_in_prefix>0`（cl 以内的列里有 -1）就是非法输入（内核会按 -1 寻址）。
+        if _oenv("DS41M_MQ_DBG_PK") and int(_oenv("RANK", "0")) == 0:
+            try:
+                _cim = int(ci[ci >= 0].max()) if bool((ci >= 0).any()) else -1
+                _cimn = int(ci[ci >= 0].min()) if bool((ci >= 0).any()) else -1
+                _clm = int(cl.max())
+                _negp = int(((ci.reshape(int(T), -1)[:, :_clm] < 0)).sum())
+                _suv = (int(su_c.max()) if torch.is_tensor(su_c) else int(su_c))
+                print(f"  [mq-pk] L{ctx.get('idx')} ratio={ratio} T={int(T)} "
+                      f"off={ctx.get('pos_offset')} Pc={int(Pc)} n={int(_nseq)} "
+                      f"ci[{_cimn},{_cim}] cl_max={_clm} neg_in_prefix={_negp} "
+                      f"bt{tuple(bt_c.shape)} bt_max={int(bt_c.max())} "
+                      f"cpool_blocks={int(cpool.shape[0])} su_c={_suv} "
+                      f"cl_first={[int(v) for v in cl.reshape(-1)[:4].cpu().tolist()]}",
+                      flush=True)
+            except Exception as _dbe:                  # noqa: BLE001
+                print(f"  [mq-pk] 诊断失败 {type(_dbe).__name__}: {_dbe}", flush=True)
+    if _oenv("DS41M_MQ_SUB"):
+        _t5 = time.perf_counter()
+        _MQ_SUB["glue"] = _MQ_SUB.get("glue", 0.0) + (_t5 - _t4)
+    if _dbg:
+        print("      [mq 5] 调 metadata …", flush=True)
+    if _oenv("DS41M_MQ_SUB"):
+        _tC = time.perf_counter()
+        _MQ_SUB["C_cmp"] = _MQ_SUB.get("C_cmp", 0.0) + (_tC - _tB)
+    # ★ 这个 metadata 的入参**全是层不变量**（长度表只跟 T/off/ratio 有关，cu/heads/head_dim 常量）
+    #   → 按 (ratio, has_cmp) 缓存；省掉每层一次 metadata 算子调用（~0.4 ms/层）。
+    _mdk = ("mq_md", int(ratio), bool(has_cmp), int(T), int(ctx.get("pos_offset", 0)),
+            int(ctx["index_topk"]), str(dev), int(_nseq),
+            # CP：同一本地 T 可对应不同 L（非整除），metadata 依赖全局几何 → 入键
+            int(ctx.get("cp_total_q") or 0))
+    md = _meta(_mdk, lambda: _mqfc.mqsmla_metadata(
+        length,
+        kwargs.get("cmp_topk_length", torch.zeros_like(length)),
+        cu_seqlens_q=cu, num_heads_q=N_HEADS, num_heads_kv=1, head_dim=HEAD_DIM,
+        quant_mode=1, layout_q="TND", layout_kv="PA_BBND",
+        has_ori_kv=True, has_cmp_kv=has_cmp))
+    if _dbg:
+        print("      [mq 6] metadata ok", flush=True)
+    kwargs["metadata"] = md
+    # 诊断（DS41M_MQ_DUMP_IN=层号）：落 mqsmla 的**逐行输入**（窗口索引/长度/块表/cmp 三件套），
+    # 用于 CP compact 段与非 CP 拆分的逐行对拍（dump 的 st 快照不含这些 kwargs）。
+    if (_oenv("DS41M_MQ_DUMP_IN", "").strip() == str(int(ctx.get("idx", -1)))
+            and int(_oenv("RANK", "0")) == 0 and not dg_on()):
+        try:
+            _dd = _oenv("DS41M_MQ_DUMP_DIR", "/mnt/xds/sfs/l00972766/tmp/mq_in")
+            os.makedirs(_dd, exist_ok=True)
+            _save = {}
+            for _k in ("ori_sparse_indices", "ori_topk_length", "ori_block_table",
+                       "cu_seqlens_q", "seqused_ori_kv", "cmp_sparse_indices",
+                       "cmp_block_table", "seqused_cmp_kv", "cmp_topk_length"):
+                _v = kwargs.get(_k)
+                if torch.is_tensor(_v):
+                    _save[_k] = _v.detach().cpu()
+                elif _v is not None:
+                    _save[_k] = _v
+            _save["q"] = st["q"].detach().float().cpu()
+            _cpv = ctx.get("cp_positions")
+            _save["cp_positions"] = _cpv.detach().cpu() if torch.is_tensor(_cpv) else None
+            torch.save(_save, os.path.join(_dd, f"mqin_L{int(ctx.get('idx', -1))}.pt"))
+            print(f"      [mq-dump-in] L{int(ctx.get('idx', -1))} 已落 {_dd}", flush=True)
+        except Exception as _e:                       # noqa: BLE001
+            print(f"      [mq-dump-in] 失败 {type(_e).__name__}: {_e}", flush=True)
+    if _oenv("DS41M_DEBUG"):
+        bad = []
+        for k, v in kwargs.items():
+            if torch.is_tensor(v):
+                cont = int(v.is_contiguous())
+                amp = ""
+                if v.dtype in (torch.bfloat16, torch.float32, torch.float16):
+                    amp = f" absmax={v.float().abs().max().item():.3e}"
+                bad.append(f"{k}{tuple(v.shape)}/{str(v.dtype).replace('torch.','')}"
+                           f"/{v.device.type}/c{cont}{amp}")
+        print("      [mqsmla in] " + "\n                   ".join(bad), flush=True)
+        if has_cmp:
+            # 压缩索引口径自证（odd-T 排查）：索引上界必须 < seqused_cmp_kv；
+            # cl 的逐行值应等于 min((pos+1)//ratio, index_topk)。
+            _su = kwargs.get("seqused_cmp_kv")
+            _su_v = int(_su.reshape(-1)[0]) if torch.is_tensor(_su) else int(_su or 0)
+            _civ = ci[ci >= 0]
+            print(f"      [mqsmla cmp] L{ctx.get('idx')} seqused={_su_v} idx_max="
+                  f"{int(_civ.max()) if _civ.numel() else -1} "
+                  f"idx_min={int(_civ.min()) if _civ.numel() else -1} "
+                  f"cl_max={int(cl.max())} cl_last={int(cl.reshape(-1)[-1])} "
+                  f"valid_idx={int((ci >= 0).sum())} "
+                  f"n_rows={int(st.get('cmp_latent').shape[0]) if st.get('cmp_latent') is not None else -1}",
+                  flush=True)
+    # ★ 逐算子对拍用（2026-10-17）：把**喂给官方算子的窗口元数据**留在 st，
+    #   `_dump_tensors` 会一并落盘 → 与官方 dump 的 win_sparse/win_len/block_table/cu_seqlens_q 逐项比。
+    #   （q/池逐位一致而 attn_out 不一致时，分歧必然在这里或 cmp 索引）
+    st["_win_idx"], st["_win_len"], st["_bt"], st["_cu"] = idx, length, bt, cu
+    if has_cmp:
+        st["_cmp_sparse_in"], st["_cmp_len_in"] = ci, cl
+    # ★★ 2026-10-19：厂商 mqsmla 在 **cmp 路径 + T%4==1 + T>1** 时 aicore trap
+    #   （实测 T=5/9/329/333 崩；T=1/330/331/332 正常；`DS41M_NO_CMP=1` 置空索引后不崩）。
+    #   在算子内拆段（[0,T-1]+[T-1,T]）实测仍崩（同一 q/元数据直调 T=328 却正常），
+    #   ⇒ 改为在 **runner 的整段前向**拆：前 T-1 个 token 正常 prefill，最后 1 个 token
+    #   走 decode 步（见 runner.run_prefill_auto）。算子这一层保持单次调用、不做侵入。
+    if _MQ_L2_ON:
+        out, _lse = _mqfc2.mqsmla(q, kwargs)          # ★ B3：L2（DS41M_MQ_L2=1）
+    else:
+        out, _lse = _mqfc.mqsmla(q, kwargs)
+    if _oenv("DS41M_MQ_SUB"):
+        _MQ_SUB["call"] = _MQ_SUB.get("call", 0.0) + (time.perf_counter() - _t5)
+        _MQ_SUB["n"] = _MQ_SUB.get("n", 0) + 1
+    st["attn_out"] = out.reshape(T, N_HEADS, HEAD_DIM)
+    if _oenv("DS41M_DEBUG"):
+        print(f"      [mqsmla] ratio={ratio} cmp={has_cmp} q_absmax={q.abs().max().item():.3f} "
+              f"out_absmax={st['attn_out'].abs().max().item():.4f}", flush=True)
+    if _ENV_RELEASE_Q_ATTN and st.get("attn_out") is not None:
+        st["q"] = None
+
+
+# ─────────────────── 元素级（层内小算子）───────────────────
+@op("cast")
+def _cast(st, ctx, w):
+    _ = st["x"].to(torch.float32).to(torch.bfloat16)
+
+
+@op("mul")
+def _mul(st, ctx, w):
+    st["x"] = st["x"] * 1.0
+
+
+@op("add")
+def _add(st, ctx, w):
+    st["x"] = st["x"] + 0.0
+
+
+@op("tmove")
+def _tmove(st, ctx, w):
+    st["x"] = st["x"].contiguous()
+
+
+# ─────────────────── 尚不能真跑（M2 分步补齐；原因写清）───────────────────
+skip("mega_moe", "需要对称缓冲 + HCCL 组（Tier B）")
+skip("engram_fetch", "ElasticBuffer 内部 HCCL 要求 ≥2 rank → 单卡跑不了（M3/M4）")
+skip("engram_wait", "同 engram_fetch（≥2 rank）")
+skip("idx_prolog", "需要 indexer 上下文（Tier B）")
+skip("qli", "需要 indexer 上下文（Tier B）")
+skip("qsli", "需要 indexer 上下文（Tier B）")
+skip("transpose_qmm", "见 wo_a（已由 wo_a 承担）")
+
+
+PLUGINS_LOADED = False
+
+
+def _load_plugins(cfg=None):
+    """可选算子插件：把大块算子拆到独立文件，团队并行开发时各改各的。
+
+    插件约定（例：exec_indexer.py）::
+
+        def register(OPS, SKIP, core):
+            OPS["idx_prolog"] = _idx_prolog        # 实现放插件里
+            SKIP.pop("idx_prolog", None)           # 从"跑不了"名单里拿掉
+            core._qmm(...)                         # 可借用 core（=本模块）里的工具函数
+    """
+    global PLUGINS_LOADED
+    if PLUGINS_LOADED:
+        return
+    PLUGINS_LOADED = True
+    _apply_spec(cfg)                     # ★ 先把本模块的常量对齐到 config（默认值不变）
+    import importlib
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    for name in ("exec_indexer", "exec_moe", "exec_engram"):
+        if not _os.path.exists(_os.path.join(here, name + ".py")):
+            continue
+        mod = importlib.import_module(name)
+        try:
+            mod.register(OPS, SKIP, sys.modules[__name__], cfg)
+        except TypeError:                    # 旧签名（3 参）
+            mod.register(OPS, SKIP, sys.modules[__name__])
+        print(f"  [exec_ops] 插件 {name}: +{getattr(mod, 'ADDED', '?')}")
+    # 所有算子只有**一个**入口（varlen 默认口径）：见文件末尾的 kv_compress 分派
+    print("  [exec_ops] 算子实现已合并（无 packed 变体）")
+
+
+_DUMP_N = {}
+
+
+def _dump_tensors(st, ctx, key):
+    """`DS41M_DUMP_TENSORS=<dir>`：逐算子落盘中间张量（行 0:DS41M_DUMP_ROWS），
+    供与官方 `DS41L_PARITY_OPS` 的 dump 逐项比对（定位数值差出自哪一步）。
+    只 dump `DS41M_DUMP_LAYERS`（默认 0）里的层；异常只告警。"""
+    d = _ENV_DUMP_TENSORS
+    if not d:
+        return
+    try:
+        layers = {int(s) for s in (os.environ.get("DS41M_DUMP_LAYERS", "0") or "0").split(",")}
+        idx = int(ctx.get("idx", -1))
+        if idx not in layers:
+            return
+        rows = int(os.environ.get("DS41M_DUMP_ROWS", "512"))
+        roff = int(os.environ.get("DS41M_DUMP_ROW_OFF", "0") or 0)   # ★ 定位到出错 token 行窗口
+        n = _DUMP_N.get(idx, 0)
+        _DUMP_N[idx] = n + 1
+        os.makedirs(d, exist_ok=True)
+        hold = _hold(st)
+        rec = {}
+        for name in ("x", "residual", "q", "kv", "qr", "attn_out", "o_lora",
+                     "logits", "topk_idx", "topk_weight", "moe_out", "hc_pre_t",
+                     # ★ 2026-10-17：与官方 official_ops2 的 L1_engram_* / 压缩件对齐用
+                     "engram_kv", "engram_proj_out", "engram_out",
+                     "cmp_kv", "cmp_latent", "idx_sparse",
+                     # ★ 2026-10-17：注意力窗口/压缩元数据（与官方 win_sparse/win_len/
+                     #   block_table/cu_seqlens_q/cmp_sparse 同源同义）
+                     "_win_idx", "_win_len", "_bt", "_cu", "_cmp_sparse_in", "_cmp_len_in"):
+            v = st.get(name)
+            if isinstance(v, torch.Tensor):
+                rec[name] = v.detach()
+        for name in ("_full_pool", "_win_pool"):
+            v = hold.get(name)
+            if isinstance(v, torch.Tensor):
+                rec[name] = v.detach()
+        out = {}
+        for name, v in rec.items():
+            if name in ("_bt", "_cu", "_full_pool", "_win_pool"):   # dim0 不是 token，别切
+                t = v
+            elif v.dim() >= 1 and v.shape[0] > rows:
+                t = v[roff:roff + rows]
+            else:
+                t = v
+            if name in ("_full_pool", "_win_pool"):
+                out[name] = t.reshape(t.shape[0], -1).view(torch.uint8).cpu()   # 原字节，便于与官方 uint8 池逐字节比
+            elif t.dtype.is_floating_point:
+                out[name] = t.float().cpu()
+            else:
+                out[name] = t.cpu()
+        out["_key"], out["_idx"] = key, idx
+        out["_stage"] = st.get("_norm_stage")
+        torch.save(out, os.path.join(d, f"L{idx}_{n:02d}_{key}.pt"))
+    except Exception as exc:                             # noqa: BLE001
+        print(f"  [exec_ops] dump {key} 失败：{type(exc).__name__}: {exc}", flush=True)
+
+
+_MQ_SUB: dict = {}       # mqsmla 内部分段计时（DS41M_MQ_SUB=1）
+
+
+META: dict = {}          # 层间共享的"元数据张量"（win 索引 / slot / cu_seqlens / 位置表…）
+                         #   官方做法：build_attn_metadata 每 **步** 建一次、40 层共享读
+                         #   （modeling_deepseek.py 注释 "reused by layers"）。mini 以前每层重算
+                         #   → 每层多出若干 arange/cat/where 的 kernel 与下发。key 必须含所有
+                         #   决定数值的参数（T/off/ratio/BS/device…）。
+
+
+# ★ 2026-10-21 诊断：`_meta` 未命中 = 一次阻塞 H2D（`torch.tensor(..., device=npu)`），
+#   流水跑法下要等整条设备队列排空（实测单次要 170~260ms）。`DS41M_META_TRACE=1` 时
+#   把 (pass 号, key) 打到 stderr（pure 模式只滤 stdout，stderr 仍进 all.log）。
+#   runner 每个前向开头会 +1 `PASS_NO`，用来区分"预热漏"还是"采集期还在漏"。
+PASS_NO = 0
+_META_TRACE = os.environ.get("DS41M_META_TRACE", "").strip().lower() in ("1", "on", "true", "yes")
+
+
+# ★ 2026-10-31 校验开关：`DS41M_META_VERIFY=1` 时，**每次命中**都重算一遍 build()，
+#   与缓存值逐位比较（张量 torch.equal / 元组递归 / 标量 ==）。用于证明"缓存=现算"，
+#   只在校验跑里开，正常跑零开销（一次 dict.get 之外的 env 布尔判断）。
+_META_VERIFY = os.environ.get("DS41M_META_VERIFY", "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def _meta_eq(a, b):
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+            return False
+        return (a.shape == b.shape and a.dtype == b.dtype and a.device == b.device
+                and bool(torch.equal(a, b)))
+    if isinstance(a, dict):
+        return (isinstance(b, dict) and a.keys() == b.keys()
+                and all(_meta_eq(a[k], b[k]) for k in a))
+    if isinstance(a, (tuple, list)):
+        return (isinstance(b, (tuple, list)) and len(a) == len(b)
+                and all(_meta_eq(x, y) for x, y in zip(a, b)))
+    return a == b
+
+
+def _meta(key, build):
+    t = META.get(key)
+    if t is None:
+        t = META[key] = build()
+        if _META_TRACE:
+            import sys as _s
+            _s.stderr.write(f"  [meta-miss] pass={PASS_NO} {key}\n")
+    elif _META_VERIFY:
+        _t2 = build()
+        if not _meta_eq(t, _t2):
+            raise RuntimeError(f"[meta-verify] 缓存值与现算不一致：pass={PASS_NO} key={key}")
+    return t
+
+
+# ★★ 2026-10-31（对齐 DeepInfer `CrossLayerRuntime`）：**forward 级**缓存。
+#   DeepInfer 把「每 forward 算一次、跨层复用」的值挂在 `cross_layer_runtime` 上
+#   （`v4_modules/cross_layer.py:277-340`：模型 forward 创建 → 逐层传递 → 候选组边界
+#   `index_attn.py:563-565` / `yoco.py:118-122` 处 clear）。我们这里用 `PASS_NO`
+#   （`core/runner.py:955` 每个前向 +1）当 epoch：键随前向自动失效，跨 forward 不会串味。
+#   注意：**只放"同一次前向内、跨层逐位相同"的纯函数结果**（输入张量按 data_ptr 进键）。
+_FWD_META = [None, {}]
+
+
+def _meta_fwd(key, build):
+    """forward 级缓存（epoch = PASS_NO）。语义同 `_meta`，但每次新前向整表重建。"""
+    ep = int(PASS_NO)
+    if _FWD_META[0] != ep:
+        _FWD_META[0] = ep
+        _FWD_META[1] = {}
+    d = _FWD_META[1]
+    if key not in d:
+        d[key] = build()
+        if _META_TRACE:
+            import sys as _s
+            _s.stderr.write(f"  [meta-fwd-miss] pass={ep} {key}\n")
+    elif _META_VERIFY:
+        _t2 = build()
+        if not _meta_eq(d[key], _t2):
+            raise RuntimeError(f"[meta-fwd-verify] 缓存值与现算不一致：pass={ep} key={key}")
+    return d[key]
+
+
+# ── decode graph 静态位置缓冲（DS41M_DECODE_GRAPH）──────────────────────────
+# decode 每一步 pos 都变；图里录的是**张量地址**，所以依赖 pos 的元数据张量必须住固定
+# 缓冲：首步建好，之后每次 replay 前 `dg_update(pos)` 原地刷新内容。只用于 T=1 的增量
+# decode（`runner.run_forward` 在捕获前 `dg_begin()`）。
+_DG = {"on": False, "call": True, "map": {}, "bufs": [], "pos": 0}
+_DG_CONST: dict = {}
+
+
+def dg_begin():
+    _DG["on"] = True
+    _DG["map"].clear()
+    _DG["bufs"].clear()
+
+
+def dg_end():
+    _DG["on"] = False
+    _DG["map"].clear()
+    _DG["bufs"].clear()
+
+
+def dg_on():
+    # `call`：本次 run_forward 是否真的走 DG。T=4 verify 与 T=1 图共用同一进程，
+    # 非 DG 调用期间必须让所有 dg_* 走回普通 `_meta`（缓冲/图仍保留给下一次 T=1）。
+    return bool(_DG["on"] and _DG["call"])
+
+
+def dg_call_enter(active):
+    _DG["call"] = bool(active)
+
+
+def dg_update(pos):
+    """replay 前刷新所有 pos 相关缓冲（设备侧小 kernel/H2D，同一流上先于 replay）。"""
+    _DG["pos"] = int(pos)
+    for buf, fill in list(_DG["bufs"]):
+        fill(buf, int(pos))
+
+
+def dg_meta(key, build, fill):
+    """DG 模式：同一 key 只建一次固定缓冲；之后每步 fill(buf, pos)。
+    非 DG：退回 `_meta`（此时 key 必须带 pos）。"""
+    if not _DG["on"]:
+        return _meta(key, build)
+    b = _DG["map"].get(key)
+    if b is None:
+        b = build()
+        _DG["map"][key] = b
+        _DG["bufs"].append((b, fill))
+    return b
+
+
+def dg_const(key, value, dtype, device):
+    """decode 图里的常量张量：跨步复用，避免捕获期 host→device 拷贝。"""
+    k = ("const", key, str(dtype), str(device))
+    t = _DG_CONST.get(k)
+    if t is None:
+        t = torch.tensor(value, dtype=dtype, device=device)
+        _DG_CONST[k] = t
+    return t
+
+
+def meta_clear():
+    META.clear()
+    batch_layout.clear_cache()
+
+
+PHASE: dict = {}
+HOSTTIME: dict = {}          # DS41M_HOSTTIME=1 时的逐算子 host 墙钟累计（runner 里写）
+
+
+def mq_table():
+    if _MQ_SUB.get("n"):
+        n = _MQ_SUB["n"]
+        print(f"  ── mqsmla 内部（{n} 次）：前置 {_MQ_SUB.get('pre',0):.3f}s | "
+              f"glue {_MQ_SUB.get('glue',0):.3f}s | 主调用 {_MQ_SUB.get('call',0):.3f}s "
+              f"→ 每次 主调用 {_MQ_SUB.get('call',0)/n*1000:.2f} ms；胶水细分(ms/次)："
+              f"idx+cu {_MQ_SUB.get('A_kw',0)/n*1000:.2f} | kwargs {_MQ_SUB.get('B_kwargs',0)/n*1000:.2f} | "
+              f"cmp {_MQ_SUB.get('C_cmp',0)/n*1000:.2f}",
+              flush=True)
+        # ★ A1：薄下发通道的分级命中统计（DS41M_MQ_FAST 生效与否一眼可见）
+        _s = _mqfc.stats()
+        if _s["level"]:
+            print(f"  ── mq-fast：level={_s['level']}  L0 {_s['l0']} / L1 {_s['l1']} / L2 {_s['l2']} 次"
+                  f"，回退 {_s['fallback']}（noprep={'on' if _s['noprep'] else 'off'}）",
+                  flush=True)
+        _MQ_SUB.clear()
+
+
+def hosttime_table(pass_secs=None):
+    """打印逐算子 host 耗时表（按总时长排序）。"""
+    mq_table()
+    # T-043 ①②③ 的缓存/合并计数（未开启/未命中时不打印）
+    if _WOA_STATS["hit"] or _WOA_STATS["miss"]:
+        print(f"    [woa-plan]   hit {_WOA_STATS['hit']} / miss {_WOA_STATS['miss']}")
+    _ne = _WOA_EINSUM_STATS["call"]
+    _nt = _WOA_TQMM_N["n"]
+    if (_ne or _WOA_EINSUM_STATS["fallback"] or _WOA_EINSUM_STATS["err"]
+            or _nt):
+        # 单次 dispatch 成本（探针判据：einsum ≤30µs 才叫"换掉了"）
+        _sub = ""
+        if _ne and "wo_a.einsum" in HOSTTIME:
+            _sub += f" | wo_a.einsum {HOSTTIME['wo_a.einsum'] * 1e6 / _ne:.1f}µs/次×{_ne}"
+        if _nt and "wo_a.tqmm" in HOSTTIME:
+            _sub += f" | wo_a.tqmm {HOSTTIME['wo_a.tqmm'] * 1e6 / _nt:.1f}µs/次×{_nt}"
+        print(f"    [woa-einsum] call {_WOA_EINSUM_STATS['call']} / fallback "
+              f"{_WOA_EINSUM_STATS['fallback']}（fallback = 权重侧没打包成功）"
+              f" / err {_WOA_EINSUM_STATS['err']}{_sub}")
+    tot = sum(HOSTTIME.values())
+    # DS41M_HOSTTIME_ALL=1：打印**全部**算子（默认只打前 15）——host 瘦身要看长尾
+    _all = os.environ.get("DS41M_HOSTTIME_ALL", "").strip().lower() in (
+        "1", "on", "true", "yes")
+    print(f"  ── 逐算子 host 耗时（合计 {tot:.2f}s"
+          + (f" / wall {pass_secs:.2f}s" if pass_secs else "") + "）──")
+    _lim = len(HOSTTIME) if _all else 15
+    for k, v in sorted(HOSTTIME.items(), key=lambda kv: -kv[1])[:_lim]:
+        print(f"    {k:<14} {v:7.4f}s")
+    if pass_secs:
+        # 阶段外未归账 = wall − (造输入 + 层前 + 算子循环)：逐层尾段（抢跑 event 同步、
+        #   层切换）与 pass 首尾。**同步等待设备的时间落在这里**，不是 host CPU 成本。
+        _acc = (PHASE.get("input", 0.0) + PHASE.get("pre", 0.0) + PHASE.get("ops", 0.0))
+        print(f"  ── 阶段外未归账 {pass_secs - _acc:.4f}s（抢跑同步/层切换/pass 首尾）")
+    return tot
+
+
+# DS41M_MEMDBG=2：高频采样线程 —— 把**瞬时**大额分配归到具体算子（peak 口径只在创新高时才动，
+# 抓不到"申请又立刻释放"的大块；HBM 顶墙排查需要它）。
+_MW = {"on": False, "cur": "?", "peak": {}, "alloc": {}, "max": 0.0}
+
+
+def _mw_loop():
+    import time as _t
+    while True:
+        try:
+            import torch as _t2
+            a = _t2.npu.memory_allocated() / 2**30
+        except Exception:                              # noqa: BLE001
+            return
+        t = _MW["cur"]
+        if a > _MW["peak"].get(t, 0.0):
+            _MW["peak"][t] = a
+        if a > _MW["max"]:
+            _MW["max"] = a
+        _t.sleep(0.001)
+
+
+def _mw_report():
+    if not _MW["on"] or not _MW["peak"]:
+        return
+    top = sorted(_MW["peak"].items(), key=lambda kv: -kv[1])[:10]
+    print("  [memdbg2] 各算子时段内显存峰值 Top10（GiB，全局峰值 "
+          f"{_MW['max']:.2f}）：", flush=True)
+    for k, v in top:
+        print(f"      {v:7.2f}  {k}", flush=True)
+
+
+def run_op(key, st, ctx, w):
+    """执行一个算子；不可执行的返回 False（由 runner 记入 skipped）。"""
+    fn = OPS.get(key)
+    # ★ 2026-10-21 统一实现：分派口径 = "有没有 cu_seqlens"（b=1 也走 packed），
+    #   不再用 n_seqs>1 —— 否则 b=1 与 b>1 是两套代码，修一边漏一边。
+    # ★ 2026-10-23（CP）：CP 的本地 ctx 也带 cu（head/tail 两块 + pad），但语义不是
+    #   "一个 packed batch"——压缩/indexer 走**非 packed 的 CP 实现**（gather 全长）。
+    #   不绕开的话 varlen 版 `kv_compress` 会把本地 2*ps 行当成一段 0 起的序列，
+    #   压缩池/索引 K 全是本地的（实测 cmp 路径 aicore trap：seqused=64 而 cl=512）。
+    # ★ 2026-10-26：不再有 `@packed` 变体——每个算子一个入口，
+    #   varlen 是默认口径；CP 的 compact 段在实现内部单独处理。
+    if fn is None:
+        return False
+    # DS41M_MEMDBG=1：盯"哪个算子申请了多大显存"（HBM 顶墙排查；峰值口径抓瞬时申请）
+    _mb = _MEMDBG
+    if _mb == "2":
+        _mb = ""
+        if not _MW["on"]:
+            import threading
+            _MW["on"] = True
+            _MW["cur"] = f"层{ctx.get('idx')}/{key}"
+            threading.Thread(target=_mw_loop, daemon=True).start()
+            import atexit
+            atexit.register(_mw_report)
+        _MW["cur"] = f"层{ctx.get('idx')}/{key}"
+    _p0 = _a0 = 0
+    if _mb:
+        import torch as _t
+        _p0 = _t.npu.max_memory_allocated()
+        _a0 = _t.npu.memory_allocated()
+    _ps = PROBE_SET
+    if _ps is not None:
+        _ps(key)                        # 探针作用域 = 算子实现体（dispatch 已完成）
+    try:
+        fn(st, ctx, w)
+    except Exception:
+        # ★ 诊断（DS41M_OP_TB=1）：runner 只报最深的 exec_ops 帧，看不到真因。
+        import os as _os
+        if _os.environ.get("DS41M_OP_TB"):
+            import traceback as _tb
+            print(f"  [op-tb] 层{ctx.get('idx')}/{key} 失败，完整栈：", flush=True)
+            _tb.print_exc()
+        raise
+    finally:
+        if _ps is not None:
+            _ps(None)
+    if _mb:
+        import torch as _t
+        _d = _t.npu.max_memory_allocated() - _p0
+        if _d > (1 << 30) or abs(_t.npu.memory_allocated() - _a0) > (1 << 30):
+            print(f"    [mem] 层 {ctx.get('idx')} {key:<16} 峰值Δ={_d / 2**30:+.2f} GiB"
+                  f" 现存Δ={(_t.npu.memory_allocated() - _a0) / 2**30:+.2f} GiB"
+                  f" 共 {_t.npu.memory_allocated() / 2**30:.1f} GiB"
+                  f" / 峰值 {_t.npu.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+    _dump_tensors(st, ctx, key)
+    return True
+
+
+# ───────────── packed 实现（原 exec_ops_packed.py，2026-10-26 合并）─────────────
+_CORE = sys.modules[__name__]
+
+def _kv_compress_pk(st, ctx, w):
+    """压缩（varlen 多请求）实现：**一次 batched 调用**（官方 `compressor.py:130-160` 口径）。
+
+    官方契约（已用 tools/probe_packed_compressor.py 实测逐位确认）：
+      · `seqused` [B]、`start_pos` [B]、`cu_seqlens` [B+1]、`state_block_table` [B]（块号 1..B）；
+      · 输出行布局 = **各请求真实压缩行打包在前**（每请求 s_b//ratio），**pad 行甩尾**（B 行）；
+      · 压缩 rope 位置 = 压缩行号×ratio（每请求从 0 起），pad 行用 pad 位置（不被消费）。
+    """
+    T = int(st["x"].shape[0])
+    device = st["x"].device
+    H = int(ctx["H"])
+    D = int(ctx["head_dim"])
+    ratio = max(1, int(ctx["ratio"]))
+    cu = [int(x) for x in ctx["cu_seqlens"]]
+    nseq = int(ctx.get("n_seqs", 1) or 1)
+    d = _CORE._d41()
+    cnw = (w.get("_packed") or {}).get("attn.compressor.norm.weight.f32")
+    if cnw is None:
+        cnw = w["attn.compressor.norm.weight"].to(torch.float32).contiguous()
+    lens = [cu[b + 1] - cu[b] for b in range(nseq)]
+    # ★ packed-hit：pos_offset = 每序列 tail 的起始绝对位置（plain=0）。
+    #   压缩器按 start_pos 定相位/进位；写池/索引缓存的**绝对压缩行号** = off//ratio + 局部行。
+    off = int(ctx.get("pos_offset", 0) or 0)
+    off_c = off // max(1, ratio)
+    # ★ 2026-10-21（逐序列几何）：各批不同 L/命中率 → 每请求各自的起始绝对位置。
+    #   老路径没有 pos_offsets → 退化成"全部等于标量 off"，逐位不变。
+    _offs = [int(v) for v in (ctx.get("pos_offsets") or [])]
+    if len(_offs) != nseq:
+        _offs = [off] * nseq
+    elif nseq == 1 and int(_offs[0]) != off:
+        # ★★ 2026-10-31（主控定位 NaN 根因）：CP 逐块调用时，per-block ctx 是
+        #   `dict(base, pos_offset=gs, T=nv)` —— 标量 pos_offset 是本块的，
+        #   但 `pos_offsets` 列表是从父 ctx **继承**来的上一块的值（CP2 实测：
+        #   第二块 off=7133，off_cs 仍是 [1978]）⇒ ①压缩池按头块几何开（20 块 < 需要的 33）
+        #   ②尾块的 K/V 写进头块的槽位、尾部行永远不写（零行）⇒ 注意力读到未初始化行
+        #   ⇒ moe_topk_gate NaN 断言（hit0.5/hit0.7 崩、0.3/0.9 侥幸不崩）。
+        #   单序列时标量 pos_offset 才是唯一权威来源。
+        _offs = [off]
+    _off_cs = [int(o) // max(1, ratio) for o in _offs]
+    off_c = max(_off_cs) if _off_cs else off_c
+    if ratio > 1:
+        stc = _CORE._hold(st).get(f"_cmp_state_L{ctx['idx']}")
+        if stc is None or stc.shape[0] < 1 + nseq:
+            stc = torch.zeros(1 + nseq, ratio, 2, D, dtype=torch.float32, device=device)
+            _CORE._hold(st)[f"_cmp_state_L{ctx['idx']}"] = stc
+        # ★ 2026-10-21 hostbound：这些元数据逐层完全一样，`torch.tensor(..., device=npu)`
+        #   却每次都是一次**阻塞 H2D**（packed 下每层 4 次 → 队列深时每次 ~ms 级）。
+        #   按值缓存（_meta）→ 稳态零 H2D；值不变 ⇒ 逐位不变 ✓。
+        _dev = str(device)
+        _seqused = _CORE._meta(("pk_seqused", tuple(lens), _dev),
+                               lambda: torch.tensor(lens, dtype=torch.int32, device=device))
+        _start = _CORE._meta(("pk_startpos", tuple(_offs), _dev),
+                             lambda: torch.tensor(_offs, dtype=torch.int32, device=device))
+        _cu = _CORE._meta(("pk_cu", tuple(cu), _dev),
+                          lambda: torch.tensor(cu, dtype=torch.int32, device=device))
+        _sbt = _CORE._meta(("pk_sbt", int(nseq), _dev),
+                           lambda: torch.arange(1, 1 + nseq, dtype=torch.int32, device=device))
+        if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+                and int(ctx.get("idx", -1)) == 2 and int(os.environ.get("RANK", "0")) == 0):
+            try:
+                _x = st["x"]
+                import hashlib as _hl4
+
+                def _h4(t):
+                    if not isinstance(t, torch.Tensor):
+                        return "none"
+                    return _hl4.sha1(t.detach().float().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]
+
+                print(f"  [cmp-args pk] x{tuple(_x.shape)} {_x.dtype} stride={_x.stride()} "
+                      f"fmt={torch_npu.get_npu_format(_x)} stc{tuple(stc.shape)} "
+                      f"stc_sum={float(stc.float().sum()):.3e} off={int(off)} T={int(T)} "
+                      f"ratio={int(ratio)} seqused={_seqused.tolist()} start={_start.tolist()} "
+                      f"cu={_cu.tolist()} sbt={_sbt.tolist()} "
+                      f"wkv={_h4(w['attn.compressor.wkv.weight'])} "
+                      f"wgate={_h4(w['attn.compressor.wgate.weight'])} "
+                      f"cnw={_h4(cnw)} cnw_dtype={cnw.dtype} cnw_dev={cnw.device} "
+                      f"fmt_wkv={torch_npu.get_npu_format(w['attn.compressor.wkv.weight'])} "
+                      f"fmt_wgate={torch_npu.get_npu_format(w['attn.compressor.wgate.weight'])}", flush=True)
+            except Exception as _e:                    # noqa: BLE001
+                print(f"  [cmp-args pk] err {_e}", flush=True)
+        kv = d.compressor(
+            x=st["x"].view(-1, H),
+            wkv=w["attn.compressor.wkv.weight"],
+            wgate=w["attn.compressor.wgate.weight"],
+            seqused=_seqused,
+            start_pos=_start,
+            cmp_ratio=ratio,
+            cu_seqlens=_cu,
+            state_cache=stc.flatten(-2),
+            state_block_table=_sbt)
+    else:
+        kv = torch.nn.functional.linear(st["x"].view(-1, H),
+                                        w["attn.compressor.wkv.weight"])
+    if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+            and int(ctx.get("idx", -1)) == 2 and int(os.environ.get("RANK", "0")) == 0):
+        import hashlib as _hl8
+        print(f"  [cmp-out pk] kv{tuple(kv.shape)} "
+              f"{_hl8.sha1(kv.detach().float().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]}",
+              flush=True)
+    n = int(kv.shape[0])
+    l_real = [s // ratio for s in lens]
+    n_real = int(sum(l_real))
+    n_pad = nseq if ratio > 1 else 0
+    if n != n_real + n_pad and os.environ.get("DS41M_CMP_ARGDBG"):
+        print(f"  [cmp-geom] n={n} n_real={n_real} n_pad={n_pad} nseq={nseq} "
+              f"cu={ctx.get('cu_seqlens')} row_lens={ctx.get('row_lens')} "
+              f"seq_lens={ctx.get('seq_lens')} off={ctx.get('pos_offset')} "
+              f"L={ctx.get('L_full')} cpfull={ctx.get('_cp_full')} idx={ctx.get('idx')}", flush=True)
+    if n != n_real + n_pad:
+        raise RuntimeError(f"packed compressor 输出 {n} 行，期望 {n_real}+{n_pad}"
+                           f"（各请求 s//ratio 打包 + pad 甩尾；见官方生成式）")
+    kv = torch_npu.npu_rms_norm(kv, cnw, _CORE.EPS)[0]
+    if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+            and int(ctx.get("idx", -1)) == 2 and int(os.environ.get("RANK", "0")) == 0):
+        import hashlib as _hl9
+        _h = lambda t: _hl9.sha1(t.detach().float().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]
+        print(f"  [cmp-norm] cnw={_h(cnw)} post={_h(kv)} l_real={l_real} off_cs={_off_cs} "
+              f"rowlens={list(lens)}", flush=True)
+    st["cmp_latent"] = kv.clone()
+    if ratio > 1:
+        # 压缩 rope 位置 = **绝对压缩行号** × ratio（plain: off=0 与旧值逐位相同）
+        # ★ 2026-10-31（CP4 空泡）：pos 是 (n, l_real, off_cs, ratio) 的纯函数，而 CP 分段
+        #   下每次调用都重发 Range/Add/OnesLike/ConcatD/Mul ×2 段/层。`_meta` 按值缓存后
+        #   同一 `_rope_at_pos` 的 pos 对象也稳定 ⇒ rope gather 的按身份缓存同时命中。
+        pos = _meta(("pk_cmp_pos", int(n), tuple(l_real), tuple(_off_cs), int(ratio),
+                     str(device)),
+                    lambda: torch.cat(
+                        [torch.arange(l, dtype=torch.long, device=device) + _off_cs[i]
+                         for i, l in enumerate(l_real)]
+                        + [torch.ones(n - n_real, dtype=torch.long, device=device)]) * ratio)
+        # 表行数 = max(pos)+1，按几何直接算（不再 pos.max().item() 同步）
+        _n = max(max(l_real[i] - 1 + _off_cs[i] for i in range(nseq)), 1) * ratio + 1
+    else:
+        pos, _ = batch_layout.local_positions(ctx, n, device)   # 已含逐序列偏移
+        _n = max(1, max(int(lens[i]) + int(_offs[i]) for i in range(nseq)))
+    cos, sin = _CORE._rope_at_pos(pos, ctx, device, n=_n)
+    _rope_dump(4, kv.view(-1, 1, 1, D), cos, sin,
+               [D - ctx["rope_dim"], D], "interleave", ctx)
+    torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
+        kv.view(-1, 1, 1, D), cos, sin, rotary_mode="interleave",
+        partial_slice=[D - ctx["rope_dim"], D])
+    st["cmp_kv"] = kv
+    BS = int(_CORE.BS)
+    # ★★ 2026-10-31（主控，命中+CP 的第二处池 sizing）：池必须覆盖**整条序列的绝对压缩行**，
+    #   不能只覆盖本 rank 自己的块。原因：层 20 边界截断后，compact 窗口会**跨 rank 重分布**
+    #   （`_boundary_cut_state_cp` / `_cp_replay_trim`），rank1 可能拿到序列尾部（位置到 8191），
+    #   而它的压缩池若按自己块的末端（7132）开，注意力按 ci 读到 8058 ⇒ 越界 19,882 次 ⇒
+    #   aicore trap（507015）。实测 L20/ratio=1：rank1 池 7296 行、ci 到 8058。
+    _end_local = max(_off_cs[i] + l_real[i] for i in range(nseq))
+    _end_global = int(ctx.get("L_full", 0) or 0) // max(1, ratio) + 1
+    Pc = max(1, -(-(max(_end_local, _end_global) + 2) // BS))
+    nblk = nseq * Pc
+    if os.environ.get("DS41M_CMP_NANDBG"):
+        print(f"  [cmp-pool-pk] L{int(ctx.get('idx', -1))} ratio={ratio} nseq={nseq} "
+              f"off_cs={list(_off_cs)} l_real={list(l_real)} off={ctx.get('pos_offset')} "
+              f"T={int(T)} L_full={ctx.get('L_full')} Pc={Pc} nblk={nblk} "
+              f"pool_rows={(1 + nblk) * BS}", flush=True)
+    pool = _CORE._cache_buf(st, f"_cmp_pool_r{ratio}" + _CORE._sfx(ctx, "cmp"),
+                            (1 + nblk) * BS, _CORE.CMP_ROW_W, device, torch.uint8)
+    # ★ 2026-10-21 packed hostbound：`torch.tensor(list, device=npu)` 是**阻塞 H2D**
+    #   （要等设备队列排空；80k b2/b3/b4 trace 里 4 个 kv_source 层 × 每 pass 各一次，
+    #   实测 20–117ms，把 host 顶住）。每层的 l_real 完全一样 → 按值缓存。
+    _lreal_t = _CORE._meta(("pk_lreal", tuple(l_real), str(device)),
+                           lambda: torch.tensor(l_real, device=device))
+    # ★ output_size 必须给：repeats 是**设备**张量时，算子要把它读回主机才能算输出长度
+    #   → 每次调用一次流同步（80k b2/b3/b4：32 次/点，host 30–115ms/次，设备只有 0.3ms）。
+    #   长度已知（n_real=sum(l_real)），显式给 output_size 即可免同步。
+    # ★★ 2026-10-26（T-063）：这一整段（repeat_interleave + cat + full + 算术 + where + to(int32)）
+    #   每层要发 6–8 个小 kernel，40 层 = 200+ 次下发，而**值只跟 (n, l_real, off_cs, Pc, BS,
+    #   replay 裁段, ratio, device) 有关**——同一个点位每个 forward 完全相同。
+    #   缓存最终的 int32 slot（[n] int64→int32，64k 时 2106 元素 = 8 KB），命中时零 kernel。
+    #   逐位不变：同样的输入算出同样的 slot；缓存项只在键完全相同的情况下复用。
+    #   kill switch：`DS41M_CMP_SLOT_CACHE=0`。
+    _slot_key = None
+    _slot_hit = None
+    if _ENV_CMP_SLOT_CACHE:
+        _slot_key = ("cmp_slot", int(n), tuple(l_real), tuple(_off_cs), int(Pc), int(BS),
+                     int(ctx.get("hit_replay_tail") or 0), int(ratio), str(device))
+        _slot_hit = _CMP_SLOT_CACHE.get(_slot_key)
+    if _slot_hit is not None:
+        _slot_i32 = _slot_hit
+    else:
+        sid_c = torch.repeat_interleave(torch.arange(nseq, device=device), _lreal_t,
+                                        output_size=n_real)
+        loc = torch.cat([torch.arange(x, device=device) + _off_cs[i]
+                         for i, x in enumerate(l_real)])  # 绝对压缩行号（逐序列）
+        slot = torch.full((n,), -1, dtype=torch.int64, device=device)
+        slot[:n_real] = (sid_c * Pc + 1 + loc // BS) * BS + loc % BS
+        _slot_i32 = None
+    # ★★ 2026-10-21（hit b=1 层 20 分歧根因）：**replay 段的压缩行一律不写**。
+    #   官方 `adaptlib/hit.py`："the replay rows' compressed-KV / indexer writes are
+    #   suppressed (slot -1); [0, H) is reused from stage A"；顺序实现
+    #   （exec_ops.py `_kv_compress`）有这段，packed **漏了** →
+    #   packed 多写 128 行压缩 KV（绝对压缩行 3840..3967）→ mqsmla 读到的压缩行与顺序版
+    #   不同 → 层 20 `attn_out` 整段错（rel 1.25），层 21 起级联。
+    #   实测（L20 压缩池非零行）：seq 4096..4223（128 行）/ packed 3968..4223（256 行）；
+    #   补上后两边逐位一致。
+    _rep = int(ctx.get("hit_replay_tail") or 0)
+    if _slot_i32 is not None:
+        _rep = -1                       # 命中缓存：跳过裁段与 to(int32)
+    elif max(_offs) > 0 and _rep > 0:
+        _cuts = [_CORE._meta(("pk_cut", tuple(_offs), int(_rep), int(ratio), str(device)),
+                             lambda: torch.tensor(
+                                 [(int(o) + _rep) // max(1, ratio) for o in _offs],
+                                 dtype=torch.long, device=device))]
+        _cut_row = _cuts[0][sid_c]                # 逐行：该请求的重放段压缩行上界
+        slot[:n_real] = torch.where(loc < _cut_row, torch.full_like(loc, -1), slot[:n_real])
+    if _slot_i32 is None:
+        _slot_i32 = slot.to(torch.int32)
+        if _ENV_CMP_SLOT_CACHE and _slot_key is not None:
+            # ★★ 2026-10-31（CP4 空泡）：原来这里 `clear()` 只留**一条** —— 而 CP 分段
+            #   每层有 2 个不同的段（off_cs/l_real 各不同）⇒ 两块交替把缓存冲掉，
+            #   每次调用都重建整条 repeat_interleave/Range/FloorDiv/FloorMod/where 链
+            #   （trace：每段 ~30 个 AIV 小算子，CP4 每 forward 8 段 ≈ 240 个任务）。
+            #   改成**多键**（容量 64，超了整体清空；条目是 [n] int32，小）。
+            if len(_CMP_SLOT_CACHE) >= 64:
+                _CMP_SLOT_CACHE.clear()
+            _CMP_SLOT_CACHE[_slot_key] = _slot_i32
+    torch.ops.custom.kv_compress_epilog_v2(
+        pool.view(-1, pool.shape[-1]), kv.reshape(-1, D), _slot_i32,
+        quant_group_size=16, quant_mode="mxfp4_bf16", round_scale=True, x_scale=1.0)
+    hold = _CORE._hold(st)
+    hold[f"_cmp_nblk_r{ratio}" + _CORE._sfx(ctx, "cmp")] = nblk
+    hold[f"_cmp_pc_r{ratio}" + _CORE._sfx(ctx, "cmp")] = Pc
+    # ★ 2026-10-21 packed hostbound：`torch.tensor(l_real, dtype=int32, device=npu)` 是
+    #   阻塞 H2D（每 pass 每源层一次）。它**有消费者**：mqsmla 的 `seqused_cmp_kv` [B]
+    #   （exec_ops.py:1314 只认张量，换成 list 会让 B 维度对不上 → 114 个算子报错）。
+    #   → 按值缓存设备张量（值不变，逐位不变；稳态零 H2D）。
+    # ★★ 2026-10-21（hit b=1 层 20 分歧根因）：这里必须是**绝对可见压缩长度**
+    #   `off_c + 本段行数`（= 官方 `compressed_seq_lens = actual_seq_k // ratio`，
+    #   与顺序实现 exec_ops.py:1075 的 `(off+T)//ratio` 同口径），**不是**本段行数本身。
+    #   写成行数时 packed 的 `seqused_cmp_kv` 是 256/128，顺序版是 4096/2048（T=256, off=3840）
+    #   → mqsmla 层 20 输出相对差 1.25（层 2..19 因索引/cl 主导未显形）。
+    #   plain prefill（off=0）两者相同 ⇒ 逐位不变。
+    _l_vis = [int(_off_cs[i]) + int(l_real[i]) for i in range(nseq)]
+    if (os.environ.get("DS41M_CMP_ARGDBG", "").strip().lower() in ("1", "on", "true", "yes")
+            and int(ctx.get("idx", -1)) == 2 and os.environ.get("RANK", "0") == "0"):
+        print(f"  [cmp-len-write-pk] key='_cmp_len_r{ratio}{_CORE._sfx(ctx,'cmp')}' "
+              f"val={_l_vis} shared_id={id(_CORE._hold(st))}", flush=True)
+    hold[f"_cmp_len_r{ratio}" + _CORE._sfx(ctx, "cmp")] = _CORE._meta(
+        ("pk_cmplen", tuple(_l_vis), int(ratio), str(device)),
+        lambda: torch.tensor(_l_vis, dtype=torch.int32, device=device))
+    if os.environ.get("DS41M_DEBUG"):
+        print(f"      [kv_compress packed] ratio={ratio} n={n} real={n_real} "
+              f"lens={l_real} Pc={Pc}", flush=True)
+
+
+# ───────────── 统一入口（2026-10-26）：varlen 是默认口径，CP 内部单独走 ─────────────
+def kv_compress(st, ctx, w):
+    """压缩算子唯一入口：有 cu_seqlens 走 varlen 实现；CP 的 compact 段走单序列实现。"""
+    if batch_layout.is_packed(ctx) and _cp_of(ctx) is None:
+        return _kv_compress_pk(st, ctx, w)
+    return _kv_compress(st, ctx, w)
+
+
+OPS["kv_compress"] = kv_compress
+
+
+# ── 点位边界（core/memlife.py）：**几何相关**的进程级缓存，必须随点位释放 ──────
+# 只有随 T/L/cut/池地址变化的才登记；权重/布局类（`_WOA_PLAN`/`_DG_CONST`/…）**不许**登记
+# —— 跨点位复用正是「一次预热跑多点位」的收益（见 memlife 模块 docstring）。
+POINT_CACHES = (
+    _CP_PAD_CACHE,       # CP qmm 的 M 分块补零缓冲（按 (rows,pad) 增长）
+    _HC_PAD_CACHE,       # hc_pre 的 [padM,M,H] 常驻缓冲（256k 单块 2.6 GB 级）
+    _CMP_SLOT_CACHE,     # 压缩池 slot（按 T/ratio）
+    _HC_X_CACHE,         # [T,M,H] 展开缓冲（256k 4.3 GB）
+    _QD_CACHE,           # 层内 quant 去重（钉住上一层 xq/xs）
+    _ROPE_TBL_CACHE,     # packed cos/sin 表（按 T/off）
+    _NEG_SIN_CACHE,      # -sin 派生态
+    _ROPE_CP_CACHE,      # CP 段 gather 后的 cos/sin
+    _QBUF_CACHE,         # q 常驻缓冲（按形状）
+    _CS,                 # 逐 L 的 rope 表
+    _CS_STEP,            # decode 图 rope 表（按 L_full）
+    _DUMP_N,             # dump 计数
+)
+
+
+def POINT_RELEASE():                                     # noqa: N802 —— memlife 约定名
+    """元数据张量（win 索引 / slot / cu_seqlens / 位置表）= 几何 ⇒ 一并清。"""
+    meta_clear()

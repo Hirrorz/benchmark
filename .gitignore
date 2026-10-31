@@ -1,0 +1,26 @@
+res/
+results/
+logs/
+__pycache__/
+*.pyc
+*.bak_*
+*.tar
+*.tar.gz
+
+# 运行时产物（trace / 临时文件 / 日志）
+prof/
+out/
+.tmp/
+.tmp*/
+*.log
+
+# NPU 崩溃转储（跑崩时会在仓里落文件）
+extra-info/
+
+# 打包产物（tools/build_pack.sh）与环境引导产物
+dist/
+runtime/
+env_local.sh
+
+# 本地调试树/临时目录（不是源码）
+tmp/

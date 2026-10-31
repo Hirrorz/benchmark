@@ -1,0 +1,153 @@
+# 上下文键命名空间（配置即事实源；人工可编辑）
+# legacy: 原始键 -> 规范键；overloads: 同名多义说明；tiers: 命名空间默认 tier。
+# 修改后跑 tools/test_module_config.py 与 check_module_spec.py。
+schema: ds41_mini/key-names@1
+note: 上下文键的规范命名空间：legacy 别名 / 多义键 / 命名空间默认 tier。改键名只改本文件。
+legacy:
+  H: model.hidden
+  I: model.moe_intermediate
+  T: geometry.rows
+  chunk: geometry.chunk
+  L_full: geometry.full_len
+  ratio: layer.ratio
+  rtopk: model.moe_topk
+  e_local: moe.e_local
+  S: model.sliding_window
+  idx: layer.index
+  head_dim: model.head_dim
+  index_topk: model.index_topk
+  rope_dim: model.rope_dim
+  is_kv_src: layer.roles.kv_source
+  is_idx_src: layer.roles.index_source
+  is_candidate: layer.roles.candidate_source
+  engram: layer.roles.engram
+  pos_offset: position.offset
+  pos_offsets: position.offsets
+  hit_replay_tail: position.hit_replay_tail
+  win_abs: position.win_abs
+  win_keep: model.win_keep
+  input_ids: input.ids
+  cu_seqlens: batch.cu
+  seq_lens: batch.seq_lens
+  row_lens: batch.row_lens
+  n_seqs: batch.n_seqs
+  is_decode_step: position.is_decode
+  cp_positions: cp.positions
+  cp_abs_positions: cp.abs_positions
+  cp_total_q: cp.total_q
+  _cp_full: cp.full
+  _cp_chunk: cp.chunk
+  state_block: compressor.state_block
+  _cmp_T: compressor.t_override
+  _cmp_pre: compressor.pre
+  cmp_len: cache.cmp.len
+  hc_mult: model.hc_mult
+  hc_sinkhorn_iters: model.hc_sinkhorn_iters
+  hc_eps: model.hc_eps
+  hc_pad_ref: hc.pad_ref
+  hc_pad_cap: hc.pad_cap
+  routed_scaling_factor: model.routed_scaling_factor
+  topk: model.moe_topk
+  swiglu_limit: model.swiglu_limit
+  eps: model.rms_norm_eps
+  rope_theta: model.rope_theta
+  compress_rope_theta: model.compress_rope_theta
+  rope_scaling: model.rope_scaling
+  device: process.device
+  _src: process.src
+  _backends: process.backends
+  x: hidden.x
+  residual: hidden.residual
+  qr: attn.qr
+  q: attn.q
+  kv: attn.kv
+  attn_out: attn.out
+  o_lora: attn.o_lora
+  _rope_done: attn.rope_done
+  cmp_latent: cmp.latent
+  cmp_kv: cmp.kv
+  cmp_sparse_indices: idx.sparse
+  cmp_topk_length: idx.topk_length
+  idx_sparse: idx.sparse
+  idx_q: idx.q
+  idx_descale_q: idx.descale_q
+  idx_w: idx.w
+  suffix_win: cache.suffix.win
+  suffix_cmp: cache.suffix.cmp
+  suffix_idx: cache.suffix.idx
+  idx_k_ready: indexer.k_ready
+  moe_nspan: moe.nspan
+  candidate_block_size: model.candidate_block_size
+  candidate_topk_blocks: model.candidate_topk_blocks
+  engram_rows: model.engram_rows
+  engram_tp_size: model.engram_tp_size
+  engram_tp_rank: process.engram_tp_rank
+  logits: moe.logits
+  topk_idx: moe.topk_idx
+  topk_weight: moe.topk_weight
+  moe_out: moe.out
+  engram_kv: engram.kv
+  engram_proj_out: engram.proj_out
+  engram_out: engram.out
+  hc_pre_t: hc.pre_t
+  hc_post_t: hc.post_t
+  _norm_stage: hc.stage
+  _ffn_pre: hc.ffn_pre
+  _engram_fut: engram.future
+  _w: process.weights
+  _shared: cache.root
+  _allow_placeholder: process.allow_placeholder
+  _placeholder_used: process.placeholder_used
+overloads:
+  position.offset:
+  - hit/replay segment start
+  - decode absolute position
+  - compact segment start
+  geometry.rows:
+  - layer['T'] hint (stale after replay)
+  - effective st['x'] rows
+  indexer.k_ready:
+  - boundary compact no-rewrite flag
+  - CP inferred from cache presence
+  cache.cmp.len:
+  - int (single sequence)
+  - Tensor[B] (packed)
+  batch.n_seqs:
+  - explicit n_seqs
+  - derived from batch.cu
+  batch.seq_lens:
+  - logical length
+  - physical rows without hit
+  - CP local lens
+  cache.suffix.win:
+  - per-layer window pool suffix
+  cache.suffix.cmp:
+  - compressor source-owner suffix
+  cache.suffix.idx:
+  - indexer source-owner suffix
+  position.offsets:
+  - per-request hit start (packed hit)
+  - decode positions
+  hc.pad_ref:
+  - M padding reference for hc_pre (CP/boundary)
+  compressor.state_block:
+  - state ring block size
+  - candidate block size
+tiers:
+  model: const
+  process: const
+  geometry: pass
+  position: pass
+  batch: pass
+  cp: pass
+  input: pass
+  layer: layer
+  hidden: module
+  attn: module
+  cmp: module
+  idx: module
+  moe: module
+  engram: module
+  hc: module
+  cache: cache
+  external: external

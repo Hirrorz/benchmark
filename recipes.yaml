@@ -1,0 +1,129 @@
+# 每种层的**算子配方**（§7 纪律 2：层的算子顺序只写在这里）。
+#
+# 两条纪律：
+#   ① 哪些层有这个算子 → 写在这里（存在性）；
+#   ② 每层跑几次           → 写在 ops.py 的 count（数量，如 kv_src 层多 1 次 rope）。
+#   `_xxx` = 引用另一个段落（attn_core / attention / moe / engram / extras 等）。
+#
+# 校准来源：bench 的 L64k hit0.97 trace（megamoe=deepgemm 的融合路径，单 pass T=2048，
+#   Step 0 共 1800 个算子）。推导与验证方法见 CALIBRATION.md；各算子注释里带 trace 证据。
+#   注意：层内**顺序**是近似的 —— trace 里多 stream 并行，按 Start Time 排出来的顺序
+#   只能保证形状/次数，不保证严格串行次序。
+
+# ── 所有层共有的骨架 ──
+common:                # 顺序 = 官方 modeling_deepseek.py:1592-1629 的数据流
+  - hc_pre             # ① hc_pre(attn)：出 post/comb/pre
+  - rmsnorm            # ② attn_norm
+  - _attention         # （含 wo_a→o_lora）
+  - wo_b               # 注意力输出投回 hidden（[T, o_groups×o_lora] → [T,H]）
+  - hc_post            # ③ hc_post(attn)
+  - hc_pre             # ④ hc_pre(ffn)：pre_mix = 上一步的 pre
+  - rmsnorm            # ⑤ ffn_norm
+  - _moe
+  - hc_post            # ⑥ hc_post(ffn)
+  # 元素级小算子（trace 里每层各有 1~3 个，位置近似；数量由 ops.py 的 count 定）
+  - mul
+  - add
+  - cast
+  - tmove
+
+# ── 注意力骨架：40 层都有（含 win 层！trace 里这三个矩阵乘/压缩/rope 都是 40/pass）──
+attn_core:             # ① 注意力前半段：算 q/kv 并把缓存写好（顺序 = 数据流）
+  # ★ 2026-10-28（CP 通信掩盖，DeepInfer attn.py:783 同款）：**kv 先算** →
+  #   kv rope 完成时侧流发起 all-gather → 再算 q 投影（通信与计算并行）→ kv_epilog 等事件。
+  #   旧序是 q 先算、kv 后算、gather 在 kv_epilog 里同步等（256k CP2 h0.97 主流水线
+  #   等满 84% 的 AG 时间）。算子集合不变，只是次序 ⇒ 数值逐位不变。
+  - wkv                # QMM：T×5120 → [512,5120]（压缩 KV 投影）
+  - kv_norm            # 压缩 KV 上的 RmsNorm[512]
+  - rope               # 第一次 rope：本层只有 kv → 只 rope kv（done-set；末尾发起 CP gather）
+  - wq_a               # QMM：T×5120 → [1280,5120]（MLA q 低秩）
+  - q_norm             # q_lora 上的 RmsNorm[1280]
+  - wq_b               # QMM：T×1280 → [32768,1280]
+  - rope               # 第二次 rope：q（kv 已 rope → done-set 跳过）
+  - kv_epilog          # KvCompressEpilogV2 ×2（写 win 池 A/B；CP 下只 wait 侧流 gather）
+  - dyn_mx_quant       # ★隐式算子：由 _qmm / wo_a 内部产生，执行侧不会单独发（见 exec_ops.IMPLICIT）
+
+attn_tail:             # ② 注意力后半段：读缓存做注意力 + 输出投影
+  - mqsmla             # ds41 稀疏量化 MLA（ori 走 win 池；ratio>0 层带空 cmp 索引）
+  - wo_a               # TransposeQuantBatchMatmul（o_groups=8）
+# 注：配方里的 dyn_mx_quant 标着"隐式"——它由量化算子在内部产生（_qmm / wo_a 里的
+#     npu_dynamic_mx_quant），执行侧不会单独调用；dry-run/对拍照记 6/层，见 exec_ops.IMPLICIT。
+
+# ── 按层类型叠加（层类型由 assemble.attention_kind() 从 config 推出）──
+attention:
+  win:                 # ratio=0（0,1）：纯滑窗
+    - _attn_core
+    - _attn_tail
+  c2a_source:          # 2,8,14：写压缩 KV + index cache（kv_src）
+    - _attn_core
+    - kv_compress      # 真压缩写入（长块），在 mqsmla 之前 ✓
+    - idx_prolog
+    - qli
+    - _attn_tail
+  c2a_consumer:        # 3-7,9-13,15-19：读共享 cache
+    - _attn_core
+    - _attn_tail
+  c1a_source:          # 20：1:1 压缩 + 候选块来源（kv_src + idx_src）
+    - _attn_core
+    - kv_compress
+    - idx_prolog
+    - qli
+    - _attn_tail
+  c1a_source_split:    # 20（DeepInfer 边界层）：**全长 KV 路径 → 截到 keep 行 → 余下计算**
+    - wkv              # KV 投影（全长）
+    - kv_norm
+    - rope             # 本层第一次 rope：st 里只有 kv → 只 rope kv
+    - kv_epilog        # 写 win 池（全长）
+    - kv_compress      # 压缩 KV / state（全长）
+    - idx_k_write      # ★ 索引 K 缓存（含候选源层组合缓存）也在 KV 路径上、全长写
+    - boundary_cut     # ★ 截断 hidden/residual/hc/q/idx_*/kv → keep 行
+    - wq_a             # —— 以下 compact（官方 decoder_layer.py:134-141 的 compact 段）——
+    - q_norm
+    - wq_b
+    - rope             # 第二次 rope：q（kv 已 rope，done-set 跳过）
+    - idx_prolog       # indexer query 侧（compact）
+    - qli              # QLI（compact；K 池已在 cut 前写好，不再重写）
+    - _attn_tail
+  c1a_indexsource:     # 24,28,32,36：只算 QSLI（吃 20 的候选块）
+    - _attn_core
+    - idx_prolog
+    - qsli
+    - _attn_tail
+  c1a_consumer:        # 其余 21-23,25-27,…：复用 shared_idx
+    - _attn_core
+    - _attn_tail
+
+# ── MoE：按后端二选一 ──
+moe:
+  unfused:             # megamoe: none → 未融合链（官方 nomega 形态）
+    - gating
+    - gating_sort
+    - reroute
+    - dispatch
+    - gmm
+    - swiglu_quant
+    - combine
+    - finalize
+  fused:               # megamoe: ascendc|deepgemm → 一条融合算子（gating 仍在外面）
+    - gate          # FusedMatMul（T×5120 @ 384×5120）
+    - topk_gate
+    - mega_moe
+
+# ── engram 层（1,14）额外插在层首（fetch 可与主干重叠）──
+engram:
+  - engram_fetch
+  - engram_wait
+  - engram_proj        # QMM：T×6144 → 96×25600（2/pass）
+
+# dyn_mx_quant 不在配方里：它由量化算子在内部产生（_qmm / wo_a 各调一次
+# DynamicMxQuant），避免重复量化。dry-run 的计数仍按每层 6 次记（见 ops.py）。
+
+# ── 会话级残差（trace 里 40 层循环之外的固定开销）──
+# 对不上层次的零散算子：形状小、次数是常数。留在这里而不是硬塞进层里，
+# 以便对齐时只差"层模型"，而不是被这些噪声掩盖。换 T/换配置后需要重新校准。
+extras:
+  - [rmsnorm, 5]
+  - [cast, 48]
+  - [tmove, 5]
+  - [mul, 15]
+  - [add, 29]

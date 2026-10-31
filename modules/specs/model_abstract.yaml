@@ -1,0 +1,1698 @@
+# DS4.1 mini 当前模型抽象（自动导出，勿手改）
+# 生成：python3.11 tools/export_model_yaml.py --config <cfg> --out <file>
+# 结构：model 常量 / layers 40 层 / templates 模板（steps + 模块树）/
+#       modules 用到的模块接口与参数（完整定义见 model_modules.yaml）。
+schema: ds41_mini/model-abstract@1
+config: configs/mini_ds41_flash.yaml
+model:
+  name: deepseek_v4_1_flash_mini
+  n_layers: 40
+  L: 8192
+  dims:
+    hidden: 5120
+    moe_intermediate: 2304
+    head_dim: 512
+    n_attention_heads: 64
+    q_lora_rank: 1280
+    o_lora_rank: 1024
+    o_groups: 8
+    index_n_heads: 32
+    index_head_dim: 128
+    index_topk: 512
+    hc_mult: 4
+    sliding_window: 128
+    n_routed_experts: 384
+    topk: 6
+    qk_rope_head_dim: 64
+  derived:
+    q_lora: 1280
+    o_lora: 1024
+    o_groups: 8
+    o_head_dim_per_group: 4096
+    index_packed_d: 64
+    index_q_dim: 4096
+    attn_q_dim: 32768
+    i_local: 2304
+    win_pool_slots: 384
+    kv_row_width: 544
+    cmp_row_width: 320
+  roles:
+    kv_source_layers:
+    - 2
+    - 8
+    - 14
+    - 20
+    index_source_layers:
+    - 2
+    - 8
+    - 14
+    - 20
+    - 24
+    - 28
+    - 32
+    - 36
+    engram_layers:
+    - 1
+    - 14
+    candidate_source_layer: 20
+  parallel:
+    world_size: 8
+    moe_ep_size: 8
+    cp_size: 1
+  features:
+    decoder_replay: false
+  backends:
+    megamoe: deepgemm
+    indexer_prolog_qw: ascendc
+    gate_topk: tilelang
+    engram: tilelang
+    swiglu: fused
+  run:
+    seq_len: 8192
+    moe_chunk_max_len: 8192
+  meta:
+    T_main: 8192
+    T_pass: 8192
+    cut: null
+    w: null
+layers:
+- idx: 0
+  kind: win
+  ratio: 0
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 1
+  kind: win
+  ratio: 0
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: true
+  engram: true
+  template: tpl:win+engram
+  split: false
+- idx: 2
+  kind: c2a_source
+  ratio: 2
+  roles:
+    kv_source: true
+    index_source: true
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:c2a_source
+  split: false
+- idx: 3
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 4
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 5
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 6
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 7
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 8
+  kind: c2a_source
+  ratio: 2
+  roles:
+    kv_source: true
+    index_source: true
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:c2a_source
+  split: false
+- idx: 9
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 10
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 11
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 12
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 13
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 14
+  kind: c2a_source
+  ratio: 2
+  roles:
+    kv_source: true
+    index_source: true
+    candidate_source: false
+    engram: true
+  engram: true
+  template: tpl:c2a_source+engram
+  split: false
+- idx: 15
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 16
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 17
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 18
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 19
+  kind: c2a_consumer
+  ratio: 2
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 20
+  kind: c1a_source
+  ratio: 1
+  roles:
+    kv_source: true
+    index_source: true
+    candidate_source: true
+    engram: false
+  engram: false
+  template: tpl:c2a_source
+  split: true
+- idx: 21
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 22
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 23
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 24
+  kind: c1a_indexsource
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: true
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:c1a_indexsource
+  split: false
+- idx: 25
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 26
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 27
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 28
+  kind: c1a_indexsource
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: true
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:c1a_indexsource
+  split: false
+- idx: 29
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 30
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 31
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 32
+  kind: c1a_indexsource
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: true
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:c1a_indexsource
+  split: false
+- idx: 33
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 34
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 35
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 36
+  kind: c1a_indexsource
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: true
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:c1a_indexsource
+  split: false
+- idx: 37
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 38
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+- idx: 39
+  kind: c1a_consumer
+  ratio: 1
+  roles:
+    kv_source: false
+    index_source: false
+    candidate_source: false
+    engram: false
+  engram: false
+  template: tpl:win
+  split: false
+templates:
+  tpl:win:
+    kind: win
+    view: default
+    steps:
+    - hc_pre
+    - rmsnorm
+    - wq_a
+    - q_norm
+    - wq_b
+    - wkv
+    - kv_norm
+    - rope
+    - kv_epilog
+    - dyn_mx_quant
+    - mqsmla
+    - wo_a
+    - wo_b
+    - hc_post
+    - hc_pre
+    - rmsnorm
+    - gate
+    - topk_gate
+    - mega_moe
+    - hc_post
+    tree:
+    - attn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - q_proj:
+        - wq_a
+        - q_norm
+        - wq_b
+      - kv_proj:
+        - wkv
+        - kv_norm
+      - rope
+      - kv_epilog
+      - dyn_mx_quant
+      - core:
+        - mqsmla
+      - o_proj:
+        - wo_a
+        - wo_b
+      - hc#2:
+        - hc_post
+    - ffn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - moe:
+        - routing:
+          - gate
+          - topk_gate
+        - experts:
+          - mega_moe
+      - hc#2:
+        - hc_post
+  tpl:win+engram:
+    kind: win
+    view: default
+    steps:
+    - engram_fetch
+    - engram_wait
+    - engram_proj
+    - hc_pre
+    - rmsnorm
+    - wq_a
+    - q_norm
+    - wq_b
+    - wkv
+    - kv_norm
+    - rope
+    - kv_epilog
+    - dyn_mx_quant
+    - mqsmla
+    - wo_a
+    - wo_b
+    - hc_post
+    - hc_pre
+    - rmsnorm
+    - gate
+    - topk_gate
+    - mega_moe
+    - hc_post
+    tree:
+    - engram:
+      - engram_fetch
+      - engram_wait
+      - engram_proj
+    - attn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - q_proj:
+        - wq_a
+        - q_norm
+        - wq_b
+      - kv_proj:
+        - wkv
+        - kv_norm
+      - rope
+      - kv_epilog
+      - dyn_mx_quant
+      - core:
+        - mqsmla
+      - o_proj:
+        - wo_a
+        - wo_b
+      - hc#2:
+        - hc_post
+    - ffn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - moe:
+        - routing:
+          - gate
+          - topk_gate
+        - experts:
+          - mega_moe
+      - hc#2:
+        - hc_post
+  tpl:c2a_source:
+    kind: c2a_source
+    view: default
+    steps:
+    - hc_pre
+    - rmsnorm
+    - wq_a
+    - q_norm
+    - wq_b
+    - wkv
+    - kv_norm
+    - rope
+    - kv_epilog
+    - dyn_mx_quant
+    - kv_compress
+    - idx_prolog
+    - qli
+    - mqsmla
+    - wo_a
+    - wo_b
+    - hc_post
+    - hc_pre
+    - rmsnorm
+    - gate
+    - topk_gate
+    - mega_moe
+    - hc_post
+    tree:
+    - attn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - q_proj:
+        - wq_a
+        - q_norm
+        - wq_b
+      - kv_proj:
+        - wkv
+        - kv_norm
+      - rope
+      - kv_epilog
+      - dyn_mx_quant
+      - compressor:
+        - kv_compress
+      - indexer:
+        - q_proj:
+          - idx_prolog
+        - search:
+          - qli
+      - core:
+        - mqsmla
+      - o_proj:
+        - wo_a
+        - wo_b
+      - hc#2:
+        - hc_post
+    - ffn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - moe:
+        - routing:
+          - gate
+          - topk_gate
+        - experts:
+          - mega_moe
+      - hc#2:
+        - hc_post
+  tpl:c2a_source+engram:
+    kind: c2a_source
+    view: default
+    steps:
+    - engram_fetch
+    - engram_wait
+    - engram_proj
+    - hc_pre
+    - rmsnorm
+    - wq_a
+    - q_norm
+    - wq_b
+    - wkv
+    - kv_norm
+    - rope
+    - kv_epilog
+    - dyn_mx_quant
+    - kv_compress
+    - idx_prolog
+    - qli
+    - mqsmla
+    - wo_a
+    - wo_b
+    - hc_post
+    - hc_pre
+    - rmsnorm
+    - gate
+    - topk_gate
+    - mega_moe
+    - hc_post
+    tree:
+    - engram:
+      - engram_fetch
+      - engram_wait
+      - engram_proj
+    - attn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - q_proj:
+        - wq_a
+        - q_norm
+        - wq_b
+      - kv_proj:
+        - wkv
+        - kv_norm
+      - rope
+      - kv_epilog
+      - dyn_mx_quant
+      - compressor:
+        - kv_compress
+      - indexer:
+        - q_proj:
+          - idx_prolog
+        - search:
+          - qli
+      - core:
+        - mqsmla
+      - o_proj:
+        - wo_a
+        - wo_b
+      - hc#2:
+        - hc_post
+    - ffn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - moe:
+        - routing:
+          - gate
+          - topk_gate
+        - experts:
+          - mega_moe
+      - hc#2:
+        - hc_post
+  tpl:c1a_source_split:split:
+    kind: c1a_source_split
+    view: split
+    steps:
+    - hc_pre
+    - rmsnorm
+    - wkv
+    - kv_norm
+    - rope
+    - kv_epilog
+    - kv_compress
+    - idx_k_write
+    - boundary_cut
+    - wq_a
+    - q_norm
+    - wq_b
+    - rope
+    - idx_prolog
+    - qli
+    - mqsmla
+    - wo_a
+    - wo_b
+    - hc_post
+    - hc_pre
+    - rmsnorm
+    - gate
+    - topk_gate
+    - mega_moe
+    - hc_post
+    tree:
+    - attn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - kv_proj:
+        - wkv
+        - kv_norm
+        - rope
+      - kv_epilog
+      - compressor:
+        - kv_compress
+      - kv_indexer:
+        - idx_k_write
+      - boundary_cut
+      - q_proj:
+        - wq_a
+        - q_norm
+        - wq_b
+        - rope
+      - indexer:
+        - q_proj:
+          - idx_prolog
+        - search:
+          - qli
+      - core:
+        - mqsmla
+      - o_proj:
+        - wo_a
+        - wo_b
+      - hc#2:
+        - hc_post
+    - ffn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - moe:
+        - routing:
+          - gate
+          - topk_gate
+        - experts:
+          - mega_moe
+      - hc#2:
+        - hc_post
+  tpl:c1a_indexsource:
+    kind: c1a_indexsource
+    view: default
+    steps:
+    - hc_pre
+    - rmsnorm
+    - wq_a
+    - q_norm
+    - wq_b
+    - wkv
+    - kv_norm
+    - rope
+    - kv_epilog
+    - dyn_mx_quant
+    - idx_prolog
+    - qsli
+    - mqsmla
+    - wo_a
+    - wo_b
+    - hc_post
+    - hc_pre
+    - rmsnorm
+    - gate
+    - topk_gate
+    - mega_moe
+    - hc_post
+    tree:
+    - attn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - q_proj:
+        - wq_a
+        - q_norm
+        - wq_b
+      - kv_proj:
+        - wkv
+        - kv_norm
+      - rope
+      - kv_epilog
+      - dyn_mx_quant
+      - indexer:
+        - q_proj:
+          - idx_prolog
+        - search:
+          - qsli
+      - core:
+        - mqsmla
+      - o_proj:
+        - wo_a
+        - wo_b
+      - hc#2:
+        - hc_post
+    - ffn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - moe:
+        - routing:
+          - gate
+          - topk_gate
+        - experts:
+          - mega_moe
+      - hc#2:
+        - hc_post
+  tpl:unfused:
+    kind: win
+    view: unfused
+    steps:
+    - hc_pre
+    - rmsnorm
+    - wq_a
+    - q_norm
+    - wq_b
+    - wkv
+    - kv_norm
+    - rope
+    - kv_epilog
+    - dyn_mx_quant
+    - mqsmla
+    - wo_a
+    - wo_b
+    - hc_post
+    - hc_pre
+    - rmsnorm
+    - gating
+    - gating_sort
+    - reroute
+    - dispatch
+    - gmm
+    - swiglu_quant
+    - combine
+    - finalize
+    - hc_post
+    tree:
+    - attn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - q_proj:
+        - wq_a
+        - q_norm
+        - wq_b
+      - kv_proj:
+        - wkv
+        - kv_norm
+      - rope
+      - kv_epilog
+      - dyn_mx_quant
+      - core:
+        - mqsmla
+      - o_proj:
+        - wo_a
+        - wo_b
+      - hc#2:
+        - hc_post
+    - ffn:
+      - hc:
+        - hc_pre
+      - rmsnorm
+      - moe:
+        - routing:
+          - gating
+          - gating_sort
+          - reroute
+        - dispatch
+        - experts:
+          - gmm
+          - swiglu_quant
+        - combine
+        - finalize
+      - hc#2:
+        - hc_post
+modules:
+  boundary_cut:
+    category: boundary
+    impl: runner:_boundary_cut_dispatch
+    kernel: ''
+    flags:
+    - boundary_only
+    - runner_hook
+    requires:
+    - hidden.x [T,H]
+    - hidden.residual [T,H]?
+    - hc.pre_t?
+    - hc.post_t?
+    - attn.kv?
+    - geometry.full_len
+    - batch.row_lens?
+    - batch.seq_lens?
+    - batch.n_seqs?
+    - cache.root?
+    - cache.suffix.win?
+    - external.cp_state?
+    provides:
+    - geometry.rows
+    - position.offset
+    - batch.cu
+    - indexer.k_ready
+    - hidden.residual
+    - hc.pre_t
+    - hc.post_t
+    - attn.kv
+    doc: 边界层截尾（host 钩子，非 OPS 函数）：hidden/residual/hc/q/idx_*/kv → keep 行
+  combine:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  dispatch:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  dyn_mx_quant:
+    category: implicit
+    impl: ''
+    kernel: ''
+    flags:
+    - implicit
+    - no_impl
+    - trace_only
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: ★隐式算子：由 _qmm / wo_a 内部产生，执行侧不单独下发（只做 trace 计数）
+  engram_fetch:
+    category: engram
+    impl: exec_engram:_engram_fetch
+    kernel: ''
+    requires:
+    - hidden.x [T,H]
+    - input.ids [B,L]?
+    - layer.index
+    - model.engram_rows
+    - model.engram_tp_size
+    - process.engram_tp_rank
+    provides:
+    - engram.ids [T,n_heads]
+    - engram.future
+    weights:
+    - engram.embed.weight
+    - engram.embed.scale
+    doc: ngram hash + 取表（可走侧流/厂商 ElasticBuffer）
+  engram_proj:
+    category: engram
+    impl: exec_engram:_engram_proj
+    kernel: ''
+    params:
+      hc_mult: ${model.hc_mult}
+    requires:
+    - engram.kv [T,6144]
+    - hidden.x [T,H]
+    - model.hc_mult
+    - model.hidden
+    - model.rms_norm_eps
+    - layer.index
+    provides:
+    - engram.proj_out [T,hc_mult+1,H]
+    - engram.out [T,H]
+    - hidden.x [T,H]
+    - hidden.residual [T,H]
+    weights:
+    - engram.wkv.weight
+    - engram.wkv.scale
+    - engram.q_weight
+    - engram.k_weight
+    doc: engram 投影 + gate（覆盖残差流；官方 DecoderLayer 第一步）
+  engram_wait:
+    category: engram
+    impl: exec_engram:_engram_wait
+    kernel: ''
+    requires:
+    - engram.ids?
+    - engram.future?
+    - hidden.x [T,H]
+    - layer.index
+    provides:
+    - engram.kv [T,6144]
+    doc: join 后台取表 → embeddings（H2D）
+  finalize:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  gate:
+    category: moe
+    impl: exec_ops:_gate
+    kernel: ''
+    requires:
+    - hidden.x [T,H]
+    - model.hidden
+    - model.n_routed_experts
+    provides:
+    - moe.logits [T,n_experts]
+    weights:
+    - ffn.gate.weight
+    - ffn.gate.weight.T
+    doc: 路由打分（FusedMatMul：T×5120 @ 384×5120）
+  gating:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  gating_sort:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  gmm:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  hc_post:
+    category: common
+    impl: exec_ops:_hc_post
+    kernel: ''
+    params:
+      hidden: ${model.hidden}
+      hc_mult: ${model.hc_mult}
+    requires:
+    - hidden.x [T,hc_mult,H]
+    - hidden.residual [T,hc_mult,H]
+    - hc.post_t
+    - hc.stage
+    - process.backends
+    - model.hidden
+    - model.hc_mult
+    provides:
+    - hidden.x [T,H]
+    - hidden.residual [T,H]
+    doc: hyper-connection 后处理（mhc_post）；attn 段后同时刷新 residual
+  hc_pre:
+    category: common
+    impl: exec_ops:_hc_pre
+    kernel: ''
+    params:
+      hidden: ${model.hidden}
+      hc_mult: ${model.hc_mult}
+      sinkhorn_iters: ${model.hc_sinkhorn_iters}
+    requires:
+    - hidden.x [T,hc_mult,H]
+    - hc.stage
+    - hc.pre_t [T,hc_mult]?
+    - hc.ffn_pre [T,hc_mult]?
+    - cache.root?
+    - model.hidden
+    - model.hc_mult
+    - model.hc_sinkhorn_iters
+    - model.hc_eps
+    - hc.pad_ref?
+    - hc.pad_cap?
+    - layer.index
+    provides:
+    - hc.pre_t [T,hc_mult]
+    - hc.post_t
+    - hidden.x [T,hc_mult,H]
+    - hc.ffn_pre [T,hc_mult]
+    weights:
+    - hc_attn_fn
+    - hc_attn_scale
+    - hc_attn_base
+    - hc_ffn_fn
+    - hc_ffn_scale
+    - hc_ffn_base
+    doc: hyper-connection 预处理（npu_hc_pre_v2）：出 post/comb/pre；ffn 段的 pre 跨层传递
+  idx_k_write:
+    category: indexer
+    impl: exec_indexer:_idx_k_write
+    kernel: ''
+    flags:
+    - boundary_only
+    params:
+      candidate_block_size: 8
+    requires:
+    - cmp.latent [N,512]
+    - layer.ratio
+    - position.offset
+    - position.offsets?
+    - batch.cu?
+    - batch.seq_lens?
+    - batch.n_seqs?
+    - cache.root?
+    - cp.positions?
+    - model.rope_theta?
+    - model.rope_dim?
+    - model.rope_scaling?
+    - model.compress_rope_theta?
+    - model.candidate_block_size?
+    - layer.roles.candidate_source
+    provides:
+    - cache.idx.k [1+nblk,128,1,64]
+    - cache.idx.ks [1+nblk,128,1,2,2]
+    - cache.idx.nblk
+    - cache.idx.qsli?
+    weights:
+    - attn.indexer.wk.weight
+    - attn.indexer.k_norm.weight
+    - attn.indexer.k_norm.weight.f32
+    doc: 索引 K 缓存写入（边界 split 的 KV 路径；官方 update_indexer_cache）
+  idx_prolog:
+    category: indexer
+    impl: exec_indexer:_idx_prolog
+    kernel: ''
+    requires:
+    - attn.qr [T,q_lora]
+    - hidden.x [T,H]
+    - batch.cu?
+    - batch.n_seqs?
+    - layer.ratio
+    - position.offset
+    - position.offsets?
+    - model.head_dim
+    - model.index_head_dim
+    - model.index_n_heads
+    - model.rope_theta?
+    - model.rope_dim?
+    - model.rope_scaling?
+    - model.compress_rope_theta?
+    - cp.positions?
+    - cp.abs_positions?
+    - cp.total_q?
+    provides:
+    - idx.q [T,n_heads,64]
+    - idx.descale_q [T,n_heads,2,2]
+    - idx.w [T,n_heads]
+    weights:
+    - attn.indexer.wq_b.weight
+    - attn.indexer.wq_b.scale
+    - attn.indexer.weights_proj.weight
+    - attn.indexer.wq_b.scale.pairs
+    doc: 索引器 query 侧（indexer_prologue_qw；CP 下按参考 M 补零）
+  kv_compress:
+    category: compressor
+    impl: exec_ops:_kv_compress
+    kernel: ''
+    flags:
+    - packed_variant
+    params:
+      ratio: ${layer.ratio}
+    requires:
+    - hidden.x [T,H]
+    - model.hidden
+    - geometry.full_len
+    - position.offset
+    - position.offsets?
+    - position.hit_replay_tail?
+    - layer.index
+    - layer.ratio
+    - model.head_dim
+    - model.rope_dim
+    - model.compress_rope_theta
+    - model.rope_theta?
+    - model.rope_scaling?
+    - cp.positions?
+    - cache.root?
+    - cache.suffix.cmp?
+    - compressor.state_block?
+    - compressor.t_override?
+    - compressor.pre?
+    - batch.n_seqs
+    - batch.cu?
+    - cache.cmp.state?
+    provides:
+    - cmp.latent [T//ratio+1,512]
+    - cmp.kv [T//ratio+1,512]
+    - cache.cmp.pool
+    - cache.cmp.nblk
+    - cache.cmp.len
+    - cache.cmp.state
+    weights:
+    - attn.compressor.wkv.weight
+    - attn.compressor.wgate.weight
+    - attn.compressor.norm.weight
+    - attn.compressor.norm.weight.f32
+    doc: 压缩 KV 写入（DeepInfer 口径；CP 时先 gather hidden 再跑全长）
+  kv_epilog:
+    category: attention
+    impl: exec_ops:_kv_epilog
+    kernel: ''
+    params:
+      sliding_window: ${model.sliding_window}
+      win_keep: ${model.win_keep}
+    requires:
+    - attn.kv [T,512]
+    - position.offset
+    - geometry.full_len
+    - model.sliding_window
+    - model.head_dim
+    - model.win_keep
+    - position.win_abs
+    - batch.n_seqs
+    - batch.cu?
+    - cache.root?
+    - cache.suffix.win?
+    - cache.win.pool?
+    provides:
+    - cache.win.pool [win_slots,544]
+    - cache.win.nblk
+    doc: KV cache epilog：把 kv 写进滑窗池 A/B（KvCompressEpilogV2）
+  kv_norm:
+    category: attention
+    impl: exec_ops:_kv_norm
+    kernel: ''
+    requires:
+    - attn.kv [T,512]
+    provides:
+    - attn.kv [T,512]
+    weights:
+    - attn.kv_norm.weight
+    doc: 压缩 KV 上的 RmsNorm
+  mega_moe:
+    category: moe
+    impl: exec_moe:_mega_moe
+    kernel: ''
+    flags:
+    - fused
+    params:
+      topk: ${model.moe_topk}
+    requires:
+    - hidden.x [T,H]
+    - moe.topk_idx [T,topk]
+    - moe.topk_weight [T,topk]
+    - geometry.full_len
+    - layer.index
+    - model.hidden
+    - model.moe_topk
+    - moe.e_local
+    - geometry.chunk
+    - moe.nspan?
+    - model.moe_intermediate
+    - model.swiglu_limit
+    - process.src?
+    provides:
+    - moe.out [T,H]
+    - hidden.x [T,H]
+    weights:
+    - ffn.experts.{E}.w1.weight
+    - ffn.experts.{E}.w1.scale
+    - ffn.experts.{E}.w2.weight
+    - ffn.experts.{E}.w2.scale
+    - ffn.experts.{E}.w3.weight
+    - ffn.experts.{E}.w3.scale
+    - ffn.shared_experts.w1.weight
+    - ffn.shared_experts.w1.scale
+    - ffn.shared_experts.w2.weight
+    - ffn.shared_experts.w2.scale
+    - ffn.shared_experts.w3.weight
+    - ffn.shared_experts.w3.scale
+    doc: 融合 MoE（MegaMoE：路由/分发/分组MM/SwiGLU/合并；按 chunk 分 span）
+  mqsmla:
+    category: attention
+    impl: exec_ops:_mqsmla
+    kernel: ''
+    params:
+      index_topk: ${model.index_topk}
+    requires:
+    - attn.q [T,n_heads,head_dim]
+    - cmp.latent [T//ratio,512]?
+    - idx.sparse?
+    - cp.positions?
+    - cp.total_q?
+    - batch.cu?
+    - batch.seq_lens?
+    - batch.n_seqs
+    - layer.index
+    - layer.ratio
+    - model.index_topk
+    - position.offset
+    - position.offsets?
+    - position.win_abs
+    - cache.root?
+    - cache.suffix.win?
+    - cache.suffix.cmp?
+    - cache.suffix.idx?
+    - cache.win.pool
+    - cache.cmp.pool?
+    - cache.cmp.len?
+    - cache.idx.k?
+    provides:
+    - attn.out [T,n_heads*head_dim]
+    weights:
+    - attn.attn_sink
+    doc: ds41 稀疏量化 MLA（窗口池 + 压缩索引）
+  q_norm:
+    category: attention
+    impl: exec_ops:_q_norm
+    kernel: ''
+    requires:
+    - attn.qr [T,q_lora]
+    - model.q_lora_rank
+    provides:
+    - attn.qr [T,q_lora]
+    weights:
+    - attn.q_norm.weight
+    doc: q_lora 上的 RmsNorm
+  qli:
+    category: indexer
+    impl: exec_indexer:_qli
+    kernel: ''
+    flags:
+    - packed_variant
+    params:
+      candidate_block_size: 8
+      candidate_topk_blocks: 2048
+    requires:
+    - idx.q [T,n_heads,64]
+    - idx.descale_q [T,n_heads,2,2]
+    - idx.w [T,n_heads]
+    - cmp.latent?
+    - geometry.full_len
+    - position.offset
+    - layer.ratio
+    - position.offsets?
+    - batch.cu?
+    - batch.seq_lens?
+    - batch.n_seqs?
+    - cache.root?
+    - cache.suffix.idx?
+    - cp.positions?
+    - model.rope_theta?
+    - model.rope_dim?
+    - model.rope_scaling?
+    - model.compress_rope_theta?
+    - model.candidate_block_size?
+    - model.candidate_topk_blocks?
+    - model.index_topk
+    - layer.roles.candidate_source
+    - indexer.k_ready?
+    - cache.idx.k?
+    provides:
+    - idx.sparse [T,1,index_topk]
+    - idx.topk_length [T]
+    - cache.idx.k
+    - cache.idx.ks
+    - cache.idx.nblk
+    - cache.idx.qsli
+    weights:
+    - attn.indexer.wk.weight
+    - attn.indexer.k_norm.weight
+    - attn.indexer.k_norm.weight.f32
+    doc: QuantLightningIndexer（cp 下按块跑；内含 K 缓存写入）
+  qsli:
+    category: indexer
+    impl: exec_indexer:_qsli
+    kernel: ''
+    flags:
+    - packed_variant
+    params:
+      candidate_block_size: 8
+      candidate_topk_blocks: 2048
+    requires:
+    - idx.q
+    - idx.descale_q
+    - idx.w
+    - geometry.full_len
+    - position.offset
+    - position.offsets?
+    - layer.ratio
+    - batch.cu?
+    - batch.seq_lens?
+    - batch.n_seqs?
+    - cache.root?
+    - cache.suffix.idx?
+    - cp.positions?
+    - model.candidate_block_size?
+    - model.candidate_topk_blocks?
+    - model.index_topk
+    - layer.roles.candidate_source
+    - cache.idx.qsli?
+    provides:
+    - idx.sparse
+    - idx.topk_length
+    doc: QuantSparseLightningIndexer（吃层 20 的候选块组合缓存）
+  reroute:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  rmsnorm:
+    category: common
+    impl: exec_ops:_rmsnorm
+    kernel: ''
+    params:
+      eps: ${model.rms_norm_eps}
+    requires:
+    - hidden.x [T,H]
+    - hc.stage
+    - model.hidden
+    - model.rms_norm_eps
+    provides:
+    - hidden.x [T,H]
+    weights:
+    - attn_norm.weight
+    - ffn_norm.weight
+    doc: attn_norm / ffn_norm（按 hc.stage 选权重），原地归一化 x
+  rope:
+    category: attention
+    impl: exec_ops:_rope
+    kernel: ''
+    params:
+      rope_dim: ${model.rope_dim}
+      rope_theta: ${model.rope_theta}
+    requires:
+    - hidden.x [T,H]
+    - attn.q [T,n_heads,head_dim]?
+    - attn.kv [T,512]?
+    - model.rope_dim
+    - model.rope_theta
+    - model.compress_rope_theta?
+    - model.rope_scaling?
+    - position.offset?
+    - position.offsets?
+    - batch.cu?
+    - batch.n_seqs?
+    - layer.ratio?
+    - cp.positions?
+    - cp.abs_positions?
+    - cp.total_q?
+    - geometry.full_len?
+    provides:
+    - attn.q
+    - attn.kv
+    - attn.rope_done
+    doc: inplace_partial_rotary_mul（q/kv 尾部 rope 维）
+  swiglu_quant:
+    category: moe
+    impl: ''
+    kernel: ''
+    flags:
+    - no_impl
+    requires:
+    - hidden.x [T,H]
+    provides: []
+    doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  topk_gate:
+    category: moe
+    impl: exec_ops:_topk_gate
+    kernel: ''
+    params:
+      topk: ${model.moe_topk}
+    requires:
+    - moe.logits [T,n_experts]
+    - input.ids?
+    - model.routed_scaling_factor
+    - model.moe_topk
+    provides:
+    - moe.topk_idx [T,topk]
+    - moe.topk_weight [T,topk]
+    weights:
+    - ffn.gate.bias
+    - ffn.gate.bias.f32
+    doc: top-k 路由（bias 转 fp32）
+  wkv:
+    category: attention
+    impl: exec_ops:_wkv
+    kernel: ''
+    params:
+      head_dim: ${model.head_dim}
+    requires:
+    - hidden.x [T,H]
+    - model.hidden
+    - model.head_dim
+    provides:
+    - attn.kv [T,512]
+    weights:
+    - attn.wkv.weight
+    - attn.wkv.scale
+    doc: 压缩 KV 投影（512 维）
+  wo_a:
+    category: attention
+    impl: exec_ops:_wo_a
+    kernel: ''
+    requires:
+    - attn.out [T,o_groups,head_dim*64]
+    - attn.q?
+    - hidden.x [T,H]
+    - batch.cu?
+    - batch.n_seqs
+    - layer.ratio
+    - position.offset
+    - position.offsets?
+    - cp.positions?
+    - model.rope_dim
+    - model.rope_theta
+    - model.compress_rope_theta?
+    - model.rope_scaling?
+    - process.allow_placeholder
+    - process.placeholder_used?
+    provides:
+    - attn.o_lora [T,o_groups*o_lora]
+    - attn.out
+    weights:
+    - attn.wo_a.weight
+    - attn.wo_a.scale
+    doc: o_lora 投影（TransposeQuantBatchMatMul；内含量化）
+  wo_b:
+    category: attention
+    impl: exec_ops:_wo_b
+    kernel: ''
+    params:
+      hidden: ${model.hidden}
+    requires:
+    - attn.o_lora [T,o_groups*o_lora]
+    - model.hidden
+    - model.o_groups
+    - model.o_lora_rank
+    provides:
+    - hidden.x [T,H]
+    weights:
+    - attn.wo_b.weight
+    - attn.wo_b.scale
+    doc: 输出投影：o_groups×o_lora → hidden
+  wq_a:
+    category: attention
+    impl: exec_ops:_wq_a
+    kernel: ''
+    requires:
+    - hidden.x [T,H]
+    - model.hidden
+    - model.q_lora_rank
+    provides:
+    - attn.qr [T,q_lora]
+    weights:
+    - attn.wq_a.weight
+    - attn.wq_a.scale
+    doc: MLA q 低秩投影（mxfp8 QMM）
+  wq_b:
+    category: attention
+    impl: exec_ops:_wq_b
+    kernel: ''
+    params:
+      head_dim: ${model.head_dim}
+    requires:
+    - attn.qr [T,q_lora]
+    - model.q_lora_rank
+    - model.head_dim
+    - model.n_attention_heads
+    provides:
+    - attn.q [T,n_heads,head_dim]
+    weights:
+    - attn.wq_b.weight
+    - attn.wq_b.scale
+    doc: q 上投影（→ 64 头 × 512）

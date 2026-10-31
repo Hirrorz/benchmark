@@ -1,0 +1,64 @@
+# DS4.1-Flash 最小 benchmark 配置（结构与官方 config.json 对齐；值取自真权重目录的 config.json）
+model:
+  name: deepseek_v4_1_flash
+  hidden: 5120
+  moe_intermediate: 2304
+  swiglu_limit: 10.0     # 官方 config.swiglu_limit（mega_moe activation_clamp）
+  n_layers: 40
+  n_routed_experts: 384
+  n_shared_experts: 1
+  topk: 6
+  sliding_window: 128
+  # 每层的注意力类型：0=win(纯 SWA) 2=c2a(2:1) 1=c1a(1:1)
+  compress_ratios: [0,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+  kv_source_layers:   [2, 8, 14, 20]          # 写压缩 KV 的层
+  index_source_layers: [2, 8, 14, 20, 24, 28, 32, 36]
+  candidate_source_layer: 20                   # 产候选块（2048×8）
+  engram_layers: [1, 14]
+  # ★ 与**官方 hit97 那一份**同口径（ds41_light/configs/light_8card_ep8_official_all_hit*_cp1_hitfake.yaml:32-33）：
+  #   enable_engram_offload: True + engram_tp_size: 8 —— 表放**主机内存**、按 8 卡分片，取表走厂商
+  #   ElasticBuffer（设备侧 RDMA）→ trace 里就是 EngramFetch + EngramFetchWait 两个算子。
+  #   （2026-10-15 之前用的是 eager_128k 那份口径：offload=False 表常驻设备 → **不发**这两个算子，
+  #     逐算子对拍会缺项；要退回就是 engram_offload: false + engram_tp_size: 1。）
+  engram_offload: true
+  engram_tp_size: 8
+
+parallel_config:
+  world_size: 8
+  cp_size: 1
+  moe_ep_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 1
+  lmhead_tp_size: 1
+
+run:
+  seq_len: 65536          # ★ 命中点：L=64k，h=0.97 → T_main = 0.03L+128 ≈ 2048（与官方 hit97 矩阵 64k 点同口径）
+  batch: 1                 # 每 rank 请求数
+  iters: 4                 # 一个 trace 里 4 个 pass（对齐官方该点 trace 的 4 pass 口径）
+  moe_chunk_max_len: 8192  # ★ 决定 MoE 路由/GEMM 的调用次数：chunks = ceil(T/chunk)
+
+weights:
+  mode: synthetic          # synthetic | real
+  path: /mnt/xds/sfs/DeepSeek-V4.1-Flash-cann-mxfp8-mxfp4   # mode=real 时用
+  engram_table_rows: 1048576   # engram 表行数（真实 384006168 ≈ 98 GB/层，必须 host-offload）
+                               # ★ 表大小不进算子图（只改 gather 输入，不改输出形状）→ 联调可缩小；
+                               #   0 = 用真实规模；真权重模式忽略（按真实文件读）
+  # lazy_experts: 不显式设置 → 代码按运行卡数决定（EP8/多卡=常驻，单卡=逐层）。2026-10-18 用户口径
+  share_across_layers: true    # ★ 40 层共用同一份合成权重（含专家）：生成只发生一次、
+                               #   换层不释放 → 性能采集时每轮前向的耗时才是干净的
+
+backends:                  # 每个算子可选实现（对应官方 kernel_config.*）
+  megamoe: deepgemm         # ascendc | deepgemm | none(=未融合 GMM 链)
+  indexer_prolog_qw: ascendc
+  gate_topk: tilelang
+  engram: tilelang
+  swiglu: fused            # fused | fallback
+
+hit:
+  ratio: 0.9707            # ★ 官方该点实测命中率（HIT97_MATRIX.md）→ T_main=(0.0293×65536)+128=2048
+  source: fake             # fake = 前缀用池子初值（零值、**各层共用一份**），不跑 stage A → 合成权重用这个
+                           # real = 先跑 stage A 真算前缀 [0,H) 再跑 stage B（真权重/数值口径用；慢一遍 64k）
+  replay_tail: 140         # R = (1-h)L + replay_tail
+
+features:
+  decoder_replay: false    # decoder128（仅 cp_size==1）

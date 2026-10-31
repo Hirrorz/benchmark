@@ -1,0 +1,10 @@
+This directory contains code vendored from DeepInfer
+(https://github.com/deepseek-ai/DeepInfer), Copyright DeepSeek, licensed under
+the Apache License, Version 2.0. A copy of the license is available at
+https://www.apache.org/licenses/LICENSE-2.0
+
+File: deepinfer_compress_asc.py
+  Source: deepinfer/model_executor/layers/tilelang_ops/asc/compress.py
+  Snapshot: repo commit 9bd9cf2 (2026-10-21) as mirrored in
+            /mnt/xds/sfs/l00972766/tmp/repos/DeepInfer-main
+  Modifications: none to the kernel body; only a provenance header was added.

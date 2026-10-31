@@ -1,0 +1,38 @@
+# ALOP 采集配置 —— **产出 MindStudio trace**（与 torch_npu.profiler 同构的 ASCEND_PROFILER_OUTPUT）
+#
+# 用法：python3.11 launch_mini.py <config.yaml> --prof --alop-config configs/alop_mindstudio.yaml
+#      （tools/run_real.sh 默认就带这个；换配置用 --alop-config <你的.yaml>）
+#
+# 为什么这么配：
+#   · `python_profiling_config.enabled: false`（2026-10-26 规则）→ 只用 ACL C 级；历史上 true 会委托 torch_npu.profiler，
+#      产出 `<out>/<host>_<pid>_<ts>/ASCEND_PROFILER_OUTPUT/{op_statistic,kernel_details,...}.csv`
+#      + `trace_view.json` —— 就是 MindStudio 直开、和合成口径同一套的那份。
+#      （置 false 则是纯 aclprof C 级：更轻，但只有 PROF_* 原始目录，
+#        `tools/run_real.sh` 的 trace 次数断言会读不到 → 会明确报"trace 目录里没有 op_statistic.csv"。）
+#   · aicore_metric=PipeUtilization + data_types 只开 task_time/aicore_metrics：
+#      与合成口径一致（等价旧的 Level1 + PipeUtilization）、开销最小；开越多越吃显存。
+profiling_config:
+  aicore_metric: "PipeUtilization"
+  data_types:
+    acl_api: true
+    task_time: true
+    aicore_metrics: true
+    aicpu: false
+    l2cache: false
+    hccl_trace: false
+    training_trace: false
+    msproftx: false
+    runtime_api: false
+    task_time_l0: false
+    task_memory: false
+    task_time_l2: false
+    op_attr: false
+    task_time_l3: false
+
+python_profiling_config:
+  enabled: false
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_flops: false
+  with_modules: false

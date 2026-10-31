@@ -1,0 +1,1516 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DS4.1 mini · 模型结构查看器</title>
+<style>
+:root{
+  --bg:#0a0e14; --panel:#111823; --panel2:#0e141d; --line:#1f2a3a;
+  --txt:#dbe6f3; --dim:#8496ad; --faint:#55657a;
+  --accent:#8b5cf6; --accent2:#22d3ee;
+  --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --cache:#f472b6;
+  --radius:10px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+html[data-theme="light"]{
+  --bg:#f4f6fb; --panel:#ffffff; --panel2:#eef2f9; --line:#d9e1ee;
+  --txt:#17202e; --dim:#5a6b82; --faint:#8a9ab0;
+  --accent:#6d4aff; --accent2:#0891b2;
+  --ok:#059669; --warn:#b45309; --bad:#dc2626; --cache:#db2777;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:13px;
+  display:flex;flex-direction:column;overflow:hidden}
+button{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);
+  border-radius:8px;padding:5px 10px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+input,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);
+  border-radius:8px;padding:5px 8px;outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+.mono{font-family:var(--mono)}
+.topbar{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,var(--panel),var(--panel2));flex:0 0 auto}
+.brand{display:flex;align-items:center;gap:10px;min-width:280px}
+.logo{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;font-size:17px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-weight:700}
+h1{font-size:15px;margin:0;letter-spacing:.2px}
+.sub{color:var(--dim);font-size:11px;margin-top:1px}
+.controls{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap}
+.controls label{color:var(--dim);font-size:11px;display:flex;align-items:center;gap:5px}
+#search{width:230px}
+.badge{display:inline-flex;align-items:center;gap:3px;margin-left:4px;padding:1px 6px;border-radius:999px;
+  font-size:10px;border:1px solid var(--line);color:var(--dim);background:var(--panel2);
+  white-space:nowrap}
+.badge.hot{border-color:var(--accent);color:var(--accent)}
+.layout{flex:1;display:grid;grid-template-columns:270px minmax(420px,1fr) 430px;min-height:0}
+.rail{border-right:1px solid var(--line);background:var(--panel2);display:flex;flex-direction:column;min-height:0}
+.railHead{padding:9px 12px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+.railHead .row{display:flex;align-items:center;justify-content:space-between;color:var(--dim);font-size:11px}
+.chips{display:flex;flex-wrap:wrap;gap:4px}
+.chip{cursor:pointer;border:1px solid var(--line);border-radius:999px;padding:1px 7px;font-size:10px;
+  color:var(--dim);user-select:none}
+.chip.on{color:#fff;border-color:transparent}
+.layerList{overflow:auto;flex:1;padding:6px}
+.groupHead{display:flex;align-items:center;gap:6px;padding:6px 7px;margin:4px 0 2px;color:var(--dim);
+  font-size:10.5px;letter-spacing:.4px;text-transform:uppercase;cursor:pointer;border-radius:6px}
+.groupHead:hover{background:var(--panel)}
+.groupHead .tri{width:10px;display:inline-block;transition:transform .12s}
+.groupHead.closed .tri{transform:rotate(-90deg)}
+.layer{display:grid;grid-template-columns:30px 10px 1fr auto;align-items:center;gap:7px;
+  padding:5px 7px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+.layer:hover{background:var(--panel)}
+.layer.sel{background:color-mix(in srgb,var(--accent) 16%,transparent);border-color:var(--accent)}
+.layer .idx{font-family:var(--mono);color:var(--dim);text-align:right;font-size:11px}
+.dot{width:8px;height:8px;border-radius:50%}
+.layer .kind{font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.layer .meta{font-family:var(--mono);font-size:10px;color:var(--faint);display:flex;gap:4px;align-items:center}
+.role{font-size:9px;padding:0 4px;border-radius:4px;border:1px solid var(--line);color:var(--dim)}
+.role.on{color:var(--accent2);border-color:var(--accent2)}
+.center{display:flex;flex-direction:column;min-width:0;min-height:0}
+.crumbs{padding:8px 14px;border-bottom:1px solid var(--line);color:var(--dim);font-size:11px;
+  display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.crumbs b{color:var(--txt);font-weight:600}
+.treeHead{padding:8px 14px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;
+  flex-wrap:wrap;background:var(--panel2)}
+.treeHead .title{font-weight:600;margin-right:auto}
+.tree{overflow:auto;flex:1;padding:8px 10px 60px}
+.node{border-radius:8px}
+.row{display:flex;align-items:center;gap:7px;padding:4px 7px;border-radius:7px;cursor:pointer;
+  border:1px solid transparent;user-select:none}
+.row:hover{background:var(--panel)}
+.row.sel{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 13%,transparent)}
+.row.hit{outline:1px dashed var(--warn)}
+.tri{width:12px;color:var(--faint);font-size:10px;transition:transform .12s;display:inline-block}
+.node.closed>.row .tri{transform:rotate(-90deg)}
+.children{margin-left:16px;border-left:1px dashed var(--line);padding-left:6px}
+.node.closed>.children{display:none}
+.opname{font-family:var(--mono);font-size:12px}
+.containerName{font-weight:600;font-size:12.5px}
+.kchip{font-size:10px;color:var(--dim);border:1px solid var(--line);border-radius:5px;padding:0 5px}
+.kindbar{width:3px;height:16px;border-radius:2px;background:var(--accent)}
+.detail{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+.dHead{padding:10px 14px;border-bottom:1px solid var(--line)}
+.dTitle{font-family:var(--mono);font-size:13px;font-weight:600;word-break:break-all}
+.dSub{color:var(--dim);font-size:11px;margin-top:3px;display:flex;gap:8px;flex-wrap:wrap}
+.tabs{display:flex;gap:4px;padding:8px 12px 0;border-bottom:1px solid var(--line)}
+.tab{padding:5px 10px;border-radius:8px 8px 0 0;color:var(--dim);cursor:pointer;font-size:11.5px;
+  border:1px solid transparent;border-bottom:none}
+.tab.on{color:var(--txt);background:var(--panel2);border-color:var(--line)}
+.dBody{overflow:auto;flex:1;padding:10px 12px 40px}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--dim);font-weight:500;font-size:10.5px;position:sticky;top:0;background:var(--panel)}
+td.key{font-family:var(--mono);white-space:nowrap;cursor:pointer}
+td.key:hover{color:var(--accent2)}
+.st{font-size:10px;padding:0 5px;border-radius:4px;border:1px solid var(--line)}
+.st.ok{color:var(--ok);border-color:var(--ok)}
+.st.cache{color:var(--cache);border-color:var(--cache)}
+.st.zero-init{color:var(--dim)}
+.st.optional{color:var(--faint)}
+.st.unresolved{color:var(--bad);border-color:var(--bad)}
+.st.in_place{color:var(--warn);border-color:var(--warn)}
+.note{color:var(--dim);font-size:11px;line-height:1.55;margin:8px 0}
+.note code{font-family:var(--mono);background:var(--panel2);padding:0 4px;border-radius:4px}
+.sec{margin:12px 0 6px;font-size:11px;color:var(--dim);letter-spacing:.5px;text-transform:uppercase}
+.flow{display:flex;flex-direction:column;gap:3px;margin:6px 0 2px}
+.flow .item{display:flex;gap:6px;align-items:center;font-size:11px}
+.flow .arrow{color:var(--faint)}
+.empty{color:var(--faint);font-size:11px;padding:10px 2px}
+.modal{position:fixed;inset:0;background:rgba(2,5,10,.62);display:grid;place-items:center;z-index:50}
+.modal[hidden]{display:none}
+.sheet{width:min(1000px,92vw);max-height:86vh;background:var(--panel);border:1px solid var(--line);
+  border-radius:14px;display:flex;flex-direction:column;overflow:hidden;
+  box-shadow:0 24px 80px rgba(0,0,0,.55)}
+.sheet header{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.sheet header b{margin-right:auto;font-size:14px}
+.sheet .body{overflow:auto;padding:12px 16px 24px}
+.kindTag{font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid currentColor}
+.legend{display:flex;gap:8px;flex-wrap:wrap;color:var(--dim);font-size:10.5px}
+.legend span{display:flex;align-items:center;gap:4px}
+.warnrow{background:color-mix(in srgb,var(--warn) 10%,transparent)}
+.err{color:var(--bad)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:2px 10px;font-size:11px}
+.kv div:nth-child(odd){color:var(--dim)}
+@media (max-width:1200px){.layout{grid-template-columns:230px 1fr 360px}}
+@media (max-width:980px){
+  body{overflow:auto}
+  .layout{grid-template-columns:1fr;grid-auto-rows:auto}
+  .rail{max-height:280px}.detail{border-left:none;border-top:1px solid var(--line)}
+  .center{min-height:420px}
+}
+
+/* ── 模式页（积木库 / 组装蓝图 / 模块构建器） ── */
+.modes{display:flex;gap:2px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:10px;padding:2px}
+.modes button{border:none;background:transparent;padding:4px 9px;border-radius:7px;
+  font-size:11px;color:var(--dim)}
+.modes button.on{background:var(--accent);color:#fff}
+.modePage{flex:1;overflow:auto;padding:16px 20px 60px;min-height:0}
+.modeHead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.modeHead h2{font-size:16px;margin:0;margin-right:auto}
+.plugGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}
+.plugCard{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:var(--panel);
+  cursor:pointer;transition:border-color .12s,transform .12s}
+.plugCard:hover{border-color:var(--accent);transform:translateY(-1px)}
+.plugCard .top{display:flex;align-items:center;gap:6px}
+.plugCard .op{font-family:var(--mono);font-weight:600}
+.plugCard .meta{display:flex;gap:6px;color:var(--dim);font-size:10.5px;flex-wrap:wrap;margin-top:6px}
+.plugCard .doc{color:var(--dim);font-size:11px;margin-top:6px;line-height:1.45;max-height:44px;overflow:hidden}
+.pill{font-size:9.5px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+.pill.used{color:var(--ok);border-color:var(--ok)}
+.pill.unused{color:var(--faint)}
+.bpSection{border:1px solid var(--line);border-radius:12px;background:var(--panel);
+  padding:10px 12px;margin-bottom:10px}
+.bpSection h3{font-size:12px;margin:0 0 8px;color:var(--dim);letter-spacing:.4px;text-transform:uppercase}
+.bpRow{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin:4px 0}
+.bpChip{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border-radius:6px;
+  padding:1px 6px;background:var(--panel2);cursor:pointer}
+.bpChip.ref{color:var(--accent2);border-style:dashed}
+.bpChip:hover{border-color:var(--accent)}
+.bpArrow{color:var(--faint);font-size:10px}
+.builderGrid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:14px}
+@media (max-width:1000px){.builderGrid{grid-template-columns:1fr}}
+.formRow{display:grid;grid-template-columns:110px 1fr;gap:8px;align-items:start;margin:6px 0}
+.formRow label{color:var(--dim);font-size:11px;padding-top:5px}
+textarea{font:inherit;font-family:var(--mono);font-size:11px;color:inherit;background:var(--panel2);
+  border:1px solid var(--line);border-radius:8px;padding:6px 8px;width:100%;min-height:64px;
+  resize:vertical;outline:none}
+textarea:focus{border-color:var(--accent)}
+.codeBox{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px;
+  font-family:var(--mono);font-size:10.5px;white-space:pre-wrap;max-height:380px;overflow:auto}
+.split2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:1100px){.split2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">◈</div>
+    <div>
+      <h1>DS4.1 mini · 模型结构</h1>
+      <div class="sub" id="subtitle">loading…</div>
+    </div>
+  </div>
+  <div class="controls">
+    <div class="modes" id="modeSwitch">
+      <button data-mode="structure" class="on">结构</button>
+      <button data-mode="catalog">积木库</button>
+      <button data-mode="blueprint">组装蓝图</button>
+      <button data-mode="builder">模块构建器</button>
+    </div>
+    <label>几何 <select id="presetSel"></select></label>
+    <label>视图 <select id="viewSel"></select></label>
+    <input id="search" placeholder="搜索 键 / 权重 / 算子 / kernel …">
+    <button id="diffBtn">变体对比</button>
+    <button id="helpBtn">说明</button>
+    <button id="diagBtn">诊断</button>
+    <button id="themeBtn" title="主题">☾</button>
+    <button id="linkBtn" title="复制当前深链">复制深链</button>
+  </div>
+</header>
+<main class="layout">
+  <aside class="rail">
+    <div class="railHead">
+      <div class="row"><span>40 层</span><span id="railCount"></span></div>
+      <div class="chips" id="kindChips"></div>
+    </div>
+    <div id="layerList" class="layerList"></div>
+  </aside>
+  <section class="center">
+    <div class="crumbs" id="crumbs"></div>
+    <div class="treeHead">
+      <span class="title" id="treeTitle">模块树</span>
+      <span class="badge" id="tplBadge"></span>
+      <div class="legend" id="treeLegend"></div>
+    </div>
+    <div id="tree" class="tree"></div>
+  </section>
+  <aside class="detail">
+    <div class="dHead">
+      <div class="dTitle" id="dTitle">选择一个模块</div>
+      <div class="dSub" id="dSub"></div>
+    </div>
+    <div class="tabs" id="tabs"></div>
+    <div class="dBody" id="dBody"></div>
+  </aside>
+</main>
+<section id="modePage" class="modePage" hidden></section>
+
+<div class="modal" id="modal" hidden>
+  <div class="sheet">
+    <header><b id="modalTitle"></b><button id="modalClose">关闭</button></header>
+    <div class="body" id="modalBody"></div>
+  </div>
+</div>
+
+<noscript><p style="padding:20px">此页面需要 JavaScript 才能渲染（数据内嵌，无网络请求）。</p></noscript>
+
+<script type="application/json" id="model-data">/* MODEL-DATA:START */{}/* MODEL-DATA:END */</script>
+<script>
+"use strict";
+/* ───────────────────────── 数据与常量 ───────────────────────── */
+const DATA = JSON.parse(document.getElementById("model-data").textContent
+  .replace(/\/\* MODEL-DATA:START \*\//g, "")
+  .replace(/\/\* MODEL-DATA:END \*\//g, ""));
+const PRESETS = DATA.geometry_presets || {};
+const TEMPLATES = DATA.templates || {};
+const LAYERS = DATA.layers || [];
+const OP_CATALOG = DATA.op_catalog || {};
+const DIAG = DATA.diagnostics || {};
+
+const KIND_COLOR = {
+  win:"var(--accent2)", c2a_source:"var(--warn)", c2a_consumer:"#60a5fa",
+  c1a_source:"var(--cache)", c1a_consumer:"#a78bfa", c1a_indexsource:"var(--ok)",
+  c1a_source_split:"#fb923c", unfused:"#94a3b8", engran:"#f59e0b"
+};
+const FLAG_LABEL = {
+  implicit:"隐式", packed_variant:"packed", boundary_only:"边界", runner_hook:"runner钩子",
+  no_trace:"无trace", placeholder:"占位", fused:"融合", merged:"合并", no_impl:"未实现",
+  trace_only:"仅trace", external:"外部", declared_only:"声明未用"
+};
+const ST_LABEL = {ok:"ok",cache:"cache", "zero-init":"零初始化", optional:"可选",
+  unresolved:"未解析", in_place:"原地改写"};
+
+const state = {
+  layer: Number((location.hash.match(/layer=(\d+)/)||[])[1] || 0),
+  preset: (location.hash.match(/preset=([\w-]+)/)||[])[1] || "prefill",
+  view: (location.hash.match(/view=([\w-]+)/)||[])[1] || "default",
+  node: (location.hash.match(/op=([\w.@#:+%-]+)/)||[])[1] || null,
+  tab: (location.hash.match(/tab=(\w+)/)||[])[1] || "iface",
+  search: "",
+  kinds: new Set(),
+  collapsed: new Set(),
+  mode: (location.hash.match(/mode=(\w+)/)||[])[1] || "structure",
+};
+
+if (!PRESETS[state.preset]) state.preset = Object.keys(PRESETS)[0] || "prefill";
+const MODES = new Set(["structure", "catalog", "blueprint", "builder"]);
+if (!MODES.has(state.mode)) state.mode = "structure";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const colorOf = (kind) => KIND_COLOR[kind] || "var(--accent)";
+
+/* ───────────────────────── 形状求值（与 Python 同构） ───────────────────────── */
+function evalExpr(expr, env){
+  let s = String(expr).replace(/(\d)([A-Za-z_])/g, "$1*$2");
+  let i = 0;
+  const err = (m) => { throw new Error(m); };
+  const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  function parseE(){
+    let v = parseT();
+    for(;;){ ws(); if (s[i]==='+'){i++; v+=parseT();} else if (s[i]==='-'){i++; v-=parseT();} else return v; }
+  }
+  function parseT(){
+    let v = parseU();
+    for(;;){ ws();
+      if (s[i]==='*'){i++; v*=parseU();}
+      else if (s[i]==='/' && s[i+1]==='/'){i+=2; v=Math.floor(v/parseU());}
+      else if (s[i]==='%'){i++; v%=parseU();}
+      else return v;
+    }
+  }
+  function parseU(){
+    ws(); if (s[i]==='-'){i++; return -parseU();} if (s[i]==='+'){i++; return parseU();}
+    return parseP();
+  }
+  function parseP(){
+    ws();
+    if (s[i]==='('){ i++; const v=parseE(); ws(); if (s[i]!==')') err("缺少 )"); i++; return v; }
+    if (/[0-9]/.test(s[i]||"")){ let j=i; while(/[0-9]/.test(s[i]||"")) i++; return parseInt(s.slice(j,i),10); }
+    if (/[A-Za-z_]/.test(s[i]||"")){
+      let j=i; while(/[A-Za-z_0-9]/.test(s[i]||"")) i++;
+      const name = s.slice(j,i); ws();
+      if (s[i]==='('){ i++; const args=[]; ws();
+        if (s[i]!==')'){ args.push(parseE()); ws(); while(s[i]===','){i++; args.push(parseE()); ws();} }
+        if (s[i]!==')') err("缺少 )"); i++;
+        if (name==="min") return Math.min(...args);
+        if (name==="max") return Math.max(...args);
+        err("未知函数 "+name);
+      }
+      if (!(name in env)) err("未知符号 "+name);
+      return Number(env[name]);
+    }
+    err("无法解析形状: "+expr);
+  }
+  const v = parseE(); ws();
+  if (i !== s.length) err("多余字符: "+s.slice(i));
+  return v;
+}
+function splitTop(s){
+  const out=[]; let depth=0, cur="";
+  for (const ch of s){
+    if (ch==='('||ch==='[') depth++;
+    else if (ch===')'||ch===']') depth--;
+    if (ch===',' && depth===0){ out.push(cur); cur=""; }
+    else cur += ch;
+  }
+  if (cur.trim()) out.push(cur);
+  return out.map(x=>x.trim()).filter(Boolean);
+}
+function evalShape(shape, env){
+  if (!shape) return null;
+  const s = String(shape).trim();
+  try{
+    if (s.startsWith("[") && s.endsWith("]"))
+      return splitTop(s.slice(1,-1)).map(x=>evalExpr(x, env));
+    return evalExpr(s, env);
+  }catch(e){ return {error:e.message}; }
+}
+function ceilDiv(a,b){ return Math.ceil(a/b); }
+function envFor(presetKey, layer, phase){
+  const P = PRESETS[presetKey] || PRESETS[Object.keys(PRESETS)[0]] || {};
+  const d = (DATA.model && DATA.model.dims) || {};
+  const der = (DATA.model && DATA.model.derived) || {};
+  let T = Number(P.T || 1);
+  const li = Number(layer && layer.idx || 0);
+  if (phase === "compact") T = Number(P.W_cut || T);
+  else if (P.cut != null && li >= Number(P.cut)) T = Number(P.W || T);   // replay 层
+  else if (phase === "full" && P.cut != null) T = Number(P.T_main || T);
+  const ratio = Math.max(1, Number(layer && layer.ratio || 1));
+  const nblk = Math.max(1, ceilDiv(Math.max(Math.floor(T / ratio) + 1, 1), 128));
+  const env = {
+    H:d.hidden, I:d.moe_intermediate, Q_LORA:d.q_lora_rank, O_LORA:d.o_lora_rank,
+    O_GROUPS:d.o_groups, HEAD_DIM:d.head_dim, N_HEADS:d.n_attention_heads,
+    ROPE_DIM:d.qk_rope_head_dim, INDEX_N_HEADS:d.index_n_heads,
+    INDEX_HEAD_DIM:d.index_head_dim, INDEX_Q_DIM:der.index_q_dim,
+    INDEX_PACKED_D:der.index_packed_d, INDEX_TOPK:d.index_topk,
+    S:d.sliding_window, HC_MULT:d.hc_mult, N_EXPERTS:d.n_routed_experts,
+    TOPK:d.topk, WIN_SLOTS:der.win_pool_slots, KV_ROW_W:der.kv_row_width,
+    CMP_ROW_W:der.cmp_row_width, BS:128,
+    T, T_MAIN:Number(P.T_main||T), T_PASS:Number(P.T_pass||T),
+    W:Number(P.W||0), W_CUT:Number(P.W_cut||1), NSEQ:Number(P.NSEQ||1),
+    N:Number(P.N||1), B:Number(P.B||1),
+    L:Number(P.L||P.full_len||T), FULL_LEN:Number(P.full_len||T),
+    RATIO:ratio, ratio, NBLK:nblk, NBLK_CMP:nblk,
+    NBLK_IDX:Math.max(1, ceilDiv(Math.floor(T/ratio)+1,128)),
+    NBLK_FULL:Math.max(1, ceilDiv(T,128)),
+    E_LOCAL:Math.floor((d.n_routed_experts||1)/Math.max(1,((DATA.model.parallel||{}).moe_ep_size||1))),
+    E:Math.floor((d.n_routed_experts||1)/Math.max(1,((DATA.model.parallel||{}).moe_ep_size||1))),
+    POS_OFFSET:Number(P.pos_offset||0), CP_SIZE:Number(P.cp_size||1),
+  };
+  for (const [lo, up] of [["q_lora","Q_LORA"],["o_lora","O_LORA"],["o_groups","O_GROUPS"],
+      ["head_dim","HEAD_DIM"],["n_heads","N_HEADS"],["n_experts","N_EXPERTS"],
+      ["topk","TOPK"],["hc_mult","HC_MULT"],["index_topk","INDEX_TOPK"],
+      ["index_head_dim","INDEX_HEAD_DIM"],["index_n_heads","INDEX_N_HEADS"],
+      ["win_slots","WIN_SLOTS"],["kv_row_w","KV_ROW_W"],["cmp_row_w","CMP_ROW_W"],
+      ["rope_dim","ROPE_DIM"]]) env[lo]=env[up];
+  env.nblk=nblk; env.nblk_cmp=nblk; env.nblk_idx=env.NBLK_IDX; env.nblk_full=env.NBLK_FULL;
+  return env;
+}
+
+/* ───────────────────────── 树工具 ───────────────────────── */
+function walk(node, fn, parents){
+  parents = parents || [];
+  fn(node, parents);
+  for (const c of node.children || [])
+    if (node.kind === "container") walk(c, fn, parents.concat([node]));
+}
+function findNode(root, id){
+  let hit = null;
+  walk(root, n => { if (n.id === id && !hit) hit = n; });
+  return hit;
+}
+function leaves(node, out){
+  out = out || [];
+  if (node.kind === "container"){ for (const c of node.children||[]) leaves(c, out); }
+  else out.push(node);
+  return out;
+}
+function templateFor(layer, view){
+  if (!layer) return null;
+  if (view === "unfused") return { tid: "tpl:unfused", tpl: TEMPLATES["tpl:unfused"] };
+  const tid = (view === "split" && layer.split_template) ? layer.split_template : layer.template;
+  return { tid, tpl: TEMPLATES[tid] };
+}
+function opMeta(op){ return OP_CATALOG[op] || {}; }
+function kindOfLayer(l){ return l.kind; }
+function layerRoles(l){
+  const r = l.roles || {};
+  return [["kv",r.kv_source],["idx",r.index_source],["cand",r.candidate_source],["eng",r.engram]]
+    .filter(x=>x[1]).map(x=>x[0]);
+}
+
+/* ───────────────────────── 左栏 40 层 ───────────────────────── */
+function layerMatches(l, q){
+  if (!q) return true;
+  q = q.toLowerCase();
+  if ((l.kind + " " + JSON.stringify(l.roles||{})).toLowerCase().includes(q)) return true;
+  const t = templateFor(l, "default");
+  let hit = false;
+  if (t.tpl) walk(t.tpl.root, (n)=>{
+    if (hit) return;
+    if (String(n.id).toLowerCase().includes(q) || String(n.op||"").toLowerCase().includes(q)){ hit=true; return; }
+    const m = opMeta(n.op);
+    if (m.kernel && String(m.kernel).toLowerCase().includes(q)) hit = true;
+    for (const w of (m.weights||[])) if (String(w.suffix).toLowerCase().includes(q)) hit = true;
+  });
+  if (hit) return true;
+  return (l.weights||[]).some(w => String(w.key).toLowerCase().includes(q));
+}
+function visibleLayers(){
+  const q = state.search.trim();
+  return LAYERS.filter(l => (state.kinds.size===0 || state.kinds.has(l.kind)) && layerMatches(l,q));
+}
+function renderRail(){
+  const list = $("layerList");
+  const groups = [];
+  for (const l of visibleLayers()){
+    const key = l.kind + (l.engram ? "+engram" : "");
+    const last = groups[groups.length-1];
+    if (last && last.key === key) last.layers.push(l);
+    else groups.push({key, kind:l.kind, engram:l.engram, layers:[l]});
+  }
+  let html = "";
+  for (const g of groups){
+    const closed = state.collapsed.has(g.key);
+    html += `<div class="groupHead ${closed?"closed":""}" data-group="${esc(g.key)}">
+      <span class="tri">▾</span><span style="color:${colorOf(g.kind)}">●</span>
+      <span>${esc(g.key)}</span><span style="margin-left:auto" class="mono">×${g.layers.length}</span></div>`;
+    if (closed) continue;
+    for (const l of g.layers){
+      const t = templateFor(l, "default");
+      const w = (l.coverage && (l.coverage.unmapped||[]).length + (l.coverage.missing||[]).length) || 0;
+      const roles = layerRoles(l).map(r=>`<span class="role on">${r}</span>`).join("");
+      const T = envFor(state.preset, l, "same").T;
+      const replay = PRESETS[state.preset] && PRESETS[state.preset].cut != null &&
+        l.idx >= Number(PRESETS[state.preset].cut);
+      const tid = (templateFor(l,"default")||{}).tid || "";
+      html += `<div class="layer ${l.idx===state.layer?"sel":""}" data-layer="${l.idx}"
+        style="padding-left:18px" title="模板 ${esc(tid)}">
+        <span class="idx">${l.idx}</span>
+        <span class="dot" style="background:${colorOf(l.kind)}"></span>
+        <span class="kind">${esc(l.kind)}</span>
+        <span class="meta">${roles}${w?`<span class="err">⚠${w}</span>`:""}
+          <span class="${replay?"hot":""}">T${T}${replay?"↺":""}</span><span>r=${l.ratio}</span></span>
+      </div>`;
+    }
+  }
+  list.innerHTML = html || `<div class="empty">没有匹配的层（清空筛选/搜索试试）</div>`;
+  const vis = visibleLayers().length;
+  $("railCount").textContent = `${vis}/${LAYERS.length} 层 · ${Object.keys(TEMPLATES).length} 模板`;
+  list.querySelectorAll("[data-group]").forEach(el=>el.onclick=()=>{
+    const k = el.dataset.group;
+    if (state.collapsed.has(k)) state.collapsed.delete(k); else state.collapsed.add(k);
+    renderRail();
+  });
+  list.querySelectorAll("[data-layer]").forEach(el=>el.onclick=()=>{
+    state.layer = Number(el.dataset.layer);
+    state.view = "default";
+    state.node = null;
+    syncHash(); renderAll();
+  });
+}
+
+/* 层型筛选 chip */
+function renderChips(){
+  const kinds = [...new Set(LAYERS.map(l=>l.kind))];
+  $("kindChips").innerHTML = kinds.map(k=>{
+    const on = state.kinds.has(k);
+    return `<span class="chip ${on?"on":""}" data-kind="${esc(k)}"
+      style="${on?`background:${colorOf(k)};`:""}">${esc(k)}</span>`;
+  }).join("");
+  $("kindChips").querySelectorAll("[data-kind]").forEach(el=>el.onclick=()=>{
+    const k = el.dataset.kind;
+    if (state.kinds.has(k)) state.kinds.delete(k); else state.kinds.add(k);
+    renderChips(); renderRail();
+  });
+}
+
+/* ───────────────────────── 模块树 ───────────────────────── */
+function matchSearch(node){
+  const q = state.search.trim().toLowerCase();
+  if (!q) return true;
+  const m = opMeta(node.op);
+  const parts = [node.id, node.op, m.kernel, m.impl, ...(m.flags||[])];
+  for (const w of (m.weights||[])) parts.push(w.suffix);
+  for (const k of [...(node.iface?.requires||[]), ...(node.iface?.provides||[])]) parts.push(k.key);
+  return parts.filter(Boolean).join(" ").toLowerCase().includes(q);
+}
+function nodeOpen(node, depth){
+  if (state.search) return true;
+  if (node.kind !== "container") return false;
+  return ["attn","ffn","engram","attn.q_proj","attn.kv_proj","attn.indexer","ffn.moe"].includes(node.id)
+    || depth < 1;
+}
+function renderNode(node, depth){
+  if (node.kind === "container"){
+    const kids = node.children || [];
+    const hitKids = kids.filter(k => nodeMatchesRec(k));
+    const closed = !nodeOpen(node, depth) || state.collapsed.has("n:"+node.id);
+    const name = (DATA.diagnostics?.container_titles?.[node.id]) || node.name;
+    const tid = templateFor(LAYERS[state.layer], state.view)?.tid;
+    return `<div class="node ${closed?"closed":""}" data-node="${esc(node.id)}">
+      <div class="row" data-toggle="${esc(node.id)}">
+        <span class="tri">▾</span><span class="kindbar" style="background:${colorOf(LAYERS[state.layer].kind)}"></span>
+        <span class="containerName">${esc(name)}</span>
+        <span class="kchip">${kids.length}</span>
+        ${hitKids.length && state.search ? `<span class="badge hot">${hitKids.length} 命中</span>`:""}
+      </div>
+      <div class="children">${kids.map(c=>renderNode(c, depth+1)).join("")}</div>
+    </div>`;
+  }
+  const m = opMeta(node.op);
+  const flags = (m.flags||[]).filter(f=>f!=="placeholder").map(f=>
+    `<span class="badge">${esc(FLAG_LABEL[f]||f)}</span>`).join("");
+  const hit = matchSearch(node);
+  const sel = node.id === state.node;
+  return `<div class="node" data-node="${esc(node.id)}">
+    <div class="row ${sel?"sel":""} ${hit&&state.search?"hit":""}" data-leaf="${esc(node.id)}">
+      <span class="tri" style="visibility:hidden">▾</span>
+      <span class="opname">${esc(node.op)}</span>
+      <span class="kchip">${esc(m.kernel||"—")}</span>
+      ${flags}
+    </div>
+  </div>`;
+}
+function nodeMatchesRec(node){
+  if (node.kind !== "container") return matchSearch(node);
+  return (node.children||[]).some(nodeMatchesRec);
+}
+function renderTree(){
+  const layer = LAYERS[state.layer];
+  const {tid, tpl} = templateFor(layer, state.view) || {};
+  if (!tpl){ $("tree").innerHTML = `<div class="empty">没有模板</div>`; return; }
+  const root = tpl.root;
+  $("treeTitle").textContent = `层 ${layer.idx} · ${layer.kind}`;
+  $("tplBadge").textContent = tid;
+  $("tplBadge").title = "与前层相同的模板会被复用（templates 去重）";
+  $("tree").innerHTML = renderNode(root, 0);
+  $("tree").querySelectorAll("[data-toggle]").forEach(el=>el.onclick=(ev)=>{
+    ev.stopPropagation();
+    const id = el.dataset.toggle;
+    const node = el.closest(".node");
+    if (state.search){ node.classList.toggle("closed"); return; }
+    if (state.collapsed.has("n:"+id)) state.collapsed.delete("n:"+id);
+    else state.collapsed.add("n:"+id);
+    node.classList.toggle("closed");
+  });
+  $("tree").querySelectorAll("[data-leaf]").forEach(el=>el.onclick=(ev)=>{
+    ev.stopPropagation();
+    state.node = el.dataset.leaf;
+    state.tab = "iface";
+    syncHash(); renderTree(); renderDetail();
+  });
+  if (state.node){
+    const rootNode = findNode(root, state.node);
+    if (rootNode && rootNode.kind==="container") { /* 容器也能选 */ }
+  }
+}
+
+/* ───────────────────────── 详情面板 ───────────────────────── */
+const TABS = [["iface","上下文接口"],["weights","权重"],["shapes","形状 / 内核"],["src","源码 / 证据"]];
+function renderTabs(){
+  $("tabs").innerHTML = TABS.map(([k,t])=>
+    `<div class="tab ${state.tab===k?"on":""}" data-tab="${k}">${t}</div>`).join("");
+  $("tabs").querySelectorAll("[data-tab]").forEach(el=>el.onclick=()=>{
+    state.tab = el.dataset.tab; syncHash(); renderTabs(); renderDetail();
+  });
+}
+function nodeIface(node){
+  if (node.iface) return node.iface;
+  // 容器：汇总直接子模块的接口差集
+  const req = new Map(), prov = new Map();
+  for (const l of leaves(node)) for (const k of (l.iface?.requires||[])) req.set(k.key,k);
+  for (const l of leaves(node)) for (const k of (l.iface?.provides||[])) prov.set(k.key,k);
+  for (const k of prov.keys()) req.delete(k);
+  return {requires:[...req.values()], provides:[...prov.values()]};
+}
+function shapeCell(shape, layer, phase){
+  if (!shape) return "";
+  const env = envFor(state.preset, layer, phase||"same");
+  const v = evalShape(shape, env);
+  if (v && v.error) return `<span class="err">${esc(v.error)}</span>`;
+  return `<span class="mono">${esc(Array.isArray(v)?`[${v.join(", ")}]`:String(v))}</span>`;
+}
+function renderDetail(){
+  const layer = LAYERS[state.layer];
+  const {tid, tpl} = templateFor(layer, state.view) || {};
+  let node = null;
+  if (state.node && tpl) node = findNode(tpl.root, state.node);
+  if (!node){
+    $("dTitle").textContent = `层 ${layer.idx} · ${layer.kind}`;
+    $("dSub").innerHTML = `<span>${esc(tid||"")}</span><span>ratio=${layer.ratio}</span>` +
+      (layer.split_template?`<span>有 split 变体</span>`:"");
+    $("dBody").innerHTML = `<div class="note">点击左侧模块树里的任一容器 / 算子，查看它的
+      <b>上下文接口</b>、权重、形状与源码位置。</div>
+      <div class="sec">本层角色</div>
+      <div class="kv">${Object.entries(layer.roles||{}).map(([k,v])=>
+        `<div>${esc(k)}</div><div>${v?"✅":"—"}</div>`).join("")}</div>
+      <div class="sec">本层权重（${(layer.weights||[]).length}）</div>
+      ${weightTable(layer, null)}`;
+    return;
+  }
+  const iface = nodeIface(node);
+  $("dTitle").textContent = node.id;
+  const m = opMeta(node.op);
+  $("dSub").innerHTML = [
+    node.op?`<span class="mono">${esc(node.op)}</span>`:"",
+    node.kind==="container"?"容器":"算子",
+    m.module?`<span class="badge">Module ${esc(m.module)}</span>`:"",
+    node.kind==="container"?`<span class="mono">ns: ${esc(node.id)}.*</span>`:"",
+    m.kernel?`<span class="kchip">${esc(m.kernel)}</span>`:"",
+    ...(m.flags||[]).map(f=>`<span class="badge">${esc(FLAG_LABEL[f]||f)}</span>`),
+    node.rows_phase && node.rows_phase!=="same"?`<span class="badge">${esc(node.rows_phase)}</span>`:"",
+  ].filter(Boolean).join("");
+  let body = "";
+  if (state.tab === "iface"){
+    if (node.kind === "container"){
+      body += `<div class="note">容器本身<b>不存上下文</b>：下表是子模块接口的<b>差集</b>
+        （子模块内部提供又被消费的键已扣除）。子模块取不到的键会沿命名空间链向最近的祖先查询。</div>`;
+    }
+    body += `<div class="sec">requires（${iface.requires.length}）</div>` + reqTable(iface.requires, layer, node) +
+      `<div class="sec">provides（${iface.provides.length}）</div>` + provTable(iface.provides, layer, node) +
+      `<div class="sec">上下文流</div>` + flowView(iface, node);
+  } else if (state.tab === "weights"){
+    body += weightTable(layer, node);
+  } else if (state.tab === "shapes"){
+    body += shapeTable(node, layer, iface);
+  } else {
+    body += srcView(node, m);
+  }
+  $("dBody").innerHTML = body;
+  $("dBody").querySelectorAll("[data-key]").forEach(el=>el.onclick=()=>keyPivot(el.dataset.key));
+}
+function reqTable(reqs, layer, node){
+  if (!reqs.length) return `<div class="empty">无（容器汇总时子模块内部键已扣除）</div>`;
+  return `<table><thead><tr><th>键</th><th>形状</th><th>来源</th><th>状态</th></tr></thead><tbody>
+    ${reqs.map(k=>`<tr class="${k.status==="unresolved"?"warnrow":""}">
+      <td class="key" data-key="${esc(k.key)}">${esc(k.key)}${k.legacy&&k.legacy.length?`<span class="badge" title="legacy 别名">${esc(k.legacy.join(", "))}</span>`:""}${k.overload&&k.overload.length?`<span class="badge hot" title="${esc(k.overload.join(" / "))}">多义</span>`:""}</td>
+      <td>${k.shape?`<span class="mono">${esc(k.shape)}</span><br>${shapeCell(k.shape, layer, node.rows_phase)}`:"—"}</td>
+      <td class="mono">${esc(k.from||"—")}</td>
+      <td><span class="st ${esc(k.status)}">${esc(ST_LABEL[k.status]||k.status)}</span></td>
+    </tr>`).join("")}</tbody></table>`;
+}
+function provTable(provs, layer, node){
+  if (!provs.length) return `<div class="empty">无（本模块只读）</div>`;
+  return `<table><thead><tr><th>键</th><th>形状</th><th>写策略</th><th>后续消费者</th></tr></thead><tbody>
+    ${provs.map(k=>`<tr>
+      <td class="key" data-key="${esc(k.key)}">${esc(k.key)}</td>
+      <td>${k.shape?`<span class="mono">${esc(k.shape)}</span><br>${shapeCell(k.shape, layer, node.rows_phase)}`:"—"}</td>
+      <td><span class="st ${k.mutation==="in_place"?"in_place":"ok"}">${esc(k.mutation||"new")}</span>
+        ${k.shadow&&k.shadow!=="single_writer"?`<span class="badge">${esc(k.shadow)}</span>`:""}</td>
+      <td class="mono">${(k.consumers&&k.consumers.length)?k.consumers.map(esc).join("<br>"):"—"}</td>
+    </tr>`).join("")}</tbody></table>`;
+}
+function flowView(iface, node){
+  const providers = [...new Set((iface.requires||[]).map(k=>k.from).filter(Boolean))];
+  return `<div class="flow">
+    ${providers.map(p=>`<div class="item"><span class="mono">${esc(p)}</span><span class="arrow">→</span>
+      <b class="mono">${esc(node.id)}</b></div>`).join("")}
+    ${(iface.provides||[]).map(k=>`<div class="item"><b class="mono">${esc(node.id)}</b><span class="arrow">→</span>
+      <span class="mono">${esc(k.key)}</span>${(k.consumers||[]).length?`<span class="badge">${esc(k.consumers.join(", "))}</span>`:""}</div>`).join("")}
+  </div>`;
+}
+function weightTable(layer, node){
+  const rows = layer.weights || [];
+  let chosen = rows;
+  if (node && node.kind !== "container"){
+    const lid = node.id;
+    const own = rows.filter(w => (w.owners||[]).some(o => o === lid || o.startsWith(lid+"#")));
+    const extra = rows.filter(w => !own.includes(w) && (w.owners||[]).length === 0);
+    chosen = own.length ? own.concat(extra) : rows;
+  } else if (node && node.kind === "container"){
+    const prefix = node.id + ".";
+    chosen = rows.filter(w => (w.owners||[]).some(o => o === node.id || o.startsWith(prefix)));
+  }
+  if (!chosen.length) return `<div class="empty">本层没有匹配的权重</div>`;
+  return `<table><thead><tr><th>权重键</th><th>dtype</th><th>shape</th><th>打包</th><th>宿主模块</th></tr></thead><tbody>
+    ${chosen.map(w=>`<tr>
+      <td class="key mono">${esc(w.key)}${w.ignored?`<span class="badge" title="${esc(w.ignored)}">未读</span>`:""}</td>
+      <td class="mono">${esc(w.dtype)}</td>
+      <td class="mono">[${(w.shape||[]).map(esc).join(", ")}]</td>
+      <td>${w.packed?`<span class="st cache">_packed</span>`:"—"}</td>
+      <td class="mono">${(w.owners||[]).map(esc).join("<br>")||"—"}</td>
+    </tr>`).join("")}</tbody></table>`;
+}
+function shapeTable(node, layer, iface){
+  const m = opMeta(node.op);
+  const rows = [];
+  for (const k of iface.requires) if (k.shape) rows.push(["require", k.key, k.shape, k.storage]);
+  for (const k of iface.provides) if (k.shape) rows.push(["provide", k.key, k.shape, k.storage]);
+  for (const s of (m.shapes||[])) if (Array.isArray(s)) rows.push(["opgraph.in", "", `[${s.join(",")}]`, ""]);
+  let html = `<div class="sec">符号形状（按当前几何求值）</div>`;
+  if (!rows.length) html += `<div class="empty">没有形状声明</div>`;
+  else html += `<table><thead><tr><th>种</th><th>键</th><th>符号</th><th>求值</th></tr></thead><tbody>
+    ${rows.map(([kind,key,shape,storage])=>`<tr>
+      <td>${esc(kind)}</td><td class="key mono" ${key?`data-key="${esc(key)}"`:""}>${esc(key||"—")}</td>
+      <td class="mono">${esc(shape)}</td>
+      <td>${shapeCell(shape, layer, node.rows_phase)}</td></tr>`).join("")}</tbody></table>`;
+  html += `<div class="sec">内核 / 次数</div>
+    <div class="kv">
+      <div>kernel</div><div class="mono">${esc(m.kernel||"—")}</div>
+      <div>调用次数</div><div class="mono">${esc(m.calls ?? 1)}（opgraph count 按 ctx 求值）</div>
+      <div>impl</div><div class="mono">${esc(m.impl||"—")}</div>
+      <div>Module 类</div><div class="mono">${esc(m.module||"—")}</div>
+      <div>flags</div><div>${(m.flags||[]).map(f=>`<span class="badge">${esc(FLAG_LABEL[f]||f)}</span>`).join(" ")||"—"}</div>
+      ${m.dispatch?`<div>dispatch</div><div class="mono">${esc(m.dispatch)}</div>`:""}
+      ${m.intrinsics?`<div>融合内部</div><div class="mono">${esc(m.intrinsics.join(", "))}</div>`:""}
+    </div>`;
+  return html;
+}
+function srcView(node, m){
+  const s = m.source;
+  return `<div class="kv">
+      <div>文件</div><div class="mono">${s?`${esc(s.file)}:${s.line}-${s.end_line}`:"—"}</div>
+      <div>impl</div><div class="mono">${esc(m.impl||"—")}</div>
+      <div>flag</div><div>${(m.flags||[]).map(f=>`<span class="badge">${esc(FLAG_LABEL[f]||f)}</span>`).join(" ")||"—"}</div>
+    </div>
+    <div class="sec">opgraph note</div>
+    <div class="note">${esc(m.note||"—")}</div>
+    <div class="sec">trace 证据</div>
+    <div class="note mono" style="white-space:pre-wrap">${esc(m.trace||"—")}</div>
+    <div class="sec">模块说明</div>
+    <div class="note">${esc(m.doc||"—")}</div>`;
+}
+
+/* ───────────────────────── 键透视 ───────────────────────── */
+function keyPivot(key){
+  if (!key) return;
+  const rows = [];
+  for (const l of LAYERS){
+    for (const view of ["default"].concat(l.split_template?["split"]:[])){
+      const {tid, tpl} = templateFor(l, view) || {};
+      if (!tpl) continue;
+      walk(tpl.root, (n)=>{
+        for (const k of (n.iface?.provides||[])) if (k.key===key)
+          rows.push({layer:l.idx, tid, view, role:"提供", node:n.id});
+        for (const k of (n.iface?.requires||[])) if (k.key===key)
+          rows.push({layer:l.idx, tid, view, role:"消费", node:n.id, status:k.status, from:k.from});
+      });
+    }
+  }
+  openModal(`键透视 · ${key}`, rows.length ? `
+    <div class="note">共 ${rows.length} 处引用（跨 40 层；模板去重后同一模板会重复出现）。</div>
+    <table><thead><tr><th>层</th><th>视图</th><th>角色</th><th>模块</th><th>解析自 / 状态</th></tr></thead><tbody>
+    ${rows.map(r=>`<tr><td class="mono">${r.layer}</td><td>${esc(r.view)}</td>
+      <td>${r.role==="提供"?`<span class="st ok">提供</span>`:`<span class="st ${esc(r.status)}">消费</span>`}</td>
+      <td class="mono">${esc(r.node)}</td>
+      <td class="mono">${esc(r.from||"")}</td></tr>`).join("")}
+    </tbody></table>` : `<div class="empty">没有引用</div>`);
+}
+
+/* ───────────────────────── 诊断 / 变体对比 ───────────────────────── */
+function openModal(title, html){
+  $("modalTitle").textContent = title;
+  $("modalBody").innerHTML = html;
+  $("modal").hidden = false;
+}
+function closeModal(){ $("modal").hidden = true; }
+function renderHelp(){
+  openModal("这套模块规格怎么读", `
+    <div class="note">
+      <b>每个 op = 一个 Module 类</b>（共 41 个），类上声明它的<b>上下文接口</b>：
+      <code>requires</code>（要什么）与 <code>provides</code>（写到自己的字典里）。
+      容器（attn / ffn / indexer …）只做语义分组，<b>本身不存上下文</b>；
+      容器详情里的接口是子模块接口的差集。
+    </div>
+    <div class="note">
+      <b>插件开发工作流（四个模式，配置驱动）</b>：<br>
+      ① <b>积木库</b>：所有已注册模块（含未被配方使用的）；点卡片看接口、参数与“装在哪”。<br>
+      ② <b>组装蓝图</b>：配方段（recipes.yaml）与 40 层实际复用到的模板。<br>
+      ③ <b>模块构建器</b>：填写 requires/provides/weights/params + 选装配位置，
+      静态验证上下文，并生成 **YAML 配置片段**（不再生成 Python 类）。<br>
+      ④ <b>结构</b>：当前层/模板的完整模块树与逐节点接口。<br>
+      新增/修改模块：编辑 <code>modules/specs/model_modules.yaml</code>
+      （容器路径在 <code>modules/specs/recipe_map.yaml</code>，配方在
+      <code>recipes.yaml</code>）→ 跑 <code>tools/check_module_spec.py</code> 和
+      <code>export_model_html</code>，本页即更新。实现函数仍可放在
+      <code>exec_ops.py</code>（配置里的 <code>impl:</code> 指向它）。
+    </div>
+    <div class="note">
+      <b>解析规则</b>：模块取一个键时，先看自己的容器链（最近祖先），再沿命名空间向
+      上查到层 / 本次 forward / 进程常量；<code>cache.*</code> 不走词法链，而是找
+      “执行序最近的前序写者”（跨层池）。详情里的 <b>来源</b> 列就是解析到的祖先。
+      同一层里后执行的模块能看到前面模块 provides 上浮到层工作集的键。
+    </div>
+    <div class="note">
+      <b>多义键</b>（如 <code>position.offset</code> = 命中起点 / decode 位置 / compact 起点）
+      会打 <span class="badge hot">多义</span> 标记；<code>legacy</code> 别名对应现有 ctx/st
+      的扁平键（Phase 1.5 的 dict 适配器据此翻译）。
+    </div>
+    <div class="note">
+      <b>几何预设</b>只改变形状求值（T / replay 宽度 / CP compact），不改结构。
+      <b>视图</b>：层 20 可切到 <code>split</code>（SWA replay 截尾后的 compact 段，
+      含 idx_k_write / boundary_cut）；任何层可切到 <code>unfused</code> 看未融合 MoE 对照。
+    </div>
+    <div class="note">
+      <b>操作</b>：↑/↓ 切层，<code>/</code> 搜索（键/权重/算子/kernel），点键做“键透视”，
+      顶部“变体对比”看模板差异，“诊断”看未解析/权重覆盖/多义键。URL 可分享。
+    </div>
+    <div class="note">
+      <b>SSH 下不想下载 HTML？</b>
+      ① 端口转发 + 自动刷新：远端 <code>python3.11 tools/serve_viewer.py --port 8765</code>，
+      本地 <code>ssh -L 8765:127.0.0.1:8765 …</code>，浏览器开
+      <code>http://localhost:8765/</code>（改代码自动刷新）；
+      ② 终端 CLI：<code>tools/view_model.py layers|tree|op|plugin|catalog|blueprint|search</code>；
+      ③ 全屏 TUI：<code>tools/view_model.py tui</code>。
+    </div>
+    <div class="note">数据由 <code>python3.11 -m modules.export_model_html</code> 从
+      <code>recipes.yaml + opgraph + model_spec + weights_manifest</code> 静态生成；
+      运行时零改动。重建：<code>python3.11 tools/check_module_spec.py</code> 与
+      <code>JSDOM_PATH=… node tools/test_model_viewer.js</code>。</div>`);
+}
+function renderDiag(){
+  const d = DIAG;
+  const cov = d.coverage || {};
+  const buckets = [
+    ["unresolved","未解析", d.unresolved],
+    ["shadowed","遮蔽 / 双写", d.shadowed],
+    ["phantom","提供但本层未消费", d.phantom],
+    ["optional","可选未提供", d.optional],
+    ["overloads","多义键", d.overloads],
+    ["impl_missing","无实现（未融合链）", d.impl_missing],
+    ["weights.unmapped","权重未归属", (d.weights||{}).unmapped],
+    ["weights.missing","声明但清单缺失", (d.weights||{}).missing],
+  ];
+  let html = `<div class="two">
+    <div><div class="sec">覆盖</div><div class="kv">
+      <div>recipes 算子</div><div class="mono">${cov.recipes_ops}</div>
+      <div>opgraph 算子</div><div class="mono">${cov.opgraph_ops}</div>
+      <div>recipes − opgraph</div><div class="mono err">${esc((cov.missing_from_opgraph||[]).join(", ")||"—")}</div>
+      <div>opgraph − recipes</div><div class="mono">${esc((cov.declared_only||[]).join(", ")||"—")}</div>
+      <div>未融合链</div><div class="mono">${esc((cov.unfused||[]).join(", "))}</div>
+    </div></div>
+    <div><div class="sec">指纹</div><div class="kv">
+      ${Object.entries(DATA.fingerprint||{}).map(([k,v])=>`<div>${esc(k)}</div><div class="mono">${esc(v)}</div>`).join("")}
+      <div>环境开关</div><div class="mono">${esc(JSON.stringify(DATA.env_flags||{}))}</div>
+    </div></div>
+  </div>`;
+  for (const [key,label,arr] of buckets){
+    const list = arr || [];
+    html += `<div class="sec">${label}（${list.length}）</div>`;
+    if (!list.length){ html += `<div class="empty">无</div>`; continue; }
+    html += `<table><thead><tr><th>模板/层</th><th>模块</th><th>键 / 说明</th></tr></thead><tbody>
+      ${list.slice(0,300).map(it=>`<tr>
+        <td class="mono">${esc(it.template||it.layer||"")}</td>
+        <td class="mono">${esc(it.leaf||it.first||"")}</td>
+        <td class="mono">${esc(it.key||it.second||JSON.stringify(it.roles||it)||"")}</td>
+      </tr>`).join("")}</tbody></table>`;
+  }
+  openModal("诊断", html);
+}
+function renderDiff(){
+  const tids = Object.keys(TEMPLATES);
+  const opts = tids.map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join("");
+  let html = `<div class="note">选择两个模板对比算子 / 权重 / 接口差异。</div>
+    <div style="display:flex;gap:8px;margin:10px 0">
+      <select id="diffA">${opts}</select><span style="align-self:center">vs</span>
+      <select id="diffB">${opts}</select></div><div id="diffOut"></div>`;
+  openModal("变体对比", html);
+  const a = $("diffA"), b = $("diffB");
+  const prefer = (list, i) => tids.includes(list[i]) ? list[i] : tids[0];
+  a.value = prefer(["tpl:c2a_source","tpl:win","tpl:c1a_indexsource"],0);
+  b.value = prefer(["tpl:c1a_source_split:split","tpl:unfused","tpl:win+engram"],0);
+  function draw(){
+    const A = TEMPLATES[a.value], B = TEMPLATES[b.value];
+    if (!A || !B) return;
+    const sa = new Set(A.steps), sb = new Set(B.steps);
+    const added = B.steps.filter(x=>!sa.has(x));
+    const removed = A.steps.filter(x=>!sb.has(x));
+    const wA = new Set(weightsOfTemplate(a.value)), wB = new Set(weightsOfTemplate(b.value));
+    const wAdd = [...wB].filter(x=>!wA.has(x)), wDel = [...wA].filter(x=>!wB.has(x));
+    $("diffOut").innerHTML = `<div class="two">
+      <div><div class="sec">${esc(a.value)}</div><div class="note">${A.steps.length} 个算子</div></div>
+      <div><div class="sec">${esc(b.value)}</div><div class="note">${B.steps.length} 个算子</div></div></div>
+      <div class="sec">仅 ${esc(b.value)} 有</div>
+      <div class="note mono">${esc(added.join(", ")||"—")}</div>
+      <div class="sec">仅 ${esc(a.value)} 有</div>
+      <div class="note mono">${esc(removed.join(", ")||"—")}</div>
+      <div class="sec">权重差</div>
+      <div class="note mono">+ ${esc(wAdd.join(", ")||"—")}<br>- ${esc(wDel.join(", ")||"—")}</div>`;
+  }
+  a.onchange = draw; b.onchange = draw; draw();
+}
+function weightsOfTemplate(tid){
+  const out = new Set();
+  const tpl = TEMPLATES[tid];
+  if (!tpl) return [];
+  walk(tpl.root, n=>{ for (const w of (opMeta(n.op).weights||[])) out.add(w.suffix); });
+  return [...out];
+}
+
+/* ═══════════════════ 模式页：积木库 / 组装蓝图 / 构建器 ═══════════════════ */
+const catState = { q: "", cats: new Set(), unusedOnly: false };
+const builderState = {
+  op: "my_op", category: "attention", container: "attn.core", after: "",
+  kernel: "", impl: "", req: "hidden.x=[T,H]", prov: "act.my_out=[T,H]",
+  w: "", params: "", doc: "", tpl: "", pos: "__end__", segment: "attn_tail",
+};
+
+function camel(s){ return String(s||"").split(/[_@]+/).filter(Boolean)
+  .map(p=>p[0].toUpperCase()+p.slice(1)).join(""); }
+
+function renderModePage(){
+  if (state.mode === "catalog") return renderCatalog();
+  if (state.mode === "blueprint") return renderBlueprint();
+  if (state.mode === "builder") return renderBuilder();
+}
+
+/* ── 积木库 ───────────────────────────────────────────────────── */
+function renderCatalog(){
+  const plugs = DATA.plugin_catalog || [];
+  const cats = [...new Set(plugs.map(p=>p.category))].sort();
+  const q = catState.q.trim().toLowerCase();
+  const rows = plugs.filter(p =>
+    (!catState.cats.size || catState.cats.has(p.category)) &&
+    (!catState.unusedOnly || !p.used) &&
+    (!q || [p.op,p.module,p.kernel,p.impl,p.doc,p.category].filter(Boolean)
+      .join(" ").toLowerCase().includes(q)));
+  const chips = cats.map(c=>`<span class="chip ${catState.cats.has(c)?"on":""}"
+      data-cat="${esc(c)}" style="${catState.cats.has(c)?`background:${colorOf("win")};`:""}">
+      ${esc(c)} · ${plugs.filter(p=>p.category===c).length}</span>`).join("");
+  const cards = rows.map(p=>`<div class="plugCard" data-op="${esc(p.op)}">
+      <div class="top"><span class="op">${esc(p.op)}</span>
+        <span class="pill">${esc(p.category)}</span>
+        <span class="pill ${p.used?"used":"unused"}">${p.used?"已装配":"未使用"}</span></div>
+      <div class="meta"><span class="kchip">${esc(p.kernel||"—")}</span>
+        <span>${esc(p.module||"")}</span>
+        <span>req ${p.requires} · prov ${p.provides} · w ${p.weights}</span></div>
+      <div class="doc">${esc(p.doc||"")}</div>
+    </div>`).join("");
+  $("modePage").innerHTML = `
+    <div class="modeHead"><h2>积木库 · ${plugs.length} 个插件</h2>
+      <input id="catSearch" placeholder="搜索插件 / 内核 / 实现…" value="${esc(catState.q)}" style="width:240px">
+      <label style="color:var(--dim);font-size:11px"><input type="checkbox" id="catUnused" ${catState.unusedOnly?"checked":""}> 仅未使用</label>
+      <button id="catNew">＋ 新建模块</button></div>
+    <div class="chips" style="margin-bottom:12px">${chips}</div>
+    <div class="note">每个模块的接口与参数写在配置
+      <code>modules/specs/model_modules.yaml</code>（容器/路径在
+      <code>recipe_map.yaml</code>）；开发者改配置即可，不需要新建 Python 类。
+      父节点不必汇总子节点 I/O——子节点缺失的键沿祖先作用域解析。</div>
+    <div class="plugGrid">${cards||`<div class="empty">没有匹配的积木</div>`}</div>`;
+  $("catSearch").oninput = (e)=>{ catState.q = e.target.value; renderCatalog(); };
+  $("catUnused").onchange = (e)=>{ catState.unusedOnly = e.target.checked; renderCatalog(); };
+  $("catNew").onclick = ()=>{ state.mode="builder"; syncHash(); renderAll(); };
+  $("modePage").querySelectorAll("[data-cat]").forEach(el=>el.onclick=()=>{
+    const c = el.dataset.cat;
+    if (catState.cats.has(c)) catState.cats.delete(c); else catState.cats.add(c);
+    renderCatalog();
+  });
+  $("modePage").querySelectorAll("[data-op]").forEach(el=>el.onclick=()=>{
+    showPlugin(el.dataset.op);
+  });
+}
+
+function showPlugin(op){
+  const d = OP_CATALOG[op]; if (!d) return;
+  const layer = LAYERS[state.layer] || LAYERS[0];
+  const reqRows = (d.requires||[]).map(k=>`<tr>
+      <td class="key mono">${esc(k.key)}</td><td>${esc(k.type||"")}</td>
+      <td class="mono">${esc(k.shape||"—")}</td>
+      <td>${k.optional?`<span class="st optional">可选</span>`:"—"}</td>
+      <td class="mono">${esc(k.storage||"")}</td></tr>`).join("");
+  const provRows = (d.provides||[]).map(k=>`<tr>
+      <td class="key mono">${esc(k.key)}</td><td>${esc(k.type||"")}</td>
+      <td class="mono">${esc(k.shape||"—")}</td>
+      <td>${esc(k.mutation||"new")}</td>
+      <td class="mono">${esc(k.condition||"")}</td></tr>`).join("");
+  const wRows = (d.weights||[]).map(w=>{
+    const hit = (layer.weights||[]).find(x=>x.key===w.suffix);
+    return `<tr><td class="key mono">${esc(w.suffix)}</td>
+      <td class="mono">${esc(hit?hit.dtype:"")}</td>
+      <td class="mono">${hit?`[${hit.shape.join(", ")}]`:""}</td>
+      <td>${esc(w.via||"raw")}</td><td class="mono">${esc(w.condition||"")}</td></tr>`;
+  }).join("");
+  const u = d.used_in || {};
+  const used = (u.templates||[]).length ? `
+    <div class="sec">装在哪（${(u.layers||[]).length} 层）</div>
+    <div class="note">模板：<span class="mono">${esc((u.templates||[]).join(", "))}</span><br>
+      层：<span class="mono">${esc(rangeStr(u.layers||[]))}</span><br>
+      路径：<span class="mono">${esc((u.paths||[]).join(", "))}</span></div>`
+    : `<div class="sec">装在哪</div><div class="note">当前配方尚未使用这个积木（写进 recipes.yaml 后重新导出即可出现）。</div>`;
+  openModal(`积木 · ${op}`, `
+    <div class="note"><b>${esc(op)}</b> · ${esc(d.category||"")} ·
+      Module <span class="mono">${esc(d.module||"—")}</span> ·
+      kernel <span class="mono">${esc(d.kernel||"—")}</span> ·
+      impl <span class="mono">${esc(d.impl||"—")}</span><br>${esc(d.doc||"")}</div>
+    <div class="split2">
+      <div><div class="sec">requires（${(d.requires||[]).length}）</div>
+        <table><thead><tr><th>键</th><th>类型</th><th>形状</th><th>可选</th><th>存储</th></tr></thead>
+        <tbody>${reqRows||`<tr><td colspan="5" class="empty">无</td></tr>`}</tbody></table></div>
+      <div><div class="sec">provides（${(d.provides||[]).length}）</div>
+        <table><thead><tr><th>键</th><th>类型</th><th>形状</th><th>写策略</th><th>条件</th></tr></thead>
+        <tbody>${provRows||`<tr><td colspan="5" class="empty">无</td></tr>`}</tbody></table></div>
+    </div>
+    <div class="sec">权重（${(d.weights||[]).length}）</div>
+    <table><thead><tr><th>键</th><th>dtype</th><th>shape</th><th>打包</th><th>条件</th></tr></thead>
+    <tbody>${wRows||`<tr><td colspan="5" class="empty">无</td></tr>`}</tbody></table>
+    ${used}
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button id="plugJump" ${u.paths&&u.paths.length?"":"disabled"}>在结构中查看</button>
+      <button id="plugCode">复制 YAML 配置</button>
+      <button id="plugPy">复制 Python（旧）</button>
+    </div>`);
+  $("plugJump").onclick = ()=>{ closeModal(); jumpTo((u.templates||[])[0], (u.paths||[])[0]); };
+  $("plugCode").onclick = async ()=>{
+    const code = yamlSnippetFromCatalog(d);
+    try{ await navigator.clipboard.writeText(code); $("plugCode").textContent="已复制"; }
+    catch(e){ openModal("YAML 配置", `<div class="codeBox">${esc(code)}</div>`); }
+  };
+  $("plugPy").onclick = async ()=>{
+    const code = pySnippetFromCatalog(d);
+    try{ await navigator.clipboard.writeText(code); $("plugPy").textContent="已复制"; }
+    catch(e){ openModal("Python 声明（旧）", `<div class="codeBox">${esc(code)}</div>`); }
+  };
+}
+
+/* ── 组装蓝图 ─────────────────────────────────────────────────── */
+function rangeStr(layers){
+  if (!layers || !layers.length) return "";
+  const out = []; let a=layers[0], b=layers[0];
+  for (let i=1;i<layers.length;i++){
+    if (layers[i]===b+1){ b=layers[i]; continue; }
+    out.push(a===b?String(a):`${a}-${b}`); a=b=layers[i];
+  }
+  out.push(a===b?String(a):`${a}-${b}`);
+  return out.join(", ");
+}
+function renderBlueprint(){
+  const bp = DATA.blueprint || {};
+  let html = `<div class="modeHead"><h2>组装蓝图 ${esc(DATA.cfg_path||"")}</h2>
+    <span class="badge">${esc(bp.moe_key||"")}</span></div>
+    <div class="note">配方段 = 积木的**顺序表**；模板 = 40 层实际复用到的组合。
+      点任意积木跳到结构视图里对应位置。</div>`;
+  const segs = bp.segments || {};
+  html += `<div class="sec">配方段</div>`;
+  for (const [name, val] of Object.entries(segs)){
+    if (Array.isArray(val)){
+      html += `<div class="bpSection"><h3>${esc(name)}</h3>${segRow(val)}</div>`;
+    } else if (val && typeof val === "object"){
+      html += `<div class="bpSection"><h3>${esc(name)}</h3>`;
+      for (const [k, arr] of Object.entries(val)){
+        if (Array.isArray(arr))
+          html += `<div class="note" style="margin:4px 0 2px"><span class="mono">${esc(k)}</span></div>${segRow(arr)}`;
+      }
+      html += `</div>`;
+    }
+  }
+  html += `<div class="sec" style="margin-top:16px">模板 → 层</div>`;
+  for (const [tid, tpl] of Object.entries(TEMPLATES)){
+    const ls = LAYERS.filter(l=>l.template===tid || l.split_template===tid).map(l=>l.idx);
+    const leaves = tplLeaves(tid);
+    html += `<div class="bpSection">
+      <h3 style="display:flex;gap:8px;align-items:center">
+        <span class="mono" style="color:var(--txt)">${esc(tid)}</span>
+        <span class="pill">${esc(tpl.view||"default")}</span>
+        <span class="pill">${leaves.length} 个积木</span>
+        <span class="pill">${ls.length?`层 ${esc(rangeStr(ls))}`:"对照模板（不绑定层）"}</span></h3>
+      <div class="bpRow">${leaves.map((n,i)=>
+        `<span class="bpChip" data-tid="${esc(tid)}" data-node="${esc(n.id)}">${esc(n.op)}</span>`
+        + (i<leaves.length-1?`<span class="bpArrow">→</span>`:"")).join("")}</div>
+    </div>`;
+  }
+  $("modePage").innerHTML = html;
+  $("modePage").querySelectorAll("[data-node]").forEach(el=>el.onclick=()=>{
+    jumpTo(el.dataset.tid, el.dataset.node);
+  });
+}
+function segRow(arr){
+  return `<div class="bpRow">${arr.map((x,i)=>{
+    const ref = typeof x==="string" && x.startsWith("_");
+    return `<span class="bpChip ${ref?"ref":""}">${esc(x)}</span>` +
+      (i<arr.length-1?`<span class="bpArrow">→</span>`:"");
+  }).join("")}</div>`;
+}
+function tplLeaves(tid){
+  const t = TEMPLATES[tid]; if (!t) return [];
+  const out = []; walk(t.root, n=>{ if (n.kind !== "container") out.push(n); });
+  return out;
+}
+function jumpTo(tid, nodeId){
+  let layer = null, view = "default";
+  if (tid === "tpl:unfused"){ layer = LAYERS[0]; view = "unfused"; }
+  else {
+    layer = LAYERS.find(l=>l.template===tid);
+    if (!layer){ layer = LAYERS.find(l=>l.split_template===tid); view = "split"; }
+  }
+  if (!layer) return;
+  state.mode = "structure"; state.layer = layer.idx; state.view = view;
+  state.node = nodeId || null; state.tab = "iface";
+  syncHash(); renderAll();
+}
+
+/* ── 模块构建器 ───────────────────────────────────────────────── */
+function parseKeyLines(text){
+  return String(text||"").split("\n").map(x=>x.trim()).filter(x=>x && !x.startsWith("#"))
+    .map(line=>{
+      const optional = line.endsWith("?");
+      if (optional) line = line.slice(0,-1).trim();
+      const [k, shape] = line.split("=", 2).map(x=>x.trim());
+      return { key: k, shape: shape || "", type: shape ? "Tensor" : "int",
+               optional };
+    });
+}
+function tupleLit(items){ return items.length ? `(${items.join(", ")}${items.length===1?",":""})` : "()"; }
+function keyLit(r){
+  return r.shape ? `K("${r.key}", "${r.type||"Tensor"}", "${r.shape}")` : `K("${r.key}")`;
+}
+function pySnippetFromCatalog(d){
+  const req = tupleLit((d.requires||[]).map(keyLit));
+  const prov = tupleLit((d.provides||[]).map(keyLit));
+  const ws = tupleLit((d.weights||[]).map(w=>`W("${w.suffix}")`));
+  const after = tupleLit((d.after||[]).map(x=>`"${x}"`));
+  const cls = (d.module || (camel(d.op)+"Module"));
+  return `from modules.plugin import K, W, module
+from modules.registry import LeafModule
+
+
+@module(
+    op="${d.op}",
+    category="${d.category||"misc"}",
+    container="${d.container||""}",
+    after=${after},
+    requires=${req},
+    provides=${prov},
+    weights=${ws},
+    impl="${d.impl||""}",
+    kernel="${d.kernel||""}",
+    doc="${(d.doc||"").replace(/"/g, '\\"')}",
+)
+class ${cls}(LeafModule):
+    def execute(self, st, ctx, w):
+        from exec_ops import OPS
+        return OPS[self.OP](st, ctx, w)
+`;
+}
+/* 配置片段（2026-10-25）：模块定义写进 modules/specs/model_modules.yaml，
+   开发者改配置即可，不需要新建 Python 类。 */
+function yq(v){ return JSON.stringify(String(v)); }
+function yamlKey(k){
+  let s = `  - key: ${yq(k.key)}\n    type: ${yq(k.type || "int")}`;
+  if (k.shape) s += `\n    shape: ${yq(k.shape)}`;
+  if (k.optional) s += `\n    optional: true`;
+  return s;
+}
+function yamlList(name, items, fmt){
+  if (!items || !items.length) return `  ${name}: []\n`;
+  return `  ${name}:\n` + items.map(fmt).join("\n") + "\n";
+}
+function yamlSnippetFromCatalog(d){
+  let s = `- op: ${yq(d.op)}\n`;
+  s += `  category: ${yq(d.category || "misc")}\n`;
+  if (d.container) s += `  container: ${yq(d.container)}\n`;
+  if (d.impl) s += `  impl: ${yq(d.impl)}\n`;
+  if (d.kernel) s += `  kernel: ${yq(d.kernel)}\n`;
+  if ((d.after || []).length) s += `  after: [${d.after.map(yq).join(", ")}]\n`;
+  s += yamlList("requires", d.requires || [], yamlKey);
+  s += yamlList("provides", d.provides || [], yamlKey);
+  s += yamlList("weights", d.weights || [], w => `  - suffix: ${yq(w.suffix)}`);
+  if (d.params && Object.keys(d.params).length){
+    s += `  params:\n`;
+    for (const [k, v] of Object.entries(d.params))
+      s += `    ${k}: ${typeof v === "number" || typeof v === "boolean" ? String(v) : yq(v)}\n`;
+  }
+  if (d.doc) s += `  doc: ${yq(d.doc)}\n`;
+  return s;
+}
+function parseParams(text){
+  const out = {};
+  String(text || "").split("\n").map(x => x.trim()).filter(x => x && !x.startsWith("#"))
+    .forEach(line => {
+      const i = line.indexOf(":"); if (i < 0) return;
+      const k = line.slice(0, i).trim(), raw = line.slice(i + 1).trim();
+      out[k] = /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw)
+             : raw === "true" ? true : raw === "false" ? false
+             : raw.replace(/^["']|["']$/g, "");
+    });
+  return out;
+}
+function segmentOptions(){
+  const segs = (DATA.blueprint && DATA.blueprint.segments) || {};
+  const out = [];
+  for (const [k, v] of Object.entries(segs)){
+    if (Array.isArray(v)) out.push(k);
+    else if (v && typeof v === "object")
+      for (const kk of Object.keys(v)) out.push(`${k}.${kk}`);
+  }
+  return out;
+}
+function defaultTpl(){
+  return (LAYERS[0] && LAYERS[0].template) || Object.keys(TEMPLATES)[0] || "";
+}
+function parentOfLeaf(tid, nodeId){
+  let found = null;
+  walk(TEMPLATES[tid].root, (n, parents)=>{
+    if (n.id === nodeId) found = parents.length ? parents[parents.length-1].id : "layer";
+  });
+  return found;
+}
+function renderBuilder(){
+  if (!builderState.tpl) builderState.tpl = defaultTpl();
+  const cats = (DATA.builder && DATA.builder.categories) || ["misc"];
+  const conts = (DATA.builder && DATA.builder.containers) || [];
+  const tplOpts = Object.keys(TEMPLATES).map(t=>
+    `<option value="${esc(t)}" ${t===builderState.tpl?"selected":""}>${esc(t)}</option>`).join("");
+  const leaves = tplLeaves(builderState.tpl);
+  const posOpts = [`<option value="__end__" ${builderState.pos==="__end__"?"selected":""}>末尾</option>`]
+    .concat(leaves.map(n=>`<option value="${esc(n.id)}" ${n.id===builderState.pos?"selected":""}>
+      插入到 ${esc(n.id)} 之后</option>`)).join("");
+  $("modePage").innerHTML = `
+    <div class="modeHead"><h2>模块构建器</h2>
+      <span class="note" style="margin:0">定义接口 → 选装配位置 → 验证 → 生成 YAML 配置</span></div>
+    <div class="builderGrid">
+      <div>
+        <div class="bpSection"><h3>接口声明</h3>
+          ${formRow("算子名","bOp",builderState.op,"my_op")}
+          ${formRow("分类","bCat",builderState.category,null,"select",cats)}
+          ${formRow("容器","bContainer",builderState.container,null,"text",null,conts)}
+          ${formRow("配方段","bSegment",builderState.segment,null,"select",segmentOptions())}
+          ${formRow("顺序约束","bAfter",builderState.after,"逗号分隔的算子名（应先于本算子）")}
+          ${formRow("kernel","bKernel",builderState.kernel,"trace 里的内核名")}
+          ${formRow("impl","bImpl",builderState.impl,"exec_ops:_my_op")}
+          <div class="formRow"><label>requires</label>
+            <textarea id="bReq" spellcheck="false" placeholder="每行一个：key 或 key=[shape]；行尾 ? 表示可选">${esc(builderState.req)}</textarea></div>
+          <div class="formRow"><label>provides</label>
+            <textarea id="bProv" spellcheck="false" placeholder="每行一个：key 或 key=[shape]">${esc(builderState.prov)}</textarea></div>
+          <div class="formRow"><label>weights</label>
+            <textarea id="bW" spellcheck="false" placeholder="每行一个权重键；支持 {E} 专家模板">${esc(builderState.w)}</textarea></div>
+          <div class="formRow"><label>params</label>
+            <textarea id="bParams" spellcheck="false" placeholder="每行一个 key: value；支持 ${'${model.hidden}'} 这类祖先引用">${esc(builderState.params)}</textarea></div>
+          <div class="formRow"><label>说明</label>
+            <input id="bDoc" value="${esc(builderState.doc)}" placeholder="一句话说明"></div>
+        </div>
+        <div class="bpSection"><h3>装配位置</h3>
+          ${formRow("基线模板","bTpl",builderState.tpl,null,"select",Object.keys(TEMPLATES))}
+          ${formRow("插入点","bPos",builderState.pos,null,"select",null,null,posOpts)}
+          <div class="note">验证用的是**静态上下文链**：层/进程基线 + 插入点之前所有积木的 provides。
+            条件分支（ratio/CP）不做求值。</div>
+        </div>
+        <div style="display:flex;gap:8px;margin:10px 0">
+          <button id="bValidate">验证接口</button>
+          <button id="bGen">生成配置</button>
+          <button id="bCopy">复制 YAML</button>
+          <button id="bDownload">下载 .yaml</button>
+        </div>
+      </div>
+      <div>
+        <div class="bpSection"><h3>接口验证</h3><div id="bResult" class="note">点“验证接口”</div></div>
+        <div class="bpSection"><h3>模块配置（加到 modules/specs/model_modules.yaml 的 modules:）</h3>
+          <div class="codeBox" id="bCode">点“生成配置”</div></div>
+        <div class="bpSection"><h3>配方片段（加进 recipes.yaml）</h3>
+          <div class="codeBox" id="bRecipe" style="max-height:90px"></div></div>
+      </div>
+    </div>`;
+  bindBuilderInputs();
+  builderValidate(true);
+  builderGenerate(true);
+}
+function formRow(label,id,val,ph,kind,opts,list,rawOpts){
+  const v = esc(val||"");
+  if (kind==="select"){
+    const inner = rawOpts !== undefined ? rawOpts
+      : (opts||[]).map(o=>`<option value="${esc(o)}" ${o===val?"selected":""}>${esc(o)}</option>`).join("");
+    return `<div class="formRow"><label>${label}</label><select id="${id}">${inner}</select></div>`;
+  }
+  const dl = list ? `<datalist id="${id}List">${list.map(x=>`<option value="${esc(x)}"></option>`).join("")}</datalist>` : "";
+  return `<div class="formRow"><label>${label}</label>
+    <div>${dl}<input id="${id}" value="${v}" placeholder="${esc(ph||"")}"
+      ${list?`list="${id}List"`:""} style="width:100%"></div></div>`;
+}
+function bindBuilderInputs(){
+  const bind = (id,key,fn)=>{
+    const el=$(id); if(!el) return;
+    el.oninput = el.onchange = ()=>{ builderState[key] = el.value; if(fn) fn(); };
+  };
+  bind("bOp","op"); bind("bCat","category"); bind("bContainer","container");
+  bind("bSegment","segment");
+  bind("bAfter","after"); bind("bKernel","kernel"); bind("bImpl","impl");
+  bind("bReq","req"); bind("bProv","prov"); bind("bW","w");
+  bind("bParams","params"); bind("bDoc","doc");
+  $("bTpl").onchange = ()=>{ builderState.tpl = $("bTpl").value;
+    builderState.pos = "__end__"; renderBuilder(); };
+  $("bPos").onchange = ()=>{ builderState.pos = $("bPos").value; builderValidate(); };
+  $("bValidate").onclick = ()=>builderValidate();
+  $("bGen").onclick = ()=>builderGenerate();
+  $("bCopy").onclick = async ()=>{
+    const code = $("bCode").textContent;
+    try{ await navigator.clipboard.writeText(code); $("bCopy").textContent="已复制"; }
+    catch(e){ $("bCopy").textContent="复制失败"; }
+    setTimeout(()=>$("bCopy").textContent="复制 YAML", 1200);
+  };
+  $("bDownload").onclick = ()=>{
+    const code = $("bCode").textContent;
+    const op = (builderState.op || "my_op").replace(/[^a-z0-9_]/gi, "_");
+    try{
+      const blob = new Blob([code], {type: "text/yaml"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = op + ".yaml";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+    }catch(e){ openModal("模块配置", `<div class="codeBox">${esc(code)}</div>`); }
+  };
+}
+function builderValidate(silent){
+  const tid = builderState.tpl || defaultTpl();
+  const leaves = tplLeaves(tid);
+  const providers = new Map();
+  for (const k of ((DATA.builder||{}).base_providers||[])) providers.set(k, "层/进程基线");
+  for (const leaf of leaves){
+    if (leaf.id === builderState.pos) break;
+    for (const p of (leaf.iface?.provides||[])) providers.set(p.key, leaf.id);
+  }
+  const rows = parseKeyLines(builderState.req).map(r=>{
+    let from = providers.get(r.key);
+    if (!from && r.key.startsWith("cache.")) from = "cache 写者 / 零初始化";
+    return {...r, from, status: from ? "ok" : (r.optional ? "optional" : "unresolved")};
+  });
+  const provs = parseKeyLines(builderState.prov);
+  const shadows = provs.filter(p=>providers.has(p.key) && !p.key.startsWith("cache."));
+  const bad = rows.filter(r=>r.status==="unresolved");
+  const path = `${(builderState.container||"?").replace(/\.$/,"")}.${builderState.op||"?"}`;
+  const parent = builderState.pos === "__end__" ? "layer"
+    : (parentOfLeaf(tid, builderState.pos) || "?");
+  const declared = (builderState.container||"").replace(/\.$/,"");
+  const mismatch = declared && parent !== "layer" && parent !== declared &&
+    !parent.startsWith(declared + ".") && !declared.startsWith(parent + ".");
+  if (!silent){
+    const at = builderState.pos === "__end__" ? leaves.length
+      : Math.max(0, leaves.findIndex(l=>l.id===builderState.pos) + 1);
+    const around = leaves.slice(Math.max(0, at-3), at)
+      .concat([{id:"__new__", op:builderState.op || "?", kind:"op"}])
+      .concat(leaves.slice(at, at+2));
+    $("bResult").innerHTML = `
+      <div class="note">插入路径：<span class="mono">${esc(path)}</span> ·
+        插入点容器 <span class="mono">${esc(parent)}</span> ·
+        基线 <span class="mono">${esc(tid)}</span> ·
+        ${bad.length?`<span class="err">${bad.length} 个未解析</span>`:`<span class="st ok">接口满足</span>`}</div>
+      ${mismatch?`<div class="note err">容器不一致：声明 ${esc(declared)}，插入点在 ${esc(parent)}
+        （检查 container 或换插入点）</div>`:""}
+      <div class="sec">插入预览</div>
+      <div class="bpRow">${around.map((n,i)=>{
+        const isNew = n.id === "__new__";
+        return `<span class="bpChip ${isNew?"hot":""}" style="${isNew?`border-color:var(--accent);color:var(--accent);font-weight:600`:""}">${esc(n.op)}</span>` +
+          (i<around.length-1?`<span class="bpArrow">→</span>`:"");
+      }).join("")}</div>
+      <table><thead><tr><th>requires</th><th>形状</th><th>状态</th><th>解析自</th></tr></thead><tbody>
+      ${rows.map(r=>`<tr class="${r.status==="unresolved"?"warnrow":""}">
+        <td class="key mono">${esc(r.key)}</td><td class="mono">${esc(r.shape||"—")}</td>
+        <td><span class="st ${esc(r.status)}">${esc(ST_LABEL[r.status]||r.status)}</span></td>
+        <td class="mono">${esc(r.from||"—")}</td></tr>`).join("")}
+      </tbody></table>
+      ${shadows.length?`<div class="note err">provides 会覆盖已有键：${esc(shadows.map(s=>s.key).join(", "))}</div>`:""}`;
+  }
+  return {rows, shadows, path, bad};
+}
+function builderGenerate(silent){
+  const d = {
+    op: builderState.op || "my_op",
+    category: builderState.category || "misc",
+    container: builderState.container || "",
+    after: builderState.after.split(",").map(x=>x.trim()).filter(Boolean),
+    requires: parseKeyLines(builderState.req).map(r=>({key:r.key, type:r.type, shape:r.shape})),
+    provides: parseKeyLines(builderState.prov).map(r=>({key:r.key, type:r.type, shape:r.shape})),
+    weights: builderState.w.split("\n").map(x=>x.trim()).filter(Boolean).map(x=>({suffix:x})),
+    impl: builderState.impl || `exec_ops:_${builderState.op}`,
+    kernel: builderState.kernel || "",
+    params: parseParams(builderState.params),
+    doc: builderState.doc || "",
+  };
+  const code = yamlSnippetFromCatalog(d);
+  $("bCode").textContent = code;
+  if ($("bRecipe")){
+    $("bRecipe").textContent =
+      `# recipes.yaml → ${builderState.segment || "?"} 段内加一行：\n- ${d.op}`;
+  }
+  return code;
+}
+
+/* ───────────────────────── 顶栏 / 状态 / 启动 ───────────────────────── */
+function renderPresets(){
+  $("presetSel").innerHTML = Object.entries(PRESETS).map(([k,p])=>
+    `<option value="${esc(k)}" ${k===state.preset?"selected":""}>${esc(p.desc||k)}</option>`).join("");
+  $("presetSel").onchange = ()=>{ state.preset = $("presetSel").value; syncHash(); renderAll(); };
+}
+function renderViewSel(){
+  const l = LAYERS[state.layer];
+  const opts = [["default","默认视图"]];
+  if (l && l.split_template) opts.push(["split","边界 split（截尾后 compact）"]);
+  const ef = TEMPLATES["tpl:unfused"] ? [["unfused","MoE 未融合链（对照）"]] : [];
+  $("viewSel").innerHTML = opts.concat(ef).map(([k,t])=>
+    `<option value="${k}" ${k===state.view?"selected":""}>${esc(t)}</option>`).join("");
+  $("viewSel").onchange = ()=>{
+    state.view = $("viewSel").value; state.node = null;
+    syncHash(); renderAll();
+  };
+}
+function syncHash(){
+  const h = `#mode=${state.mode}&layer=${state.layer}&preset=${state.preset}&view=${state.view}` +
+    (state.node?`&op=${encodeURIComponent(state.node)}`:"") + `&tab=${state.tab}`;
+  history.replaceState(null, "", h);
+}
+function applyTheme(theme){
+  document.documentElement.dataset.theme = theme;
+  $("themeBtn").textContent = theme === "dark" ? "☾" : "☀";
+  try{ localStorage.setItem("ds41m.viewer.theme", theme); }catch(e){}
+}
+function renderSubtitle(){
+  const m = DATA.model || {};
+  const p = PRESETS[state.preset] || {};
+  $("subtitle").textContent =
+    `${m.n_layers} 层 · hidden ${m.dims?.hidden} · EP${m.parallel?.moe_ep_size} · ` +
+    `${DATA.cfg_path||""} · ${p.desc||""}`;
+}
+function renderAll(){
+  renderSubtitle(); renderPresets(); renderViewSel();
+  const isStruct = state.mode === "structure";
+  document.querySelector(".layout").style.display = isStruct ? "" : "none";
+  $("modePage").hidden = isStruct;
+  document.querySelectorAll("#modeSwitch button").forEach(b=>
+    b.classList.toggle("on", b.dataset.mode === state.mode));
+  if (!isStruct){ renderModePage(); return; }
+  renderRail(); renderChips();
+  renderTree(); renderTabs(); renderDetail();
+  const l = LAYERS[state.layer];
+  $("crumbs").innerHTML = `<b>模型</b><span>/</span><b>层 ${l.idx}</b>
+    <span>/</span><span>${esc(l.kind)}</span>` +
+    (state.node?`<span>/</span><b class="mono">${esc(state.node)}</b>`:``);
+}
+/* 调试/测试入口（jsdom 回归与人工排障用；不参与渲染逻辑） */
+window.__DS41M_VIEWER__ = {DATA, state, evalShape, envFor, PRESETS, TEMPLATES, LAYERS,
+  renderAll, keyPivot, renderDiag, renderDiff, renderHelp};
+
+function init(){
+  let theme = "dark";
+  try{ theme = localStorage.getItem("ds41m.viewer.theme") || "dark"; }catch(e){}
+  applyTheme(theme);
+  $("themeBtn").onclick = ()=> applyTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
+  $("helpBtn").onclick = renderHelp;
+  $("diagBtn").onclick = renderDiag;
+  document.querySelectorAll("#modeSwitch button").forEach(b=>{
+    b.onclick = ()=>{ state.mode = b.dataset.mode; syncHash(); renderAll(); };
+  });
+  $("diffBtn").onclick = renderDiff;
+  $("modalClose").onclick = closeModal;
+  $("modal").onclick = (e)=>{ if (e.target === $("modal")) closeModal(); };
+  $("linkBtn").onclick = async ()=>{
+    syncHash();
+    try{ await navigator.clipboard.writeText(location.href); $("linkBtn").textContent = "已复制"; }
+    catch(e){ $("linkBtn").textContent = location.href; }
+    setTimeout(()=>$("linkBtn").textContent="复制深链", 1200);
+  };
+  $("search").oninput = (e)=>{ state.search = e.target.value; renderRail(); renderTree(); };
+  if (!LAYERS.length){ $("tree").innerHTML = `<div class="empty">数据为空：请先运行导出器。</div>`; return; }
+  state.layer = Math.min(state.layer, LAYERS.length-1);
+  renderAll();
+}
+document.addEventListener("keydown", (e)=>{
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowDown" || e.key === "j"){
+    state.layer = Math.min(LAYERS.length-1, state.layer+1); state.view="default"; state.node=null;
+    syncHash(); renderAll(); e.preventDefault();
+  } else if (e.key === "ArrowUp" || e.key === "k"){
+    state.layer = Math.max(0, state.layer-1); state.view="default"; state.node=null;
+    syncHash(); renderAll(); e.preventDefault();
+  } else if (e.key === "/"){
+    $("search").focus(); e.preventDefault();
+  } else if (e.key === "Escape"){ closeModal(); }
+});
+init();
+</script>
+</body>
+</html>

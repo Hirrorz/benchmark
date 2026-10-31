@@ -1,0 +1,65 @@
+/* ══════════════════════════════════════════════════════════════════════════
+ * 布局包公共样式：打印、动效、新壳层的通用细节
+ *   - 只在 body.lp-* 作用域内生效，不碰基础层的变量与组件规则
+ *   - 绝不重定义 .hidden / .adv-only（这两个是 JS 的显隐契约）
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* 新壳层统一 z 轴：导航 70 / 底栏 80 / 弹层 150 / toast 200（基础层 60 顶栏） */
+body.lp-studio #lpStudioRail { z-index: 70; }
+body.lp-bento #lpBentoBar   { z-index: 80; }
+
+/* 键盘可见焦点（基础层部分控件没有 focus-visible 样式） */
+body.lp-studio .lp-rail-btn:focus-visible,
+body.lp-bento .lp-bar-btn:focus-visible {
+  outline: 2px solid var(--primary-2, #8b5cf6);
+  outline-offset: 2px;
+}
+
+/* 打印：隐藏壳层、展开被折叠的内容、恢复白底 */
+@media print {
+  #lpStudioRail, #lpBentoBar { display: none !important; }
+
+  body.lp-studio .layout,
+  body.lp-bento .layout {
+    grid-template-columns: 1fr !important;
+    padding: 0 0 24px !important;
+    max-width: none !important;
+  }
+  body.lp-bento #configCol { display: block !important; }
+  body.lp-bento #configCol > .card { grid-column: auto !important; }
+
+  body.lp-studio .card,
+  body.lp-bento .card {
+    background: #fff !important;
+    color: #111 !important;
+    box-shadow: none !important;
+    border: 1px solid #ccc !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+  body.lp-bento .card.cat > .cardhead {
+    background: none !important;
+    color: #111 !important;
+    border-bottom: 1px solid #ddd !important;
+  }
+  body.lp-bento .card.cat > .cardhead h2,
+  body.lp-bento .card.cat > .cardhead .hint,
+  body.lp-bento .card.cat > .cardhead .badge { color: #111 !important; }
+
+  body.lp-studio pre.term,
+  body.lp-bento pre.term {
+    background: #f7f7f7 !important;
+    color: #111 !important;
+    border: 1px solid #ccc !important;
+  }
+}
+
+/* 尊重系统动效偏好 */
+@media (prefers-reduced-motion: reduce) {
+  body.lp-studio *,
+  body.lp-bento * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

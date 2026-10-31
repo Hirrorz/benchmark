@@ -1,0 +1,204 @@
+/* ══════════════════════════════════════════════════════════════════════════
+ * 变体 A「工作台 Studio」—— 极光玻璃（深色，默认）/ 糖果渐变（浅色）
+ *
+ * 版式：78px 左导航 | 配置区 | 320–380px 右侧预览
+ * 所有规则都带 body.lp-studio 前缀，优先级高于基础层同名规则。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 令牌：深色 = 极光玻璃 ─────────────────────────────────────────────── */
+html[data-theme="dark"] body.lp-studio {
+  --bg: #070b16; --bg-subtle: #0c1322;
+  --card: rgba(17, 26, 46, .72); --card-2: rgba(11, 17, 33, .82);
+  --ink: #e8edff; --ink-2: #c3cdf0; --muted: #98a6c9; --faint: #7f8db2;
+  --line: rgba(126, 153, 214, .20); --line-2: rgba(126, 153, 214, .11);
+  --line-strong: rgba(150, 180, 240, .38);
+  --primary: #8b5cf6; --primary-2: #c4b5fd; --primary-hover: #7c3aed;
+  --primary-weak: rgba(139, 92, 246, .16); --primary-line: rgba(167, 139, 250, .45);
+  --on-primary: #ffffff;
+  --success: #34d399; --success-bg: rgba(52, 211, 153, .12); --success-line: rgba(52, 211, 153, .35);
+  --warn: #fbbf24; --warn-bg: rgba(251, 191, 36, .12); --warn-line: rgba(251, 191, 36, .35);
+  --danger: #fb7185; --danger-bg: rgba(251, 113, 133, .12); --danger-line: rgba(251, 113, 133, .35);
+  --topbar-bg: rgba(7, 11, 22, .82);
+  --radius: 16px; --radius-s: 12px; --radius-xs: 9px;
+  --shadow-1: 0 18px 40px rgba(2, 6, 18, .45);
+  --shadow-2: 0 26px 60px rgba(2, 6, 18, .60);
+  --focus-ring: rgba(139, 92, 246, .35);
+}
+
+/* ── 令牌：浅色 = 糖果 ─────────────────────────────────────────────────── */
+html[data-theme="light"] body.lp-studio {
+  --bg: #f7f7fb; --bg-subtle: #eef0f8; --card: #ffffff; --card-2: #fbfbff;
+  --ink: #1a1230; --ink-2: #42355e; --muted: #6b6183; --faint: #8b81a6;
+  --line: #e7e3f3; --line-2: #f1eefa; --line-strong: #d7d0ee;
+  --primary: #7c3aed; --primary-2: #6d28d9; --primary-hover: #6d28d9;
+  --primary-weak: #f3eeff; --primary-line: #ddd0fb; --on-primary: #ffffff;
+  --radius: 16px; --radius-s: 12px; --radius-xs: 9px;
+  --shadow-1: 0 1px 2px rgba(26, 18, 48, .04), 0 10px 28px rgba(26, 18, 48, .07);
+  --shadow-2: 0 18px 44px rgba(26, 18, 48, .12);
+  --topbar-bg: rgba(247, 247, 251, .82);
+  --focus-ring: rgba(124, 58, 237, .22);
+}
+
+/* ── 背景：极光 / 糖果 ─────────────────────────────────────────────────── */
+html[data-theme="dark"] body.lp-studio {
+  background:
+    radial-gradient(1200px 700px at 4% -12%, rgba(124, 58, 237, .42), transparent 60%),
+    radial-gradient(1000px 640px at 104% 0%, rgba(6, 182, 212, .28), transparent 58%),
+    radial-gradient(900px 700px at 50% 118%, rgba(244, 114, 182, .20), transparent 62%),
+    #070b16;
+  background-attachment: fixed;
+}
+html[data-theme="light"] body.lp-studio {
+  background:
+    radial-gradient(1100px 640px at 4% -10%, rgba(167, 139, 250, .34), transparent 60%),
+    radial-gradient(920px 600px at 104% 0%, rgba(125, 211, 252, .34), transparent 58%),
+    radial-gradient(900px 640px at 50% 116%, rgba(251, 207, 232, .46), transparent 62%),
+    #f7f7fb;
+  background-attachment: fixed;
+}
+
+/* ── 三栏骨架 ──────────────────────────────────────────────────────────── */
+body.lp-studio .layout {
+  grid-template-columns: 78px minmax(0, 1fr) minmax(320px, 380px);
+  gap: 20px;
+}
+body.lp-studio .layout.rail-collapsed {
+  grid-template-columns: 78px minmax(0, 1fr) 60px;
+}
+/* 生成的脚本通栏：左导航+配置/右侧栏两行；脚本占右两列的第一行 */
+body.lp-studio #outBand { grid-column: 2 / -1; grid-row: 1; }
+body.lp-studio #lpStudioRail { grid-column: 1; grid-row: 1 / span 3; }
+body.lp-studio #configCol { grid-column: 2; grid-row: 2; }
+body.lp-studio #sideRail { grid-column: 3; grid-row: 2; }
+body.lp-studio #outBottom { grid-column: 2 / -1; grid-row: 3; }
+
+/* ── 左导航 ────────────────────────────────────────────────────────────── */
+body.lp-studio #lpStudioRail {
+  position: sticky; top: 84px; align-self: start;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 8px 8px; border-radius: 18px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), var(--shadow-1);
+}
+body.lp-studio .lp-rail-brand {
+  display: flex; flex-direction: column; align-items: center; gap: 0;
+  padding: 2px 0 6px;
+}
+body.lp-studio .lp-rail-logo {
+  font-weight: 800; font-size: 14px; letter-spacing: .04em;
+  background: linear-gradient(135deg, #a78bfa, #22d3ee);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+body.lp-studio .lp-rail-ver { font-size: 9px; color: var(--faint); letter-spacing: .08em; }
+body.lp-studio .lp-rail-cap {
+  font-size: 9px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--faint); text-align: center; margin: 4px 0 2px;
+}
+body.lp-studio .lp-rail-group { display: flex; flex-direction: column; gap: 3px; }
+body.lp-studio .lp-rail-sep { height: 1px; background: var(--line); margin: 6px 4px; }
+
+body.lp-studio .lp-rail-btn {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 7px 2px 6px; width: 100%;
+  border: 1px solid transparent; border-radius: 12px; background: transparent;
+  color: var(--muted); font: inherit; cursor: pointer;
+  transition: background .16s ease, color .16s ease, box-shadow .16s ease;
+}
+body.lp-studio .lp-rail-btn:hover { background: var(--bg-subtle); color: var(--ink); }
+body.lp-studio .lp-rail-btn.on {
+  color: #fff; background: linear-gradient(135deg, #7c3aed, #0e7490);
+  box-shadow: 0 8px 22px rgba(124, 58, 237, .34);
+}
+body.lp-studio .lp-rail-ico { display: inline-flex; }
+body.lp-studio .lp-rail-ico svg {
+  width: 17px; height: 17px; fill: none; stroke: currentColor;
+  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+}
+body.lp-studio .lp-rail-label {
+  font-size: 9.5px; line-height: 1.15; letter-spacing: .01em; white-space: nowrap;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+}
+
+body.lp-studio .lp-rail-status {
+  margin-top: 6px; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 7px 2px; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--bg-subtle); color: var(--muted); font: inherit; font-size: 9.5px;
+  cursor: pointer; transition: .16s;
+}
+body.lp-studio .lp-rail-status i {
+  width: 7px; height: 7px; border-radius: 999px; background: currentColor; display: block;
+}
+body.lp-studio .lp-rail-status.ok { color: var(--success); border-color: var(--success-line); }
+body.lp-studio .lp-rail-status.warn { color: var(--warn); border-color: var(--warn-line); }
+body.lp-studio .lp-rail-status.err { color: var(--danger); border-color: var(--danger-line); }
+body.lp-studio .lp-rail-status:hover { filter: brightness(1.12); }
+
+/* ── 卡片：玻璃 ────────────────────────────────────────────────────────── */
+html[data-theme="dark"] body.lp-studio .card {
+  background: linear-gradient(160deg, rgba(23, 32, 54, .80), rgba(10, 16, 31, .72));
+  border-color: var(--line);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), var(--shadow-1);
+}
+html[data-theme="dark"] body.lp-studio .card:hover {
+  border-color: var(--line-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08), var(--shadow-2);
+}
+html[data-theme="light"] body.lp-studio .card { box-shadow: var(--shadow-1); }
+
+/* 顶栏：与页面同色的玻璃条 */
+html[data-theme="dark"] body.lp-studio .topbar {
+  background: linear-gradient(90deg, rgba(7, 11, 22, .90), rgba(22, 16, 44, .82));
+  border-bottom: 1px solid rgba(125, 211, 252, .16);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+/* 主按钮 / 选中态：紫→青 渐变 */
+body.lp-studio .btn.primary {
+  background: linear-gradient(135deg, #7c3aed, #0e7490);
+  box-shadow: 0 10px 26px rgba(124, 58, 237, .32);
+}
+body.lp-studio .btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+body.lp-studio .tab.on {
+  background: linear-gradient(135deg, #7c3aed, #0e7490);
+  box-shadow: 0 6px 18px rgba(124, 58, 237, .30);
+}
+body.lp-studio pre.term {
+  background: linear-gradient(180deg, #061018, #0a1a2e);
+  border-color: rgba(125, 211, 252, .18);
+}
+body.lp-studio .stepbadge {
+  background: var(--primary-weak); color: var(--primary-2); border-color: var(--primary-line);
+}
+
+/* ── 窄屏：导航变成顶部横条 ────────────────────────────────────────────── */
+@media (max-width: 1180px) {
+  body.lp-studio .layout {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 16px 14px 72px;
+  }
+  body.lp-studio #outBand,
+  body.lp-studio #lpStudioRail,
+  body.lp-studio #configCol,
+  body.lp-studio #sideRail,
+  body.lp-studio #outBottom { grid-column: 1; grid-row: auto; }
+  body.lp-studio #lpStudioRail {
+    position: static; top: auto; width: auto;
+    flex-direction: row; align-items: center; gap: 6px;
+    padding: 8px 10px; overflow-x: auto; scrollbar-width: none;
+  }
+  body.lp-studio #lpStudioRail::-webkit-scrollbar { display: none; }
+  body.lp-studio .lp-rail-brand,
+  body.lp-studio .lp-rail-cap,
+  body.lp-studio .lp-rail-sep { display: none; }
+  body.lp-studio .lp-rail-group { flex-direction: row; gap: 4px; }
+  body.lp-studio .lp-rail-btn { flex-direction: row; gap: 6px; padding: 6px 10px; width: auto; }
+  body.lp-studio .lp-rail-label { font-size: 11px; }
+  body.lp-studio .lp-rail-status { margin: 0 0 0 auto; flex-direction: row; gap: 6px; padding: 6px 10px; }
+}

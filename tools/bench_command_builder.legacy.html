@@ -1,0 +1,1297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DS4.1 mini Benchmark · 命令构建器</title>
+<style>
+  :root{
+    --navy:#0B2545; --navy2:#12365f; --teal:#13A89E; --bg:#F5F7FA; --white:#fff;
+    --ink:#1B2A41; --muted:#5B6B7F; --line:#D8E0E8; --blue:#2E6DB4; --blue-l:#E3EDF8;
+    --orange:#E08A2E; --orange-l:#FBEBD9; --green:#2E9E5B; --green-l:#DDF1E4;
+    --red:#C0504D; --red-l:#F4DAD8; --radius:12px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);
+    font-family:"Microsoft YaHei","PingFang SC","Noto Sans CJK SC",system-ui,sans-serif;font-size:14px}
+  header{background:var(--navy);color:#fff;padding:20px 28px 18px;border-bottom:4px solid var(--teal)}
+  header .tag{color:var(--teal);font-size:12px;letter-spacing:.12em;font-weight:700}
+  header h1{margin:6px 0 4px;font-size:26px}
+  header p{margin:0;color:#C9D6E3;font-size:13px}
+  .wrap{max-width:1500px;margin:0 auto;padding:20px 24px 60px;display:grid;
+    grid-template-columns:minmax(0,1.35fr) minmax(420px,1fr);gap:20px;align-items:start}
+  @media (max-width:1120px){.wrap{grid-template-columns:1fr}.out{position:static}}
+  .col{display:flex;flex-direction:column;gap:14px}
+  .card{background:var(--white);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px 18px;box-shadow:0 1px 2px rgba(11,37,69,.04)}
+  .card h2{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .card h2 .n{display:inline-flex;width:24px;height:24px;border-radius:50%;background:var(--navy);
+    color:#fff;font-size:12px;align-items:center;justify-content:center;flex:none}
+  .card .hint{color:var(--muted);font-size:12px;margin:0 0 12px;line-height:1.5}
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px}
+  .grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+  @media (max-width:640px){.grid,.grid.three{grid-template-columns:1fr}}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+  label.f > span.k{color:var(--ink);font-weight:600;font-size:12.5px}
+  label.f > span.d{font-size:11px;line-height:1.35}
+  input[type=text],input[type=number],select,textarea{
+    width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff;
+    color:var(--ink);font-size:13px;font-family:inherit;outline:none}
+  input:focus,select:focus,textarea:focus{border-color:var(--teal);box-shadow:0 0 0 3px rgba(19,168,158,.12)}
+  textarea{resize:vertical;min-height:56px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+  .seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fff}
+  .seg label{flex:1;text-align:center;padding:7px 6px;font-size:12.5px;color:var(--muted);cursor:pointer;
+    border-right:1px solid var(--line);user-select:none}
+  .seg label:last-child{border-right:none}
+  .seg input{display:none}
+  .seg input:checked + span{color:#fff}
+  .seg label:has(input:checked){background:var(--teal);color:#fff;font-weight:600}
+  .checks{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:2px}
+  .checks label{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink);cursor:pointer}
+  .checks input{accent-color:var(--teal);width:15px;height:15px}
+  .presets{display:flex;flex-wrap:wrap;gap:8px}
+  .presets button{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:20px;
+    padding:7px 14px;font-size:12.5px;cursor:pointer;font-family:inherit;transition:.15s}
+  .presets button:hover{border-color:var(--teal);color:var(--teal)}
+  .presets button.on{background:var(--navy);border-color:var(--navy);color:#fff}
+  .out{position:sticky;top:16px;display:flex;flex-direction:column;gap:12px}
+  .outcard{background:var(--navy);border-radius:var(--radius);padding:14px 16px;color:#fff}
+  .outcard .t{font-size:12px;color:#8FA6BF;letter-spacing:.08em;font-weight:700;margin-bottom:6px}
+  .chiprow{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+  .chip{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);border-radius:999px;
+    padding:3px 9px;font-size:11.5px;color:#DCE6F1}
+  .chip b{color:var(--teal);font-weight:700}
+  pre.cmd{margin:0;background:#061729;border:1px solid #1d3a5c;border-radius:10px;padding:14px;
+    color:#D7E6F5;font-family:ui-monospace,Menlo,Consolas,"Courier New",monospace;font-size:12.2px;
+    line-height:1.55;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto}
+  .btns{display:flex;gap:8px;margin-top:10px}
+  .btns button{flex:1;border:none;border-radius:8px;padding:9px 10px;font-size:13px;font-weight:600;
+    cursor:pointer;font-family:inherit}
+  .btn-copy{background:var(--teal);color:#fff}
+  .btn-copy:hover{background:#0f8f86}
+  .btn-dl{background:#21456f;color:#fff}
+  .btn-dl:hover{background:#2a5688}
+  .warn,.err,.ok{border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.55;margin-top:4px}
+  .warn{background:var(--orange-l);border:1px solid var(--orange);color:#7a4a10}
+  .err{background:var(--red-l);border:1px solid var(--red);color:#7a1f1d}
+  .ok{background:var(--green-l);border:1px solid var(--green);color:#1d5c38}
+  .summary{font-size:12.5px;line-height:1.7}
+  .summary .row{display:grid;grid-template-columns:110px 1fr;gap:8px;padding:3px 0;border-bottom:1px dashed var(--line)}
+  .summary .row:last-child{border-bottom:none}
+  .summary .k{color:var(--muted)}
+  .summary .v{color:var(--ink)}
+  .summary .v code{background:var(--blue-l);padding:0 4px;border-radius:4px}
+  details.explain{margin-top:10px;font-size:12.5px;color:var(--muted)}
+  details.explain summary{cursor:pointer;color:var(--teal);font-weight:600}
+  details.explain ul{margin:8px 0 0 18px;padding:0;line-height:1.6}
+  .hidden{display:none !important}
+  .footer-note{color:var(--muted);font-size:11.5px;line-height:1.6;margin-top:4px}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);
+    background:var(--navy);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;
+    opacity:0;pointer-events:none;transition:.2s;z-index:99}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .pathrow{display:flex;gap:8px}
+  .pathrow select{max-width:150px}
+  details.usage{margin:10px 0 4px;border:1px solid var(--line);border-radius:10px;
+    background:#fafcfe;padding:8px 12px}
+  details.usage summary{cursor:pointer;color:var(--navy);font-weight:700;font-size:12.5px}
+  .usage-body{font-size:12.2px;line-height:1.62;color:var(--muted);margin-top:6px}
+  .usage-body h3{font-size:12.5px;color:var(--ink);margin:11px 0 4px}
+  .usage-body ol,.usage-body ul{margin:4px 0 4px 18px;padding:0}
+  .usage-body table{border-collapse:collapse;width:100%;margin:4px 0}
+  .usage-body th,.usage-body td{border-bottom:1px dashed var(--line);padding:4px 6px;
+    text-align:left;vertical-align:top}
+  .usage-body th{color:var(--ink);font-weight:600;white-space:nowrap;width:130px}
+  .usage-body code{background:var(--blue-l);padding:0 4px;border-radius:4px;color:var(--ink)}
+  .usage-body b{color:var(--ink)}
+</style>
+</head>
+<body>
+<header>
+  <div class="tag">DS4.1 MINI BENCHMARK · COMMAND BUILDER</div>
+  <h1>benchmark 命令构建器</h1>
+  <p>选一选、填一填，右边直接生成可复制、可下载的运行命令。默认口径：8 卡 DP8（每卡一个 DP）+ EP8 MoE、合成权重、性能开关全开。</p>
+</header>
+
+<div class="wrap">
+  <!-- ══════════ 左侧：表单 ══════════ -->
+  <div class="col">
+
+    <div class="card">
+      <h2><span class="n">1</span>先选一个场景（预设）</h2>
+      <p class="hint">预设只是帮你把下面的选项填好，之后仍可随意改。</p>
+      <div class="presets" id="presets">
+        <button data-preset="smoke">冒烟：合成 8 卡 2k</button>
+        <button data-preset="perf">合成性能：hit97 16k</button>
+        <button data-preset="packed_on">双 batch profiling（replay + graph）</button>
+        <button data-preset="packed_off">双 batch profiling（replay off）</button>
+        <button data-preset="real">真权重 16k + 精度 gate</button>
+        <button data-preset="decode">真权重增量 decode</button>
+        <button data-preset="prompt_decode">真权重 prompt + N 步 decode（P→D）</button>
+        <button data-preset="resident">常驻 benchmark（预热后 ≤3s）</button>
+        <button data-preset="custom">自定义</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="n">2</span>运行入口与硬件</h2>
+      <p class="hint">三种入口：直跑 mini（最灵活）、合成性能脚本、真权重脚本。后两者是封装好的一键流程（自动带 gate / 汇总）。</p>
+      <div class="grid">
+        <label class="f"><span class="k">运行入口</span>
+          <select id="entry">
+            <option value="launch">launch_mini.py（直跑，最灵活）</option>
+            <option value="hit">tools/run_hit.sh（合成性能一键）</option>
+            <option value="real">tools/run_real.sh（真权重一键）</option>
+            <option value="resident">常驻 benchmark（bench_server + bench_cli，无 TUI）</option>
+          </select>
+        </label>
+        <label class="f" id="cfgWrap"><span class="k">配置文件</span>
+          <select id="config"></select>
+          <span class="d" id="cfgDesc"></span>
+        </label>
+        <label class="f"><span class="k">卡数（world）</span>
+          <select id="world">
+            <option value="8" selected>8 卡（DP8 / EP8）</option>
+            <option value="4">4 卡（DP4 / EP4）</option>
+            <option value="2">2 卡（DP2 / EP2）</option>
+            <option value="1">1 卡（单卡）</option>
+          </select>
+        </label>
+        <label class="f"><span class="k">物理卡号（逗号分隔）</span>
+          <input type="text" id="cards" value="0,1,2,3,4,5,6,7" placeholder="0,1,2,3,4,5,6,7">
+          <span class="d">开跑前先 <code>npu-smi info</code> 确认这些卡空闲（没有别人的进程、没有幽灵显存）。</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="n">3</span>序列与 batch</h2>
+      <p class="hint">“双 batch”有两种：packed（两条序列拼成一次 varlen 前向，真 batch）和 sequential（顺序跑 N 遍，各自独立计时）。</p>
+      <div class="grid">
+        <label class="f"><span class="k">每条序列长度（tokens）</span>
+          <input type="number" id="seq" value="2048" min="1" step="128">
+          <span class="d">常见：2048 / 8192 / 16384 / 65536 / 131072 / 262144 / 1048576</span>
+        </label>
+        <label class="f"><span class="k">batch 数（每个 DP）</span>
+          <input type="number" id="batches" value="2" min="1" step="1">
+        </label>
+        <label class="f"><span class="k">batch 模式</span>
+          <div class="seg" id="batchMode">
+            <label><input type="radio" name="bm" value="packed" checked><span>packed（真 batch）</span></label>
+            <label><input type="radio" name="bm" value="sequential"><span>sequential（顺序）</span></label>
+          </div>
+        </label>
+        <label class="f"><span class="k">输入种子（合成输入）</span>
+          <input type="number" id="inputSeed" value="0" step="1">
+          <span class="d">固定 seed = 可复现；每个 batch 用 seed + 7919×b。</span>
+        </label>
+      </div>
+      <div class="grid" style="margin-top:10px">
+        <label class="f"><span class="k">ids 文件（可选）</span>
+          <input type="text" id="idsFile" value="" placeholder="留空 = 合成随机输入">
+          <span class="d">真权重精度口径用 <code>/mnt/xds/sfs/l00972766/parity/ids_16k.pt</code></span>
+        </label>
+        <label class="f"><span class="k">ids 起始偏移</span>
+          <input type="number" id="idsOffset" value="0" min="0" step="1">
+          <span class="d">给了 ids 文件就按 [offset, offset+seq) 切片。</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="n">4</span>阶段与规模</h2>
+      <div class="grid three">
+        <label class="f"><span class="k">重复轮数（iters）</span>
+          <input type="number" id="iters" value="3" min="1" step="1">
+          <span class="d">性能看稳态；至少 2 轮（入图需要第 2 轮捕获）。</span>
+        </label>
+        <label class="f"><span class="k">预热轮（warmup）</span>
+          <input type="number" id="warmup" value="0" min="0" step="1">
+          <span class="d">真权重首轮含装载，建议 1。</span>
+        </label>
+        <label class="f"><span class="k">只跑前 N 层（冒烟）</span>
+          <input type="number" id="layers" value="0" min="0" step="1">
+          <span class="d">0 = 全部 40 层；真权重冒烟建议 15（覆盖 engram 层 1/14）。</span>
+        </label>
+        <label class="f"><span class="k">decode 步数（可选）</span>
+          <input type="number" id="decode" value="0" min="0" step="1">
+          <span class="d">>0 时走续写；需要 ids 文件或 prompt。</span>
+        </label>
+        <label class="f"><span class="k">decode 模式</span>
+          <select id="decodeMode">
+            <option value="inc" selected>inc（增量，真实 decode 形态）</option>
+            <option value="full">full（全量重算，金标准）</option>
+          </select>
+        </label>
+        <label class="f"><span class="k">prompt（可选）</span>
+          <input type="text" id="prompt" value="" placeholder="例如：你好，介绍一下你自己">
+        </label>
+        <label class="f when-decode"><span class="k">P→D 权重转换</span>
+          <select id="pdMode">
+            <option value="off" selected>关闭（沿用 prefill 权重）</option>
+            <option value="ep">开 · EP decode-GMM（dispatch/combine）</option>
+            <option value="tp">开 · TP（全专家 × I/tp，all_reduce）</option>
+          </select>
+          <span class="d">prefill 跑完后在同一进程里转换一次，再进 decode（单机无 PD 分离）。</span>
+        </label>
+        <label class="f when-decode"><span class="k">P→D 构建方式</span>
+          <select id="pdPrebuild">
+            <option value="1" selected>预构建全部层（推荐，首步不抖）</option>
+            <option value="0">按层懒构建（省一次启动）</option>
+          </select>
+        </label>
+      </div>
+      <div class="checks" style="margin-top:10px">
+        <label><input type="checkbox" id="promptFull"> prompt 全量 prefill（--seq 0，不按 --seq 截断）</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="n">5</span>性能开关（默认全开）</h2>
+      <p class="hint">这些是 PERF_RULES 的默认口径。除非做 A/B，否则保持默认即可。</p>
+      <div class="checks">
+        <label><input type="checkbox" id="replay" checked> decoder replay（尾段裁剪）</label>
+        <label><input type="checkbox" id="graph" checked> 尾段入图（ACL Graph）</label>
+        <label><input type="checkbox" id="graphProf"> prof 时也入图</label>
+        <label><input type="checkbox" id="graphCheck"> 图 vs eager 逐位校验</label>
+      </div>
+      <div class="grid three" style="margin-top:12px">
+        <label class="f"><span class="k">MoE 分块</span>
+          <select id="moeChunk">
+            <option value="auto" selected>默认（auto → 配置里的 8192）</option>
+            <option value="0">关闭（A/B 用）</option>
+            <option value="8192">显式 8192</option>
+            <option value="16384">显式 16384</option>
+            <option value="4096">显式 4096</option>
+          </select>
+          <span class="d">实际每层调用次数 = ceil(当前层 T / 块)。hit 口径只算 T_main（如 64k@0.97 ≈ 2176），小于 8192 时仍是 1 次/层。</span>
+        </label>
+        <label class="f"><span class="k">MoE 后端</span>
+          <select id="moeBackend">
+            <option value="cfg" selected>跟随配置（ascendc）</option>
+            <option value="ascendc">强制 ascendc</option>
+            <option value="deepgemm">deepgemm（历史参考，不推荐）</option>
+          </select>
+        </label>
+        <label class="f"><span class="k">调试/对照开关</span>
+          <select id="barrier">
+            <option value="none" selected>无</option>
+            <option value="pass">每 pass barrier</option>
+            <option value="moe">每层 MoE 前 barrier</option>
+          </select>
+        </label>
+      </div>
+      <div class="checks" style="margin-top:10px">
+        <label><input type="checkbox" id="perLayerCache"> 按层分池（DS41M_PERLAYER_CACHE=1）</label>
+        <label><input type="checkbox" id="engramVendor"> 厂商 engram 取表（DS41M_ENGRAM_VENDOR=1）</label>
+        <label><input type="checkbox" id="noBalroute"> 关闭强均路由（DS41M_NO_BALROUTE=1）</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="n">6</span>Profiling 与产物</h2>
+      <p class="hint">PERF_RULES §0：采集一律用 ALOP。这里默认已是 ALOP + MindStudio 档位，只有做 A/B 才需要改。</p>
+      <div class="checks">
+        <label><input type="checkbox" id="prof" checked> 开启 ALOP profiling</label>
+        <label><input type="checkbox" id="alopMindstudio" checked> 产出 MindStudio trace（alop_mindstudio.yaml）</label>
+        <label class="script-only"><input type="checkbox" id="profOnly"> 只采 trace（不跑无 prof 轮）</label>
+        <label class="script-only"><input type="checkbox" id="noprofOnly"> 只跑无 prof 轮</label>
+      </div>
+      <div class="grid three" style="margin-top:12px">
+        <label class="f"><span class="k">采集哪些 rank</span>
+          <select id="profRanks">
+            <option value="0" selected>0（只采一张卡）</option>
+            <option value="all">all（8 张全采）</option>
+            <option value="custom">自定义…</option>
+          </select>
+          <input type="text" id="profRanksCustom" class="hidden" value="0,3" placeholder="如 0,3">
+        </label>
+        <label class="f"><span class="k">逐层 dump（可选，对拍用）</span>
+          <input type="text" id="collectLayers" value="" placeholder="目录，例如 /mnt/xds/sfs/.../collect">
+        </label>
+        <label class="f"><span class="k">dump 哪些 rank</span>
+          <select id="collectRanks">
+            <option value="0" selected>0（对拍只收 rank0）</option>
+            <option value="all">all</option>
+          </select>
+        </label>
+      </div>
+      <div class="grid" style="margin-top:10px">
+        <label class="f"><span class="k">输出根目录</span>
+          <input type="text" id="outRoot" value="/mnt/xds/sfs/l00972766/tmp/bench_out">
+          <span class="d">日志放 &lt;root&gt;/logs，trace 放 &lt;root&gt;/prof（launch_mini 入口）。</span>
+        </label>
+        <label class="f"><span class="k">启动器参数</span>
+          <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px">
+            <select id="console">
+              <option value="all" selected>console=all</option>
+              <option value="rank0">console=rank0</option>
+              <option value="off">console=off</option>
+            </select>
+            <input type="number" id="timeout" value="3600" min="60" step="60" title="timeout（秒）">
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="n">7</span>脚本专属与高级</h2>
+      <div class="grid" id="hitOpts">
+        <label class="f"><span class="k">命中率（run_hit / run_real hit）</span>
+          <input type="text" id="hitRatio" value="0.97" placeholder="0.97 / 97% / 97">
+        </label>
+        <label class="f"><span class="k">replay 尾长 / cut</span>
+          <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px">
+            <input type="number" id="replayW" value="0" min="0" step="128" title="replay w（0=sliding_window）">
+            <input type="number" id="replayCut" value="0" min="0" step="1" title="replay cut（0=最后一个 kv_source+1）">
+          </div>
+        </label>
+      </div>
+      <div class="checks" style="margin-top:10px" id="hitChecks">
+        <label><input type="checkbox" id="plain"> 整段全算（不做命中）</label>
+      </div>
+      <div class="grid" id="realOpts" style="margin-top:10px">
+        <label class="f"><span class="k">run_real 模式</span>
+          <select id="realMode">
+            <option value="prefill">prefill（全长，能吐字）</option>
+            <option value="hit">hit（命中口径）</option>
+            <option value="both" selected>both（两种都跑）</option>
+          </select>
+        </label>
+        <label class="f"><span class="k">真权重目录（可选覆盖）</span>
+          <input type="text" id="weightsPath" value="" placeholder="/mnt/xds/sfs/DeepSeek-V4.1-Flash-cann-mxfp8-mxfp4">
+        </label>
+      </div>
+      <div class="checks" style="margin-top:10px" id="realChecks">
+        <label><input type="checkbox" id="parity"> --parity（逐层对拍）</label>
+        <label><input type="checkbox" id="engramHost"> --engram-host（逃生：主机取表）</label>
+        <label><input type="checkbox" id="noMoeChunk"> --no-moe-chunk</label>
+        <label><input type="checkbox" id="noPrecision"> --no-precision</label>
+      </div>
+      <div class="grid" style="margin-top:12px">
+        <label class="f"><span class="k">额外参数（原样追加）</span>
+          <input type="text" id="extraArgs" value="" placeholder="例如 --allow-placeholder --device npu:3">
+        </label>
+        <label class="f"><span class="k">额外环境变量（每行一个）</span>
+          <textarea id="extraEnv" placeholder="DS41M_DEBUG=1&#10;DS41M_HOSTTIME=1"></textarea>
+        </label>
+      </div>
+    </div>
+
+    <div class="card" id="residentOpts">
+      <h2><span class="n">8</span>常驻 benchmark（无 TUI，简单进度条）</h2>
+      <p class="hint">8 个 rank 进程常驻占满 8 卡；预热后每次 prompt 只跑计算（目标 ~1s，硬上限 3s）。
+      终端 A 跑 host cache + server，终端 B 用 bench_cli 发 prompt。所有命令由本页生成。</p>
+      <details class="usage" open>
+        <summary>使用说明（怎么跑 / 参数 / 口径 / 常见错误）</summary>
+        <div class="usage-body">
+          <h3>1) 三步跑起来</h3>
+          <ol>
+            <li><b>终端 A</b>：先 <code>npu-smi info</code> 确认 8 张卡空闲（有别的容器进程就先别起）→
+              需要 tp8 时手动开 host cache → 执行 <code>bench_server.py start</code>
+              （前台阻塞，Ctrl-C 整组停）。</li>
+            <li><b>终端 B</b>：<code>bench_cli.py warmup</code>（W1/W2/W3，带进度条）→
+              <code>bench_cli.py run --prompt ... --chat</code>（prefill → decode）。</li>
+            <li>收尾：<code>bench_cli.py status/stop</code>；host cache 是独立 daemon，必须单独
+              <code>moe_host_cache.py stop</code>。</li>
+          </ol>
+          <p><b>每次重启 bench_server 都要重新 warmup</b>（AC/池/形状缓存都在进程内）。</p>
+
+          <h3>2) 参数</h3>
+          <table>
+            <tr><th>mode</th><td><code>auto</code> = 一律 ep8（同布局，P→D/D→P=0，decode 全量重算，最稳）；
+              <code>ep8</code> 同上；<code>tp8-fidelity</code> = 真实 P→D/D→P（必须 host cache）；
+              <code>tp8-dual</code> 未实现。</td></tr>
+            <tr><th>serve-l-max</th><td>常驻池容量：prompt + decode 的总 token 数不能超过它（默认 1024，
+              不中途重分配）。超长请求会被拒绝。</td></tr>
+            <tr><th>预热阶梯</th><td>每个长度第一次出现要现场建 rope/slot/元数据缓存；阶梯覆盖到 ≤L 时
+              首触也承诺 ≤3s。默认 <code>16,32,64,128,256,512,1024</code>，单桶约 0.15–0.2 s。</td></tr>
+            <tr><th>decode / repeat</th><td><code>--decode</code> 是<b>上限</b>；命中 EOS 提前结束是正常的。
+              repeat 从第 2 次起取稳态中位。</td></tr>
+            <tr><th>--chat</th><td>用聊天模板（推荐开）。raw prompt 也会自动补长到 ≥16 token。</td></tr>
+            <tr><th>host cache</th><td>只有 tp8-fidelity 需要：269 GiB，冷页缓存约 3–9 min（热约 3 min）；
+              用完手动 stop。</td></tr>
+          </table>
+
+          <h3>3) 指标口径</h3>
+          <ul>
+            <li><b>prefill</b>：8 rank 取 max，不含 tokenize；实测 ep8 稳态 ~0.16 s、首触 ~0.34 s。</li>
+            <li><b>decode</b>：每 token 单独计时（ep8 全量重算 ~0.26 s/tok；tp8 TP ~0.30–0.34 s/tok），
+              首 token 不计入。</li>
+            <li><b>P→D / D→P</b>：ep8 都是 0；tp8 P→D 2.5–3.2 s、D→P 4.9–5.5 s，
+              D→P 后下一 prompt prefill 1.8–2.2 s。</li>
+            <li><b>承诺</b>：L ≤ 预热阶梯最大值（且 prompt+decode ≤ l_max）时 prefill ≤3 s；
+              超出显示实测、不承诺。</li>
+          </ul>
+
+          <h3>4) 注意事项</h3>
+          <ul>
+            <li><b>共享卡</b>：起服务前 <code>npu-smi info</code> 要是 8 张卡都没有别的进程。
+              被别的容器占着会出现 <code>halSqCqAllocate</code> / <code>RunAicpuCommInit</code>
+              这类驱动错误：停服务、等 20–30 s、确认空闲再重启；不要 kill 别人的进程。</li>
+            <li><b>根盘紧张</b>：勾选“临时目录放共享盘”，并在终端 B 也 export 同一个
+              <code>DS41_BENCH_ROOT</code>。</li>
+            <li><b>prompt 补长</b>：chat 在 BOS 后插空格；raw 在末尾补；full decode 用偶数长度
+              （单次 prefill，同时避开 mqsmla 的 T%4==1 trap）。</li>
+            <li><b>文本显示</b>：结果表格的“文本”列只放 40 字预览，完整文本在下面单独打印；
+              命中 EOS 可能只是正常句末。</li>
+            <li><b>日志</b>：<code>&lt;logdir&gt;/rank*.log</code> + <code>all.log</code>；
+              每次 run 结果里也会打印 <code>tail -f</code> 命令。</li>
+          </ul>
+
+          <h3>5) 常见错误</h3>
+          <table>
+            <tr><th>prompt + decode &gt; 池容量</th><td>加大 <code>--serve-l-max</code> 重启；
+              池不中途重分配。</td></tr>
+            <tr><th>tp8 需要 host cache</th><td>先 <code>moe_host_cache.py start</code>，或改用 ep8。</td></tr>
+            <tr><th>halSqCqAllocate / aicore exception</th><td>共享卡被占或驱动状态差：停服务、等
+              20–30 s、<code>npu-smi</code> 确认空闲后重启；反复出现找管理方清容器/驱动。</td></tr>
+            <tr><th>RunAicpuCommInit … get kernel failed</th><td>HCCL 通信域 lazy init 失败；
+              新版启动会先预热 WORLD 域。仍失败按上一条处理。</td></tr>
+            <tr><th>文本停在半句</th><td>先看完整文本/ids：命中 EOS 是正常结束；表格里只是 40 字预览。</td></tr>
+            <tr><th>控制连接断开 / rank 超时</th><td>有 rank 异常退出，看门狗整组杀（HCCL 不能单 rank
+              重启）；重启服务并重新 warmup。</td></tr>
+          </table>
+        </div>
+      </details>
+      <div class="grid three">
+        <label class="f"><span class="k">作业名（job）</span>
+          <input type="text" id="resJob" value="resident" placeholder="resident">
+          <span class="d">控制 socket 在 <code>/tmp/ds41_bench/&lt;job&gt;/</code>。</span>
+        </label>
+        <label class="f"><span class="k">布局模式</span>
+          <select id="resMode">
+            <option value="auto" selected>auto（一律 ep8 + 全量 decode；tp8 需显式）</option>
+            <option value="ep8">ep8（同布局；decode=全量重算 ≈0.2s/tok，最稳）</option>
+            <option value="tp8-fidelity">tp8-fidelity（真实 PD：P→D≈3.1s，D→P≈5.5s，需 host cache）</option>
+            <option value="tp8-dual">tp8-dual（双常驻，显存最紧）</option>
+          </select>
+        </label>
+        <label class="f"><span class="k">常驻池容量（prompt+decode）</span>
+          <input type="number" id="resLMax" value="1024" min="64" step="128">
+          <span class="d">超过这个长度的 prompt 会被拒绝（不中途重分配池）。默认 1024，给 AC/池留显存。</span>
+        </label>
+      </div>
+      <div class="grid three" style="margin-top:10px">
+        <label class="f"><span class="k">预热长度阶梯</span>
+          <input type="text" id="resWarm" value="16,32,64,128,256,512,1024" placeholder="128,256,512">
+          <span class="d">W1 干净 prefill、W2 建常驻 AC（ep8 全量 decode 不建 NZ）、W3 逐形状预热；
+            ≤ 阶梯最大值的长度承诺首触也 ≤3s（单桶约 0.15–0.2 s）。</span>
+        </label>
+        <label class="f"><span class="k">每次 prompt 的 decode 步数</span>
+          <input type="number" id="resDecode" value="32" min="0" step="1">
+        </label>
+        <label class="f"><span class="k">重复次数（稳态取中位）</span>
+          <input type="number" id="resRepeat" value="3" min="1" step="1">
+        </label>
+      </div>
+      <div class="checks" style="margin-top:10px">
+        <label><input type="checkbox" id="resWarmOnStart"> 启动服务后自动预热（不勾 = 手动在终端 B 发 warmup）</label>
+        <label><input type="checkbox" id="resChat" checked> 用 chat 模板包装 prompt</label>
+        <label><input type="checkbox" id="resSharedTmp" checked> 临时目录放共享盘（DS41_BENCH_ROOT）</label>
+      </div>
+      <div class="checks" style="margin-top:6px">
+        <label><input type="checkbox" id="resHostCache" checked> 生成 host cache start 命令</label>
+        <label><input type="checkbox" id="resHostCacheStop" checked> 命令块末尾附带 host cache stop</label>
+        <span class="d">host cache 是独立 daemon，手动开/停；<b>只有 tp8-fidelity 需要</b>，
+          全量 268.9 GiB，冷页缓存约 3–9 min（热约 3 min）。</span>
+      </div>
+      <div class="grid three" style="margin-top:10px">
+        <label class="f"><span class="k">host cache socket</span>
+          <input type="text" id="resHcSock" value="/tmp/ds41_moe_host_cache.sock">
+        </label>
+        <label class="f"><span class="k">缓存层（layers）</span>
+          <input type="text" id="resHcLayers" value="0-39" placeholder="0-39 / 0-2">
+        </label>
+        <label class="f"><span class="k">缓存专家（experts）</span>
+          <input type="text" id="resHcExperts" value="0-383" placeholder="0-383 / 0-47">
+        </label>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ══════════ 右侧：输出 ══════════ -->
+  <div class="col out">
+    <div class="outcard">
+      <div class="t">当前口径速览</div>
+      <div class="chiprow" id="chips"></div>
+      <div id="msgs"></div>
+    </div>
+
+    <div class="card" style="padding:12px 12px 14px">
+      <h2 style="margin-bottom:8px"><span class="n">▶</span>生成的命令</h2>
+      <pre class="cmd" id="cmd">…</pre>
+      <div class="btns">
+        <button class="btn-copy" id="copyBtn">复制命令</button>
+        <button class="btn-dl" id="dlBtn">下载 .sh</button>
+      </div>
+      <div class="footer-note">提示：先 <code>npu-smi info</code> 看卡是否空闲；命令默认先 <code>cd</code> 到 ds41_mini 并 <code>source ./env_pack.sh</code>。<br>
+      本页文件：<code>ds41_mini/tools/bench_command_builder.html</code>（离线可用，可直接拷走）。</div>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-bottom:8px"><span class="n">i</span>这条命令会做什么</h2>
+      <div class="summary" id="summary"></div>
+      <details class="explain">
+        <summary>每个参数是什么意思？</summary>
+        <div id="explain"></div>
+      </details>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast">已复制</div>
+
+<script>
+/* ───────────────────────── 数据 ───────────────────────── */
+const WORKDIR = '/mnt/xds/sfs/l00972766/ds41_mini';
+const IDS16K  = '/mnt/xds/sfs/l00972766/parity/ids_16k.pt';
+
+const CONFIGS = [
+  { id:'mini_ds41_flash.yaml', name:'合成 · 通用（engram 开）', weights:'synthetic', engram:true,
+    desc:'40 层全结构、合成权重、engram 层 1/14；适合通用性能/入图。' },
+  { id:'mini_ds41_flash_hit97_64k.yaml', name:'合成 · hit97 64k 基线', weights:'synthetic', engram:true,
+    desc:'官方 hit97 矩阵口径（hit=0.97），64k 基线点。' },
+  { id:'mini_real.yaml', name:'真权重 · EP8（精度口径）', weights:'real', engram:true,
+    desc:'真权重 + engram 真表 + 自然路由；能吐字、可跑精度 gate。' },
+  { id:'mini_real_ascendc.yaml', name:'真权重 · ascendc', weights:'real', engram:true,
+    desc:'真权重 + ascendc 后端口径。' },
+  { id:'packed_plain_2k.yaml', name:'合成 · 双 batch packed（engram 开）', weights:'synthetic', engram:true,
+    desc:'每 DP 两条 2k 序列、一次 varlen 前向；engram 为 1M 行合成表。' },
+  { id:'packed_plain_2k_noeng.yaml', name:'合成 · 双 batch packed（关 engram）', weights:'synthetic', engram:false,
+    desc:'关 engram；可安全搭配真实 16k ids 做 packed 对拍。' },
+  { id:'mini_single.yaml', name:'模块 · 单算子', weights:'synthetic', engram:false, desc:'单算子验证/自检用。' },
+  { id:'mini_moe.yaml', name:'模块 · MoE', weights:'synthetic', engram:false, desc:'只跑 MoE 链路的配置。' },
+  { id:'mini_indexer.yaml', name:'模块 · Indexer', weights:'synthetic', engram:false, desc:'只跑索引器链路的配置。' },
+  { id:'point_L16384.yaml', name:'单点 · L=16k', weights:'synthetic', engram:true, desc:'hit 矩阵单点配置（16k）。' },
+  { id:'point_L32768.yaml', name:'单点 · L=32k', weights:'synthetic', engram:true, desc:'hit 矩阵单点配置（32k）。' },
+  { id:'point_L65536.yaml', name:'单点 · L=64k', weights:'synthetic', engram:true, desc:'hit 矩阵单点配置（64k）。' },
+  { id:'point_L131072.yaml', name:'单点 · L=128k', weights:'synthetic', engram:true, desc:'hit 矩阵单点配置（128k）。' },
+  { id:'point_L262144.yaml', name:'单点 · L=256k', weights:'synthetic', engram:true, desc:'hit 矩阵单点配置（256k）。' },
+  { id:'point_L81920.yaml', name:'单点 · L=80k', weights:'synthetic', engram:true, desc:'hit 矩阵单点配置（80k）。' },
+];
+
+/* ───────────────────────── 工具 ───────────────────────── */
+const $ = id => document.getElementById(id);
+const val = id => $(id).value;
+const num = id => { const v = parseInt($(id).value, 10); return isNaN(v) ? 0 : v; };
+const chk = id => $(id).checked;
+
+function setVal(id, v){ $(id).value = v; }
+function setChk(id, v){ $(id).checked = !!v; }
+function setRadio(name, v){
+  document.querySelectorAll(`input[name="${name}"]`).forEach(r => r.checked = (r.value === v));
+}
+
+function cmdEscape(s){ return /^[A-Za-z0-9_./:=,@+-]+$/.test(s) ? s : `'${String(s).replace(/'/g, `'\\''`)}'`; }
+function shQuote(s){ return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+function prettySeq(n){
+  if (n >= 1048576 && n % 1048576 === 0) return (n/1048576) + 'm';
+  if (n >= 1024 && n % 1024 === 0) return (n/1024) + 'k';
+  return String(n);
+}
+function parseCards(s){ return String(s).split(',').map(x => x.trim()).filter(Boolean); }
+
+/* ───────────────────────── 预设 ───────────────────────── */
+const PRESETS = {
+  smoke(){ // 合成冒烟
+    setEntry('launch'); setCfg('mini_ds41_flash.yaml');
+    setVal('world','8'); setVal('cards','0,1,2,3,4,5,6,7');
+    setVal('seq','2048'); setVal('batches','1'); setRadio('bm','sequential');
+    setChk('replay',true); setChk('graph',true);
+    setVal('inputSeed','0'); setVal('idsFile',''); setVal('idsOffset','0');
+    setVal('iters','1'); setVal('warmup','0'); setVal('layers','0'); setVal('decode','0'); setVal('prompt','');
+    setChk('replay',true); setChk('graph',true); setChk('graphProf',false); setChk('graphCheck',false);
+    setChk('prof',false); setChk('profOnly',false); setChk('noprofOnly',false);
+    setChk('promptFull',false); setVal('pdMode','off');
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_smoke');
+  },
+  perf(){ // run_hit 16k
+    setEntry('hit'); setVal('seq','16384'); setVal('hitRatio','0.97');
+    setVal('cards','0,1,2,3,4,5,6,7'); setVal('iters','4');
+    setVal('batches','1'); setVal('warmup','0'); setVal('layers','0');
+    setVal('idsFile',''); setVal('idsOffset','0');
+    setChk('replay',true); setChk('graph',true); setChk('plain',false);
+    setChk('prof',true); setChk('profOnly',false); setChk('noprofOnly',false);
+    setVal('profRanks','0');
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_hit16k');
+  },
+  packed_on(){
+    setEntry('launch'); setCfg('packed_plain_2k.yaml');
+    setVal('world','8'); setVal('cards','0,1,2,3,4,5,6,7');
+    setVal('seq','2048'); setVal('batches','2'); setRadio('bm','packed');
+    setVal('inputSeed','0'); setVal('idsFile',''); setVal('idsOffset','0');
+    setVal('iters','3'); setVal('warmup','0'); setVal('layers','0'); setVal('decode','0'); setVal('prompt','');
+    setChk('replay',true); setChk('graph',true); setChk('graphProf',true); setChk('graphCheck',false);
+    setChk('prof',true); setChk('alopMindstudio',true); setChk('profOnly',false); setChk('noprofOnly',false);
+    setVal('profRanks','0'); setVal('collectLayers','');
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_packed_on');
+  },
+  packed_off(){
+    PRESETS.packed_on();
+    setChk('replay',false); setChk('graph',false); setChk('graphProf',false);
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_packed_off');
+  },
+  real(){ // 真权重精度
+    setEntry('real'); setVal('seq','16384'); setVal('realMode','prefill');
+    setVal('batches','1'); setVal('inputSeed','0');
+    setChk('replay',true); setChk('graph',true);
+    setVal('hitRatio','0.96875'); setVal('cards','0,1,2,3,4,5,6,7');
+    setVal('iters','3'); setVal('warmup','1'); setVal('layers','0');
+    setVal('idsFile',IDS16K); setVal('weightsPath','');
+    setChk('parity',false); setChk('engramHost',false); setChk('noMoeChunk',false); setChk('noPrecision',false);
+    setChk('prof',true); setChk('profOnly',false); setChk('noprofOnly',false); setVal('profRanks','0');
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_real16k');
+  },
+  decode(){ // 真权重增量 decode
+    setEntry('launch'); setCfg('mini_real.yaml');
+    setVal('world','8'); setVal('cards','0,1,2,3,4,5,6,7');
+    setVal('seq','16384'); setVal('batches','1'); setRadio('bm','sequential');
+    setVal('idsFile',IDS16K); setVal('idsOffset','0'); setVal('inputSeed','0');
+    setVal('iters','1'); setVal('warmup','1'); setVal('layers','0');
+    setVal('decode','8'); setVal('decodeMode','inc'); setVal('prompt','');
+    setVal('pdMode','ep'); setVal('pdPrebuild','1'); setChk('promptFull',false);
+    setChk('replay',true); setChk('graph',false); setChk('graphProf',false); setChk('graphCheck',false);
+    setChk('prof',false); setChk('profOnly',false); setChk('noprofOnly',false);
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_decode');
+  },
+  prompt_decode(){
+    setEntry('launch'); setCfg('mini_real.yaml');
+    setVal('world','8'); setVal('cards','0,1,2,3,4,5,6,7');
+    setVal('seq','0'); setChk('promptFull',true);
+    setVal('prompt','请用一句话介绍杭州，并说明它最有名的景点。');
+    setVal('batches','1'); setRadio('bm','sequential');
+    setVal('idsFile',''); setVal('idsOffset','0'); setVal('inputSeed','0');
+    setVal('decode','8'); setVal('decodeMode','inc');
+    setVal('iters','1'); setVal('warmup','0'); setVal('layers','0');
+    setVal('pdMode','ep'); setVal('pdPrebuild','1');
+    setChk('prof',false); setChk('profOnly',false); setChk('noprofOnly',false);
+    setChk('replay',true); setChk('graph',true);
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_prompt_decode');
+  },
+  resident(){
+    setEntry('resident'); setCfg('mini_real.yaml');
+    setVal('world','8'); setVal('cards','0,1,2,3,4,5,6,7');
+    setVal('prompt','请用一句话介绍杭州，并说明它最有名的景点。');
+    setVal('resDecode','32'); setVal('resRepeat','3');
+    setVal('resJob','resident');
+    setVal('resMode','auto');
+    setVal('resLMax','1024');
+    setVal('resWarm','16,32,64,128,256,512,1024');
+    setChk('resWarmOnStart',false); setChk('resChat',true);
+    setChk('resSharedTmp',true);
+    // auto = ep8，不需要 host cache；要 tp8 时再勾（勾了没切模式会有提示）
+    setChk('resHostCache',false); setChk('resHostCacheStop',true);
+    setVal('resHcSock','/tmp/ds41_moe_host_cache.sock');
+    setVal('resHcLayers','0-39'); setVal('resHcExperts','0-383');
+    setChk('replay',true); setChk('graph',true);
+    setVal('moeChunk','auto'); setVal('moeBackend','cfg');
+    setChk('perLayerCache',false); setChk('engramVendor',false); setChk('noBalroute',false);
+    setChk('prof',false); setChk('profOnly',false); setChk('noprofOnly',false);
+    setVal('extraArgs',''); setVal('extraEnv','');
+    setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_resident');
+  },
+  custom(){ setChk('prof',true); setVal('outRoot','/mnt/xds/sfs/l00972766/tmp/bench_out'); },
+};
+
+function setEntry(v){ setVal('entry', v); }
+function setCfg(v){ if (CONFIGS.some(c => c.id === v)) setVal('config', v); }
+
+/* ───────────────────────── 入口/配置联动 ───────────────────────── */
+function syncEntryVisibility(){
+  const e = val('entry');
+  document.body.dataset.entry = e;
+  // 配置下拉对 launch/resident 有意义；run_real 固定真权重，run_hit 固定合成
+  $('cfgWrap').classList.toggle('hidden', !(e === 'launch' || e === 'resident'));
+  $('hitOpts').classList.toggle('hidden', e === 'launch' || e === 'resident');
+  $('hitChecks').classList.toggle('hidden', e === 'launch' || e === 'resident');
+  $('realOpts').classList.toggle('hidden', e !== 'real');
+  $('realChecks').classList.toggle('hidden', e !== 'real');
+  $('residentOpts').classList.toggle('hidden', e !== 'resident');
+  document.querySelectorAll('.packed-only').forEach(el => el.classList.toggle('hidden', !isPacked()));
+  document.querySelectorAll('.script-only').forEach(el =>
+    el.classList.toggle('hidden', e === 'launch' || e === 'resident'));
+  $('profRanksCustom').classList.toggle('hidden', val('profRanks') !== 'custom');
+  document.querySelectorAll('.when-decode').forEach(el =>
+    el.classList.toggle('hidden', !(e === 'launch' && num('decode') > 0)));
+  // 入口对应的 config 提示
+  if (e === 'real') { $('cfgDesc').textContent = 'run_real.sh 固定使用 mini_real 口径（真权重 + 自然路由）。'; }
+  else if (e === 'hit') { $('cfgDesc').textContent = 'run_hit.sh 固定合成权重 + 强均路由 + fake 前缀。'; }
+  else { updateCfgDesc(); }
+}
+function updateCfgDesc(){
+  const c = CONFIGS.find(x => x.id === val('config'));
+  $('cfgDesc').textContent = c ? c.desc : '';
+}
+function profRankValue(){
+  const v = val('profRanks');
+  if (v === 'custom') return val('profRanksCustom').trim() || '0';
+  return v || '0';
+}
+function isPacked(){ return val('entry') === 'launch' && document.querySelector('input[name="bm"]:checked').value === 'packed'; }
+function configInfo(){
+  if (val('entry') === 'real') return CONFIGS.find(c => c.id === 'mini_real.yaml');
+  if (val('entry') === 'hit')  return CONFIGS.find(c => c.id === 'mini_ds41_flash_hit97_64k.yaml');
+  return CONFIGS.find(c => c.id === val('config')) || CONFIGS[0];
+}
+
+/* ───────────────────────── 命令生成 ───────────────────────── */
+function buildEnv(){
+  const env = [];
+  // MoE 分块 / 后端：三种入口都生效（run_hit/run_real 最终也走 launch_mini 的 run_forward）
+  if (val('moeChunk') && val('moeChunk') !== 'auto') env.push(`DS41M_MOE_CHUNK=${val('moeChunk')}`);
+  if (val('moeBackend') && val('moeBackend') !== 'cfg') env.push(`DS41M_MOEMODE=${val('moeBackend')}`);
+  if (val('entry') === 'launch' || val('entry') === 'resident'){
+    if (!chk('replay')){
+      env.push('DS41M_DECODER_REPLAY=0');
+      env.push('DS41M_GRAPH_TAIL=0');
+    } else {
+      if (!chk('graph')) env.push('DS41M_GRAPH_TAIL=0');
+      if (chk('graphCheck')) env.push('DS41M_GRAPH_TAIL_CHECK=1');
+      if (chk('prof') && chk('graph') && chk('graphProf')) env.push('DS41M_GRAPH_TAIL_PROF=1');
+    }
+    if (chk('perLayerCache')) env.push('DS41M_PERLAYER_CACHE=1');
+    if (chk('engramVendor')) env.push('DS41M_ENGRAM_VENDOR=1');
+    if (chk('noBalroute')) env.push('DS41M_NO_BALROUTE=1');
+    if (val('barrier') === 'pass') env.push('DS41M_PASS_BARRIER=1');
+    if (val('barrier') === 'moe') env.push('DS41M_MOE_BARRIER=1');
+  }
+  if (val('entry') === 'launch'){
+    const _dec = num('decode');
+    if (_dec > 0 && val('pdMode') && val('pdMode') !== 'off') {
+      env.push('DS41M_PD_MERGE=1');
+      env.push(`DS41M_DECODE_LAYOUT=${val('pdMode')}`);
+      env.push(`DS41M_DECODE_PREBUILD=${val('pdPrebuild') || '1'}`);
+    }
+  }
+  // 额外环境变量（每行一条）
+  val('extraEnv').split('\n').map(s => s.trim()).filter(Boolean).forEach(s => env.push(s));
+  return env;
+}
+
+function outRoot(){ return (val('outRoot').trim() || '/mnt/xds/sfs/l00972766/tmp/bench_out').replace(/\/+$/,''); }
+
+function buildLaunch(){
+  const a = [];
+  a.push(`--config configs/${val('config')}`);
+  a.push(`--world ${num('world')}`);
+  a.push(`--cards ${val('cards')}`);
+  const _seqRaw = num('seq');
+  const _fullPrompt = isFullPrompt();
+  const seq = _fullPrompt ? 0 : Math.max(1, _seqRaw);
+  a.push(`--seq ${seq}`);
+  const batches = Math.max(1, num('batches'));
+  if (isPacked()){
+    a.push(`--batches ${batches}`, '--batch-mode packed');
+  } else if (batches > 1){
+    a.push(`--batches ${batches}`);
+  }
+  if (val('inputSeed') !== '' && !val('prompt').trim())
+    a.push(`--input-seed ${num('inputSeed')}`);
+  const ids = val('idsFile').trim();
+  if (ids){
+    a.push(`--ids-file ${cmdEscape(ids)}`);
+    a.push(`--ids-offset ${Math.max(0, num('idsOffset'))}`);
+  }
+  if (num('decode') > 0){
+    a.push(`--decode ${num('decode')}`, `--decode-mode ${val('decodeMode')}`);
+  }
+  if (val('prompt').trim()) a.push(`--prompt ${cmdEscape(val('prompt').trim())}`);
+  a.push(`--iters ${Math.max(1, num('iters'))}`);
+  if (num('warmup') > 0) a.push(`--warmup-iters ${num('warmup')}`);
+  if (num('layers') > 0) a.push(`--layers ${num('layers')}`);
+  if (val('weightsPath').trim()) a.push(`--weights-path ${cmdEscape(val('weightsPath').trim())}`);
+  if (chk('prof')){
+    a.push('--prof');
+    a.push(`--prof-ranks ${profRankValue()}`);
+    if (chk('alopMindstudio')) a.push('--alop-config configs/alop_mindstudio.yaml');
+    a.push(`--out ${cmdEscape(outRoot() + '/prof')}`);
+  }
+  if (val('collectLayers').trim()){
+    a.push(`--collect-layers ${cmdEscape(val('collectLayers').trim())}`);
+    a.push(`--collect-ranks ${val('collectRanks')}`);
+  }
+  a.push('--progress off');
+  a.push(`--logdir ${cmdEscape(outRoot() + '/logs')}`);
+  a.push(`--console ${val('console') || 'all'}`);
+  a.push(`--timeout ${num('timeout') || 3600}`);
+  if (val('extraArgs').trim()) a.push(val('extraArgs').trim());
+  return a.join(' ');
+}
+
+function buildHit(){
+  const a = [];
+  a.push(`-L ${prettySeq(num('seq'))}`);
+  if (chk('plain')) a.push('--plain');
+  if (!chk('plain') && val('hitRatio').trim()) a.push(`--hit ${cmdEscape(val('hitRatio').trim())}`);
+  const b = Math.max(1, num('batches'));
+  if (b > 1) a.push(`--batches ${b}`);
+  if (!chk('replay')) a.push('--no-replay');
+  if (chk('replay')){
+    if (!chk('graph')) a.push('--no-graph-tail');
+    if (num('replayW') > 0) a.push(`--replay-w ${num('replayW')}`);
+    if (num('replayCut') > 0) a.push(`--replay-cut ${num('replayCut')}`);
+  }
+  a.push(`--prof-ranks ${profRankValue()}`);
+  if (num('warmup') > 0) a.push(`--prof-warmup ${num('warmup')}`);
+  a.push(`--iters ${Math.max(1, num('iters'))}`);
+  a.push(`--cards ${val('cards')}`);
+  a.push(`--timeout ${num('timeout') || 3600}`);
+  a.push(`--console ${val('console') || 'all'}`);
+  if (!chk('prof')) a.push('--noprof-only');
+  else if (!chk('noprofOnly') && chk('profOnly')) a.push('--prof-only');
+  else if (chk('noprofOnly') && !chk('profOnly')) a.push('--noprof-only');
+  a.push(`-o ${cmdEscape(outRoot())}`);
+  if (val('extraArgs').trim()) a.push(val('extraArgs').trim());
+  return a.join(' ');
+}
+
+function buildReal(){
+  const a = [];
+  a.push(`-L ${prettySeq(num('seq'))}`);
+  a.push(`--mode ${val('realMode')}`);
+  if (val('realMode') !== 'prefill' && val('hitRatio').trim()) a.push(`--hit ${cmdEscape(val('hitRatio').trim())}`);
+  a.push(`--iters ${Math.max(1, num('iters'))}`);
+  if (num('warmup') > 0) a.push(`--warmup-iters ${num('warmup')}`);
+  if (num('layers') > 0) a.push(`--layers ${num('layers')}`);
+  const ids = val('idsFile').trim();
+  if (ids) a.push(`--ids-file ${cmdEscape(ids)}`);
+  if (val('weightsPath').trim()) a.push(`--weights-path ${cmdEscape(val('weightsPath').trim())}`);
+  a.push(`--cards ${val('cards')}`);
+  a.push(`--timeout ${num('timeout') || 3600}`);
+  a.push(`--console ${val('console') || 'all'}`);
+  if (chk('parity')) a.push('--parity');
+  if (chk('engramHost')) a.push('--engram-host');
+  if (chk('noMoeChunk')) a.push('--no-moe-chunk');
+  if (chk('noPrecision')) a.push('--no-precision');
+  if (chk('prof') && chk('alopMindstudio')) a.push('--alop-config configs/alop_mindstudio.yaml');
+  if (chk('prof') && !chk('alopMindstudio')) a.push('--no-alop-config');
+  if (!chk('prof')) a.push('--noprof-only');
+  else if (chk('profOnly') && !chk('noprofOnly')) a.push('--prof-only');
+  else if (chk('noprofOnly') && !chk('profOnly')) a.push('--noprof-only');
+  a.push(`-o ${cmdEscape(outRoot())}`);
+  if (val('extraArgs').trim()) a.push(val('extraArgs').trim());
+  return a.join(' ');
+}
+
+function buildResidentCommand(){
+  const job = (val('resJob').trim() || 'resident').replace(/[^A-Za-z0-9_.-]/g, '_');
+  const root = outRoot();
+  const logdir = root + '/' + job;
+  const cfg = val('config');
+  const mode = val('resMode') || 'auto';
+  const lmax = Math.max(64, num('resLMax') || 1024);
+  const warm = val('resWarm').trim() || '16,32,64,128,256,512,1024';
+  const dec = Math.max(0, num('resDecode') || 32);
+  const rep = Math.max(1, num('resRepeat') || 3);
+  const prompt = val('prompt').trim() || '请用一句话介绍杭州，并说明它最有名的景点。';
+  const hcSock = val('resHcSock').trim() || '/tmp/ds41_moe_host_cache.sock';
+  const hcOn = chk('resHostCache');
+  const env = buildEnv();
+  const sharedTmp = chk('resSharedTmp');
+  const benchRoot = root + '/_jobs';
+  const L = [];
+  L.push('# ── 常驻 benchmark（无 TUI，简单进度条）────────────────────');
+  L.push(`# job=${job} · mode=${mode} · 池容量=${lmax} · 预热=${warm}`);
+  L.push('# 0) 起服务前先确认 8 张卡空闲（有别的容器进程就先别起）：npu-smi info');
+  L.push('# 终端 A：host cache（只有 tp8 需要）→ 8 rank 常驻服务（前台阻塞，Ctrl-C 停止）');
+  L.push(`cd ${WORKDIR}`);
+  L.push('source ./env_pack.sh   # 已生成过也可以 source ./env_local.sh');
+  if (env.length) env.forEach(x => L.push(`export ${x}`));
+  if (sharedTmp){
+    L.push(`export DS41_BENCH_ROOT=${cmdEscape(benchRoot)}`);
+    L.push('# ↑ 终端 B 也要 export 同一个 DS41_BENCH_ROOT（控制 socket 在里面）');
+  }
+  if (hcOn){
+    L.push('# host cache：只有 tp8-fidelity 的 D→P 需要；ep8/auto 可跳过（否则白等加载）');
+    L.push('python3.11 tools/moe_host_cache.py start \\');
+    L.push(`  --config configs/${cfg} \\`);
+    L.push(`  --socket ${cmdEscape(hcSock)} \\`);
+    L.push(`  --layers ${cmdEscape(val('resHcLayers').trim() || '0-39')} \\`);
+    L.push(`  --experts ${cmdEscape(val('resHcExperts').trim() || '0-383')} \\`);
+    L.push('  --progress-bar');
+  }
+  L.push('# ⚠️ 下面这条 server start 会前台阻塞：在终端 A 执行；');
+  L.push('#    终端 B 再执行 warmup / run / stop。');
+  L.push('python3.11 tools/bench_server.py start \\');
+  L.push(`  --config configs/${cfg} \\`);
+  L.push(`  --world ${num('world')} --cards ${val('cards')} \\`);
+  L.push(`  --logdir ${cmdEscape(logdir)} \\`);
+  L.push(`  --job ${cmdEscape(job)} \\`);
+  L.push(`  --mode ${mode} --host-cache ${hcOn ? cmdEscape(hcSock) : 'off'} \\`);
+  if (chk('resWarmOnStart')){
+    L.push(`  --serve-l-max ${lmax} \\`);
+    L.push(`  --warmup-on-start ${cmdEscape(warm)}`);
+  } else {
+    L.push(`  --serve-l-max ${lmax}`);
+  }
+  L.push('');
+  L.push('# 终端 B：预热（未勾“启动后自动预热”时）+ 任意 prompt');
+  L.push('# 每次重启服务都要重新 warmup；--decode 是上限，命中 EOS 提前结束是正常的');
+  L.push(`cd ${WORKDIR} && source ./env_pack.sh`);
+  if (sharedTmp) L.push(`export DS41_BENCH_ROOT=${cmdEscape(benchRoot)}`);
+  if (!chk('resWarmOnStart')){
+    L.push(`python3.11 tools/bench_cli.py warmup --job ${cmdEscape(job)} \\`);
+    L.push(`  --lengths ${cmdEscape(warm)} --decode 1`);
+  }
+  L.push(`python3.11 tools/bench_cli.py run --job ${cmdEscape(job)} \\`);
+  L.push(`  --prompt ${shQuote(prompt)} --decode ${dec} --repeat ${rep}` +
+         (chk('resChat') ? ' --chat' : ''));
+  L.push('');
+  L.push('# 收尾（host cache 是独立 daemon，必须单独停）');
+  L.push(`python3.11 tools/bench_cli.py status --job ${cmdEscape(job)}`);
+  L.push(`python3.11 tools/bench_cli.py stop --job ${cmdEscape(job)}`);
+  if (hcOn && chk('resHostCacheStop')){
+    L.push(`python3.11 tools/moe_host_cache.py stop --socket ${cmdEscape(hcSock)}`);
+  }
+  L.push('');
+  L.push(`# 日志：${logdir}/rank*.log + ${logdir}/all.log`);
+  L.push(`# tail -f ${logdir}/all.log`);
+  return L.join('\n') + '\n';
+}
+
+function buildCommand(){
+  const e = val('entry');
+  if (e === 'resident') return buildResidentCommand();
+  let cmd = `cd ${WORKDIR}\nsource ./env_pack.sh\n\n`;
+  const env = buildEnv();
+  const args = e === 'launch' ? buildLaunch() : (e === 'hit' ? buildHit() : buildReal());
+  const prog = e === 'launch' ? 'python3.11 launch_mini.py' :
+               (e === 'hit' ? 'bash tools/run_hit.sh' : 'bash tools/run_real.sh');
+  const header =
+`# ── DS4.1 mini benchmark ──────────────────────────────
+# 场景：${scenarioName()}
+# 口径：${chipsText()}
+# ──────────────────────────────────────────────────────`;
+  let line = '';
+  if (env.length){
+    line = env.map(x => x + ' \\').join('\n') + '\n' + prog + ' ' + args;
+  } else {
+    line = prog + ' ' + args;
+  }
+  return header + '\n' + cmd + line + '\n';
+}
+
+/* ───────────────────────── 口径/告警/摘要 ───────────────────────── */
+function scenarioName(){
+  const e = val('entry');
+  if (e === 'resident') return '常驻 benchmark（预热后 ≤3s，无 TUI）';
+  if (e === 'hit') return '合成性能（run_hit.sh）';
+  if (e === 'real') return '真权重（run_real.sh）';
+  if (isPacked()) return '直跑 mini · 双 batch packed';
+  if (num('decode') > 0) return '直跑 mini · 增量 decode';
+  return '直跑 mini';
+}
+function topologyText(){
+  const w = num('world');
+  if (val('entry') === 'resident') return `${w} 卡常驻（每卡一进程）· EP${w} · CP1`;
+  if (val('entry') === 'hit' || val('entry') === 'real') return `8 卡 DP8 / EP8 / CP1`;
+  return `${w} 卡 · DP${w}（每卡一个 DP）· EP${w} · CP1`;
+}
+function weightsText(){
+  const c = configInfo();
+  return c && c.weights === 'real' ? '真权重' : '合成权重';
+}
+function isFullPrompt(){
+  return !!val('prompt').trim() && (chk('promptFull') || num('seq') <= 0);
+}
+function batchText(){
+  const b = Math.max(1, num('batches'));
+  if (val('entry') === 'resident') return `任意 prompt（池 ${num('resLMax') || 1024}）+ ${num('resDecode') || 32} 步 decode`;
+  if (val('entry') === 'launch' && isFullPrompt()) return 'prompt 全量 prefill';
+  if (val('entry') === 'real') return `1 × ${num('seq')}`;
+  if (val('entry') === 'hit') return b > 1 ? `每 DP ${b} 个 batch（顺序）` : `1 × ${num('seq')}`;
+  return isPacked() ? `packed ${b} × ${num('seq')}` : `${b} × ${num('seq')}（顺序）`;
+}
+function profText(){
+  if (val('entry') === 'resident') return '常驻模式无 profiler（看简单进度条）';
+  if (!chk('prof')) return '不开 profiler';
+  if (val('entry') === 'real') return 'ALOP · 全部 rank（run_real 固定 8 份）· MindStudio trace';
+  if (val('entry') === 'hit') {
+    const r = val('profRanks') === 'all' ? '全部 rank' : `rank ${profRankValue()}`;
+    return `ALOP · ${r} · MindStudio trace（脚本固定）`;
+  }
+  const r = val('profRanks') === 'all' ? '全部 rank' : `rank ${profRankValue()}`;
+  return `ALOP · ${r}` + (chk('alopMindstudio') ? ' · MindStudio trace' : ' · 内置（无 trace_view）');
+}
+function chipsText(){
+  if (val('entry') === 'resident'){
+    return [weightsText(), topologyText(),
+            `mode=${val('resMode') || 'auto'}`,
+            `池 ${num('resLMax') || 1024}`,
+            `预热 ${val('resWarm').trim() || '16,32,64,128,256,512,1024'}`,
+            chk('resHostCache') ? 'host cache 开' : 'host cache 关',
+            chk('replay') && chk('graph') ? 'replay+入图' : '性能开关降级'].join(' · ');
+  }
+  return [weightsText(), topologyText(), batchText(),
+          chk('replay') ? 'replay 开' : 'replay 关',
+          chk('replay') && chk('graph') ? '尾段入图' : '图关',
+          chk('prof') ? 'ALOP' : '无 prof'].join(' · ');
+}
+
+function collectWarnings(){
+  const W = [], E = [];
+  const e = val('entry');
+  const c = configInfo();
+  const w = num('world');
+  const cards = parseCards(val('cards'));
+
+  if (cards.length !== w) E.push(`卡号数量 ${cards.length} ≠ world ${w}：启动器要求一一对应。`);
+
+  if (e === 'launch'){
+    if (isPacked()){
+      if (num('batches') < 2) W.push('packed 模式下 batches=1 等价单序列，没必要用 packed。');
+      if (num('layers') > 0) E.push('packed 模式不支持 --layers（runner 会直接拒绝）。');
+      if (num('decode') > 0) E.push('packed 模式不支持 decode。');
+      if (val('prompt').trim()) E.push('packed 模式不支持 --prompt。');
+      if (c && c.hit > 0) E.push(`配置 ${c.id} 带 hit.ratio>0，packed 要求 hit.ratio=0。`);
+    }
+    if (num('decode') > 0 && !val('idsFile').trim() && !val('prompt').trim())
+      E.push('decode 需要 ids 文件或 prompt，否则 runner 直接退出。');
+    if (num('decode') > 0 && isPacked()) E.push('decode 与 packed 不能同时用。');
+    if (c && c.weights === 'synthetic' && c.engram && val('idsFile').trim())
+      W.push('合成权重 + engram + 真实 ids：合成 engram 表只有 1M 行，真实 ids 的 n-gram hash 会到 3.84 亿 → 会报“engram id 越界”。改用 packed_plain_2k_noeng.yaml，或不给 ids。');
+    if (c && c.weights === 'real' && w !== 8)
+      W.push('真权重配置的 engram 按 8 卡分片（engram_tp_size=8），非 8 卡需要另行调整。');
+    if (chk('prof') && chk('replay') && chk('graph') && !chk('graphProf'))
+      W.push('prof 时默认不入图（保留逐算子 trace）。要在 trace 里看到尾段图，请勾选“prof 时也入图”。');
+    if (val('collectLayers').trim() && chk('graph'))
+      W.push('--collect-layers 会强制关闭入图（runner 的既有规则）。');
+    if (num('layers') > 0 && c && c.weights === 'real' && num('layers') < 15)
+      W.push('真权重冒烟建议 --layers 15：engram 层是 1 和 14。');
+    if (chk('perLayerCache'))
+      W.push('DS41M_PERLAYER_CACHE=1 是 hit/decode 的正确性开关，普通 prefill 不需要。');
+    if (num('decode') > 0 && val('pdMode') === 'off')
+      W.push('decode 关闭了 P→D 转换：prefill 的 AC 可能已释放 raw 专家权重，decode 首步可能崩；真权重建议开 ep/tp。');
+    if (num('decode') <= 0 && val('pdMode') !== 'off')
+      W.push('P→D 只在 decode 路径触发；当前 decode 步数为 0，不会执行转换。');
+    if (chk('promptFull') && !val('prompt').trim())
+      W.push('勾了“prompt 全量”但没填 prompt：--seq 0 只在 --prompt 时有效。');
+    if (val('prompt').trim() && val('idsFile').trim())
+      W.push('同时给了 ids 文件和 prompt：runner 优先用 ids 文件，prompt 不会生效。');
+  }
+  if (e === 'hit'){
+    if (num('layers') > 0) W.push('run_hit.sh 不支持 --layers。');
+    if (chk('prof') && chk('noprofOnly')) W.push('prof 与“只跑无 prof 轮”冲突，命令按“只跑无 prof”生成。');
+  }
+  if (e === 'real'){
+    if (!val('idsFile').trim())
+      W.push('真权重不给 --ids-file 会退回强均路由 + 合成 id 取表（数值失去精度意义）。');
+    if (chk('prof') && chk('noprofOnly')) W.push('prof 与“只跑无 prof 轮”冲突，命令按“只跑无 prof”生成。');
+  }
+  if (e === 'resident'){
+    const mode = val('resMode') || 'auto';
+    const hcOn = chk('resHostCache');
+    const lmax = Math.max(64, num('resLMax') || 1024);
+    const _ws = val('resWarm').split(',').map(x => parseInt(x.trim(), 10)).filter(x => !isNaN(x));
+    const warmMax = _ws.length ? Math.max(..._ws) : 0;
+    if (w !== 8) E.push('常驻服务按 8 rank / EP8 设计；world 必须 = 8。');
+    if (mode === 'tp8-dual')
+      E.push('tp8-dual 未实现（AC + TP NZ 放不进 91.75 GiB）；请选 ep8 或 tp8-fidelity。');
+    if (mode === 'tp8-fidelity' && !hcOn)
+      E.push('tp8-fidelity 需要 host cache（D→P 从内存回载 33.6 GiB/rank）；请勾选 host cache 或改用 ep8。');
+    if ((mode === 'ep8' || mode === 'auto') && hcOn)
+      W.push('ep8/auto 不需要 host cache；勾选只会白等 269 GiB 的加载（冷页缓存 3–9 min）。');
+    if (warmMax > lmax)
+      E.push(`预热阶梯最大 ${warmMax} > 常驻池容量 ${lmax}：W3 会被截断，请加大池或减小阶梯。`);
+    if (c && c.weights !== 'real')
+      W.push('常驻服务的目标口径是真权重；合成权重也能跑，但 host cache / D→P 没有意义。');
+    if (val('moeBackend') === 'deepgemm')
+      W.push('常驻服务固定 ascendc（PERF_RULES）；deepgemm 选择不会生效。');
+    if (!chk('replay') || !chk('graph'))
+      W.push('性能开关被降级（replay/入图默认必须开）；确认是 A/B，必要时设 DS41_ALLOW_SUBOPTIMAL=原因。');
+    if (!val('prompt').trim())
+      W.push('prompt 为空：生成的 run 命令会用示例 prompt。');
+    if (num('resDecode') + val('prompt').trim().length > lmax)
+      W.push(`prompt 字符数 + decode 步数可能超过池容量 ${lmax}；服务会拒绝超长请求。`);
+  }
+  if (chk('prof') && !chk('alopMindstudio') && (e === 'launch'))
+    W.push('未用 alop_mindstudio.yaml：ALOP 走内置纯 C 级，只有 PROF_* 原始目录，没有 trace_view.json。');
+  if (chk('profOnly') && chk('noprofOnly'))
+    W.push('“只采 trace”和“只跑无 prof”同时勾选：命令里只会保留一个，建议只选一个。');
+
+  if (!E.length && !W.length) W.push('');  // 占位
+  return {W: W.filter(x => x !== ''), E};
+}
+
+function renderMessages(){
+  const {W, E} = collectWarnings();
+  const box = $('msgs');
+  let html = '';
+  if (E.length) html += `<div class="err"><b>不能这样跑：</b><br>${E.map(x => '• ' + x).join('<br>')}</div>`;
+  if (W.length) html += `<div class="warn"><b>注意：</b><br>${W.map(x => '• ' + x).join('<br>')}</div>`;
+  if (!E.length && !W.length) html += `<div class="ok">✓ 选项组合看起来没问题。</div>`;
+  box.innerHTML = html;
+}
+
+function renderChips(){
+  const chips = [
+    ['权重', weightsText()], ['拓扑', topologyText()], ['batch', batchText()],
+    ['replay', chk('replay') ? (chk('graph') ? '开 + 尾段入图' : '开（图关）') : '关'],
+    ['MoE 分块', val('moeChunk') === 'auto' ? 'auto(8192)' : val('moeChunk')],
+    ['prof', profText()]
+  ];
+  if (val('entry') === 'launch' && num('decode') > 0) {
+    chips.push(['decode', `${num('decode')} 步 · ${val('decodeMode')}`]);
+    chips.push(['P→D', val('pdMode') === 'off' ? '关闭' : `${val('pdMode')}${val('pdPrebuild') === '0' ? '·懒构建' : '·预构建'}`]);
+  }
+  if (val('entry') === 'resident') {
+    chips.push(['布局', val('resMode') || 'auto']);
+    chips.push(['池', String(num('resLMax') || 1024)]);
+    chips.push(['预热', val('resWarm').trim() || '16,32,64,128,256,512,1024']);
+    chips.push(['host cache', chk('resHostCache') ? '开' : '关']);
+  }
+  $('chips').innerHTML = chips.map(([k, v]) => `<span class="chip">${k} <b>${v}</b></span>`).join('');
+}
+
+function renderSummary(){
+  const e = val('entry');
+  const c = configInfo();
+  const rows = [];
+  rows.push(['入口', e === 'resident' ? 'bench_server.py + bench_cli.py（常驻，无 TUI）' :
+    (e === 'launch' ? 'launch_mini.py（直跑）' : (e === 'hit' ? 'tools/run_hit.sh（合成一键）' : 'tools/run_real.sh（真权重一键）'))]);
+  rows.push(['配置', (e === 'launch' || e === 'resident') ? `<code>configs/${val('config')}</code>` :
+    (e === 'hit' ? 'run_hit.sh 内部固定（合成 / hit97）' : 'run_real.sh 内部固定（mini_real 口径）')]);
+  rows.push(['权重', weightsText() + (c && c.engram ? ' · engram 开' : ' · engram 关')]);
+  rows.push(['拓扑', topologyText() + ` · 卡 ${val('cards')}`]);
+  rows.push(['序列 / batch', batchText() + ` · 每序列 ${num('seq')} tokens`]);
+  if (e === 'hit') {
+    rows.push(['输入', '合成输入 + fake 前缀（run_hit 固定）']);
+  } else if (e === 'real') {
+    rows.push(['输入', val('idsFile').trim() ? `ids 文件 ${val('idsFile').trim()}` : '未给 ids（会退回强均路由，数值失去精度意义）']);
+  } else if (val('prompt').trim()) {
+    const _pf = chk('promptFull') || num('seq') <= 0;
+    rows.push(['输入', `prompt「${val('prompt').trim().slice(0, 24)}…」· ${_pf ? '全量 prefill（--seq 0）' : '截断到 ' + num('seq')}`]);
+  } else {
+    rows.push(['输入', val('idsFile').trim() ? `ids 文件 ${val('idsFile').trim()}（offset ${num('idsOffset')}）` :
+      `合成随机输入（seed ${num('inputSeed')}）`]);
+  }
+  if (e === 'resident'){
+    rows.push(['常驻布局', `mode=${val('resMode') || 'auto'} · job=${(val('resJob').trim() || 'resident')}`]);
+    rows.push(['池 / 预热', `池 ${num('resLMax') || 1024} · 阶梯 ${val('resWarm').trim() || '16,32,64,128,256,512,1024'}` +
+      (chk('resWarmOnStart') ? '（启动后自动）' : '（手动 warmup）')]);
+    rows.push(['host cache', chk('resHostCache') ?
+      `${val('resHcSock').trim() || '/tmp/ds41_moe_host_cache.sock'} · layers ${val('resHcLayers').trim() || '0-39'} · experts ${val('resHcExperts').trim() || '0-383'}` : '关闭']);
+    rows.push(['请求', `prompt + ${num('resDecode') || 32} 步 decode × ${num('resRepeat') || 3} 次`]);
+  } else if (e === 'launch'){
+    if (num('decode') > 0) {
+      rows.push(['decode', `${num('decode')} 步 · ${val('decodeMode')}`]);
+      rows.push(['P→D', val('pdMode') === 'off' ? '关闭（沿用 prefill 权重）' :
+        `${val('pdMode')} · ${val('pdPrebuild') === '0' ? '按层懒构建' : '预构建全部层'}`]);
+    }
+    if (num('layers') > 0) rows.push(['层数', `只跑前 ${num('layers')} 层（冒烟）`]);
+  } else {
+    rows.push(['阶段', e === 'hit' ? (chk('plain') ? '整段全算（无命中）' : `hit=${val('hitRatio')}`) : `mode=${val('realMode')} · hit=${val('hitRatio')}`]);
+  }
+  rows.push(['性能开关', `replay ${chk('replay')?'开':'关'} · 尾段入图 ${chk('replay')&&chk('graph')?'开':'关'} · MoE 分块 ${val('moeChunk')}`]);
+  rows.push(['Profiling', profText()]);
+  rows.push(['产物', `日志/结果：<code>${outRoot()}</code>` + (chk('prof') && e === 'launch' ? ` · trace：<code>${outRoot()}/prof</code>` : '')]);
+  $('summary').innerHTML = rows.map(([k, v]) => `<div class="row"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+}
+
+function renderExplain(){
+  const e = val('entry');
+  const items = [];
+  if (e === 'resident'){
+    items.push(['bench_server.py start', '拉起 8 个 runner --serve 常驻进程（每卡一个）；前台阻塞，Ctrl-C 整组停。起前先 npu-smi 空气检查。']);
+    items.push(['--mode', 'auto=一律 ep8（同布局、P→D/D→P=0，decode 全量重算 ~0.26s/tok，最稳）；tp8-fidelity 需显式指定且要 host cache；tp8-dual 未实现。']);
+    items.push(['--serve-l-max', '常驻池容量；prompt+decode 超过会被拒绝（不中途重分配池）。']);
+    items.push(['bench_cli.py warmup', 'W1 干净 prefill、W2 建常驻 AC（ep8 全量 decode 不再建 NZ）、W3 逐形状预热；每桶约 0.15–0.2s。每次重启服务都要重跑。']);
+    items.push(['bench_cli.py run', 'prefill → P→D → decode → D→P，逐段进度条；结果取 8 rank 的 max 计时。--decode 是上限，命中 EOS 提前结束正常；完整文本在结果里单独打印。']);
+    items.push(['bench_cli.py status/stop', 'status 看 warmed/ac_layers/nz_layers/显存；stop 整组退出。']);
+    items.push(['moe_host_cache.py', '独立 daemon，手动开/停；只有 tp8 需要；全量 268.9 GiB，冷页缓存 3–9 min，热约 3 min。']);
+    items.push(['--job / socket', '控制 socket 在 /tmp/ds41_bench/<job>/（可用 DS41_BENCH_ROOT 改根目录，终端 A/B 要一致）；客户端断开不影响常驻服务。']);
+  } else if (e === 'launch'){
+    items.push(['--config', '选模型结构与权重来源（合成/真权重、engram 开关）。']);
+    items.push(['--world / --cards', '起几个 rank（=几张卡）以及用哪些物理卡；launcher 会给每个 rank 只暴露它那张卡。']);
+    items.push(['--seq', '每条序列的 token 数；packed 模式下总 T = seq × batches。']);
+    items.push(['--batches / --batch-mode packed', '每 DP 的 batch 数；packed = 拼成一次 varlen 前向（cu_seqlens），sequential = 顺序跑多遍。']);
+    items.push(['--input-seed / --ids-file / --ids-offset', '合成输入用固定 seed 复现；给了 ids 文件就按 [offset, offset+seq) 取真实 token。']);
+    items.push(['--decode / --decode-mode', '续写步数与算法：inc = 每步只算 1 个 token（真实 decode 形态），full = 每步全量重算（金标准）。']);
+    items.push(['--iters / --warmup-iters', '前向轮数；warmup 轮不进 profiler，真权重首轮含权重装载时建议加。']);
+    items.push(['--prof / --prof-ranks / --alop-config / --out', 'ALOP 采集；prof-ranks=0 只给一张卡落 trace；alop_mindstudio.yaml 产出 MindStudio 的 trace_view.json。']);
+    items.push(['--collect-layers / --collect-ranks', '逐层 dump hidden（与官方同表达式），对拍用；开了会关掉尾段入图。']);
+    items.push(['--logdir / --console / --timeout', '启动器的日志目录、控制台回显范围、超时（秒）。']);
+    items.push(['--prompt / --seq 0', '自定义 prompt；--seq 0 = 按 prompt 的完整 token 数做全量 prefill（不截断）。']);
+    items.push(['DS41M_PD_MERGE / DS41M_DECODE_LAYOUT', '单机 P→D：prefill 完在同一进程里把专家权重转成 decode 形态（ep=dispatch/combine，tp=全专家×I/tp）。']);
+    items.push(['DS41M_DECODE_PREBUILD', '1=转换时预构建全部层并释放 raw（首步不抖）；0=按层懒构建。']);
+  } else if (e === 'hit'){
+    items.push(['-L', '序列长度点位，可写 16k/64k 或原始数字；脚本按点位循环。']);
+    items.push(['--hit / --plain', '命中率（0.97 / 97% / 97）或整段全算。']);
+    items.push(['--batches', '每个 DP 顺序跑的 batch 数（每个 batch 独立输入）。']);
+    items.push(['--no-replay / --no-graph-tail', 'A/B 用：关 replay 或关尾段入图。']);
+    items.push(['--prof-ranks / --prof-warmup / --iters', 'trace 落哪些 rank、prof 轮预热几个 pass、稳态轮数。']);
+    items.push(['-o', '输出根目录（日志、SUMMARY、默认 trace 都在下面）。']);
+  } else {
+    items.push(['-L / --mode', '序列长度与阶段：prefill（全长）/ hit（命中）/ both。']);
+    items.push(['--ids-file', '真权重必给（parity/ids_16k.pt）；不给会退回强均路由，数值失去精度意义。']);
+    items.push(['--iters / --warmup-iters / --layers', '轮数、预热轮、只跑前 N 层（冒烟建议 15）。']);
+    items.push(['--parity', '额外一轮逐层 dump，与官方参考对拍。']);
+    items.push(['--engram-host / --no-moe-chunk / --no-precision', '逃生与 A/B 开关：主机取表、关 MoE 分块、跳过精度 gate。']);
+    items.push(['-o / --alop-config', '输出根目录；ALOP 档位（默认 MindStudio）。']);
+  }
+  items.push(['source ./env_pack.sh', '拼出可运行环境（CANN/厂商算子/依赖），必须在 ds41_mini 目录下执行。']);
+  $('explain').innerHTML = '<ul>' + items.map(([k, v]) => `<li><b>${k}</b>：${v}</li>`).join('') + '</ul>';
+}
+
+/* ───────────────────────── 汇总刷新 ───────────────────────── */
+function refresh(){
+  syncEntryVisibility();
+  const cmd = buildCommand();
+  $('cmd').textContent = cmd;
+  renderChips();
+  renderMessages();
+  renderSummary();
+  renderExplain();
+}
+
+/* ───────────────────────── 事件绑定 ───────────────────────── */
+function bind(){
+  document.querySelectorAll('input,select,textarea').forEach(el => {
+    el.addEventListener('input', refresh);
+    el.addEventListener('change', refresh);
+  });
+  $('config').addEventListener('change', updateCfgDesc);
+  $('presets').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-preset]');
+    if (!b) return;
+    document.querySelectorAll('#presets button').forEach(x => x.classList.toggle('on', x === b));
+    PRESETS[b.dataset.preset]();
+    refresh();
+  });
+  $('copyBtn').addEventListener('click', async () => {
+    const text = $('cmd').textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+    }
+    const t = $('toast'); t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 1200);
+  });
+  $('dlBtn').addEventListener('click', () => {
+    const blob = new Blob([$('cmd').textContent], {type:'text/x-shellscript'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'run_bench.sh';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  });
+}
+
+/* ───────────────────────── 初始化 ───────────────────────── */
+function initConfigSelect(){
+  const sel = $('config');
+  sel.innerHTML = CONFIGS.map(c => `<option value="${c.id}">${c.name} — configs/${c.id}</option>`).join('');
+}
+initConfigSelect();
+bind();
+PRESETS.packed_on();
+document.querySelector('#presets button[data-preset="packed_on"]').classList.add('on');
+refresh();
+</script>
+</body>
+</html>

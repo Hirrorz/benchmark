@@ -1,0 +1,135 @@
+model:
+  name: deepseek_v4_1_flash
+  hidden: 5120
+  moe_intermediate: 2304
+  swiglu_limit: 10.0     # 官方 config.swiglu_limit（mega_moe activation_clamp）
+  n_layers: 40
+  n_routed_experts: 384
+  n_shared_experts: 1
+  topk: 6
+  sliding_window: 128
+  compress_ratios:
+  - 0
+  - 0
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 2
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  kv_source_layers:
+  - 2
+  - 8
+  - 14
+  - 20
+  index_source_layers:
+  - 2
+  - 8
+  - 14
+  - 20
+  - 24
+  - 28
+  - 32
+  - 36
+  candidate_source_layer: 20
+  engram_layers:
+  - 1
+  - 14
+  engram_offload: true
+  # ★ 2026-10-16 必设：不设=1 → 厂商 ElasticBuffer 每卡拷整张 384M 行表（≈103 GiB 拷贝 +
+  #   103 GiB pinned 窗口）×8 卡 ≈ 1.6 TB（实测 hint 口径），机器会被 OOM killer 收尸。
+  #   设 8 = 官方同口径（light_8card_ep8_real_parity.yaml:36），每卡 ~12.9 GiB。
+  #   单卡路径不受影响（厂商路径要求 ≥2 rank）。
+  engram_tp_size: 8
+  n_attention_heads: 64
+  head_dim: 512
+  qk_rope_head_dim: 64
+  q_lora_rank: 1280
+  o_lora_rank: 1024
+  o_groups: 8
+  hc_mult: 4
+  hc_sinkhorn_iters: 20
+  hc_eps: 1.0e-06
+  rms_norm_eps: 1.0e-20
+  scoring_func: sqrtsoftplus
+  routed_scaling_factor: 1.5
+  rope_theta: 10000
+  compress_rope_theta: 160000   # ★ comp 层（ratio>0）的 rope base，与 win 层不同
+  rope_scaling:                  # 真权重 config.json 的 text_config.rope_scaling
+    rope_type: yarn
+    factor: 16
+    beta_fast: 32
+    beta_slow: 1
+    original_max_position_embeddings: 65536
+  index_n_heads: 32
+  index_head_dim: 128
+  index_topk: 512
+parallel_config:
+  world_size: 1
+  cp_size: 1
+  moe_ep_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 1
+  lmhead_tp_size: 1
+  _ep_rank: 0
+run:
+  seq_len: 1024
+  batch: 1
+  iters: 1
+  moe_chunk_max_len: 8192
+weights:
+  mode: real
+  path: /mnt/xds/sfs/DeepSeek-V4.1-Flash-cann-mxfp8-mxfp4
+  engram_table_rows: 1048576
+  # lazy_experts: 不显式设置 → 代码按运行卡数决定（EP8/多卡=常驻，单卡=逐层）。2026-10-18 用户口径
+  host_cache: true             # ★ 真权重第一次读进**主机内存**(pinned)，之后从内存拷卡
+                               #   NFS ~1 GB/s → 内存 10+ GB/s；实测 40 层：首遍 52.1s → 再遍 1.2s
+                               #   收益只在**多次前向**（decode / 反复跑）；单次 prefill 用不上（每层只读一次）
+  resident: false              # ★ true = 关闭按层加载，40 层权重全部常驻
+                               #   显存：EP8 专家 34 GB + 注意力/共享 ~2 GB → 装得下 ✓
+                               #         EP4 68 GB 很紧 ✗、EP1/EP2 不可能 ✗；数值与流式完全一致 ✓
+backends:
+  hc_post: tilelang        # ★ 与参考配置一致（官方 light_8card_ep8_real.yaml：hc_post: tilelang）
+  megamoe: deepgemm
+  indexer_prolog_qw: ascendc
+  gate_topk: tilelang
+  engram: tilelang
+  swiglu: fused
+hit:
+  ratio: 0.0
+  source: fake
+  replay_tail: 140
+features:
+  decoder_replay: false

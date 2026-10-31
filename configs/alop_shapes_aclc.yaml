@@ -1,0 +1,28 @@
+# ALOP 采集配置 —— 用户口径（2026-10-26）：只用 ACL C 级，python_profiling 全关
+#   假设：aicore_metrics=true 会带出算子 shape（不需要 op_attr / record_shapes）
+#   注意：2026-10-22 实测 aicore_metrics=true + 图 replay + prof + 大 T 曾崩 507011；
+#        入图已于 2026-10-27 永久删除 ⇒ 该组合不存在。若大 T + prof 仍崩，先降 size 复现定位。
+profiling_config:
+  aicore_metric: "PipeUtilization"
+  data_types:
+    acl_api: true
+    task_time: true
+    aicore_metrics: true
+    aicpu: false
+    l2cache: false
+    hccl_trace: false
+    training_trace: false
+    msproftx: false
+    runtime_api: false
+    task_time_l0: false
+    task_memory: false
+    task_time_l2: false
+    op_attr: false
+    task_time_l3: false
+python_profiling_config:
+  enabled: false
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_flops: false
+  with_modules: false

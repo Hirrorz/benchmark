@@ -1,0 +1,25 @@
+# ALOP 采集配置 —— 用户口径（2026-10-26 v2）：ACL C 级 + acl_api 时长；python_profiling 全关
+profiling_config:
+  aicore_metric: "PipeUtilization"
+  data_types:
+    acl_api: true
+    task_time: true
+    aicore_metrics: false
+    aicpu: false
+    l2cache: false
+    hccl_trace: false
+    training_trace: false
+    msproftx: false
+    runtime_api: false
+    task_time_l0: false
+    task_memory: false
+    task_time_l2: false
+    op_attr: false
+    task_time_l3: false
+python_profiling_config:
+  enabled: false
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_flops: false
+  with_modules: false

@@ -1,0 +1,36 @@
+# ============================================================================
+# 策略规则（声明式）—— 2026-10-26 从代码硬编码抽离（照 DeepInfer config.py 做法）
+#   优先级：环境变量（DS41M_*/DS41_ALLOW_*） > 本文件 > 代码内兜底默认
+#   本文件只放"规则/策略"，不放模型结构（模型结构见 configs/mini_*.yaml）
+# ============================================================================
+parallel:
+  ep: 8
+  tp: 1
+  cp: 1
+  dp: auto            # auto → max(1, ep // cp)（同 DeepInfer ParallelConfig 推导）
+moe:
+  backend: deepgemm   # deepgemm | ascendc
+  chunk_max_len: auto # auto → 4096（真权重）/ 8192（合成），见 configs/mini_*.yaml
+replay:
+  enabled: true
+  keep_tokens: 140    # V4.1 官方 KEEP；规则下界 window+backtracking=134
+  cut: auto           # auto → max(kv_source_layers)+1
+graph:
+  enabled: false      # 2026-10-26 用户规则：默认不入图
+  allow_if:           # 仅当以下条件同时满足才允许（仍需显式开启）
+    replay: true
+    max_T: 0          # 0 = 不限制；>0 表示只有 T<=max_T 才允许
+    weights: any      # any | synth | real
+indexer:
+  variant: varlen     # varlen（唯一口径）；cp_legacy 仅 CP 内部过渡
+decoder:
+  graph: false        # DS41M_DECODE_GRAPH
+hit:
+  stages: [A, B]      # 命中分段命名（stage A=前缀命中，B=尾巴）
+runahead:
+  # 有界抢跑环（core/runner.py:_RUNAHEAD_MIN_T）：T_pass >= min_t_pass 才建环。
+  # 依据（2026-10-26 T-046，邻机 099 交错 A/B，0-error）：
+  #   64k@0.97（T_pass=2106）K=0 122.9 / K=1 137.4 / K=2 133.5 / K=3 130.0
+  #   ⇒ 小 T 上环净亏 10.6ms；大 T（≥min_t_pass）保留环，防 MegaMoE barrier timeout。
+  # 详见 NOTES/2026-10-26-runahead-k0-and-host-serial.md
+  min_t_pass: 8192

@@ -1,0 +1,3833 @@
+# DS4.1 mini 模块规格（配置即事实源；人工可编辑）
+# 规则：每个模块只声明自己的 requires/provides/weights/params；
+#       父节点/容器不汇总子节点 I/O；缺失键沿祖先作用域解析。
+#       params 支持字面量与 "${key}" 引用（由 modules.context.Scope 求值）。
+# 修改后跑 tools/check_module_spec.py 与 export_model_html --check。
+schema: ds41_mini/module-spec@1
+note: 模块接口唯一事实源：每个模块只声明自己的 requires/provides/weights/params；容器/父节点不汇总子节点 I/O，读取时沿祖先作用域解析。
+modules:
+- op: add
+  impl: exec_ops:_add
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - x
+  weights: []
+  flags:
+  - placeholder
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 1910
+    end_line: 1926
+  doc: 纯占位（数值恒等；默认不下发，DS41M_PAD_OPS=1 才进 trace）
+  category: placeholder
+- op: boundary_cut
+  impl: runner:_boundary_cut_dispatch
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: hidden.residual
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    shape: '[T,H]'
+    legacy:
+    - residual
+  - key: hc.pre_t
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - hc_pre_t
+  - key: hc.post_t
+    type: tuple[Tensor,Tensor]
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - hc_post_t
+  - key: attn.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - kv
+  - key: geometry.full_len
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - L_full
+  - key: batch.row_lens
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - row_lens
+  - key: batch.seq_lens
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - seq_lens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - n_seqs
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: cache.suffix.win
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_win
+  - key: external.cp_state
+    type: CpState|None
+    storage: external
+    tier: external
+    mutation: new
+    shadow: single_writer
+    optional: true
+  provides:
+  - key: geometry.rows
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: replace
+    shadow: single_writer
+    optional: false
+    legacy:
+    - T
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: replace
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+    roles:
+    - compact_start
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: replace
+    shadow: single_writer
+    optional: false
+    legacy:
+    - cu_seqlens
+  - key: indexer.k_ready
+    type: bool
+    storage: ctx
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx_k_ready
+  - key: hidden.residual
+    type: int
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - residual
+  - key: hc.pre_t
+    type: int
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_pre_t
+  - key: hc.post_t
+    type: int
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_post_t
+  - key: attn.kv
+    type: int
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    condition: cp.active
+    legacy:
+    - kv
+  weights: []
+  flags:
+  - boundary_only
+  - runner_hook
+  calls: 1
+  rows_phase: same
+  source:
+    file: runner.py
+    line: 1846
+    end_line: 1990
+  doc: 边界层截尾（host 钩子，非 OPS 函数）：hidden/residual/hc/q/idx_*/kv → keep 行
+  category: boundary
+- op: cast
+  impl: exec_ops:_cast
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - x
+  weights: []
+  flags:
+  - placeholder
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 1910
+    end_line: 1926
+  doc: 纯占位（数值恒等；默认不下发，DS41M_PAD_OPS=1 才进 trace）
+  category: placeholder
+- op: combine
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: dispatch
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: dyn_mx_quant
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - implicit
+  - no_impl
+  - trace_only
+  calls: 1
+  rows_phase: same
+  doc: ★隐式算子：由 _qmm / wo_a 内部产生，执行侧不单独下发（只做 trace 计数）
+  category: implicit
+- op: engram_fetch
+  impl: exec_engram:_engram_fetch
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: input.ids
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    shape: '[B,L]'
+    legacy:
+    - input_ids
+  - key: layer.index
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx
+  - key: model.engram_rows
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - engram_rows
+  - key: model.engram_tp_size
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - engram_tp_size
+  - key: process.engram_tp_rank
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - engram_tp_rank
+  provides:
+  - key: engram.ids
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads]'
+  - key: engram.future
+    type: object
+    storage: st
+    tier: module
+    mutation: new
+    shadow: hidden
+    optional: false
+    legacy:
+    - _engram_fut
+  weights:
+  - suffix: engram.embed.weight
+    via: raw
+    role: read
+  - suffix: engram.embed.scale
+    via: raw
+    role: read
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_engram.py
+    line: 598
+    end_line: 649
+  doc: ngram hash + 取表（可走侧流/厂商 ElasticBuffer）
+  category: engram
+- op: engram_proj
+  impl: exec_engram:_engram_proj
+  requires:
+  - key: engram.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,6144]'
+    legacy:
+    - engram_kv
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: model.hc_mult
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_mult
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.rms_norm_eps
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - eps
+  - key: layer.index
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx
+  provides:
+  - key: engram.proj_out
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,hc_mult+1,H]'
+    legacy:
+    - engram_proj_out
+  - key: engram.out
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - engram_out
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: replace
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: hidden.residual
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: replace
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - residual
+  weights:
+  - suffix: engram.wkv.weight
+    via: _packed
+    role: read_packed
+    packed_key: engram.wkv.weight
+  - suffix: engram.wkv.scale
+    via: _packed
+    role: read_packed
+    packed_key: engram.wkv.weight
+  - suffix: engram.q_weight
+    via: raw
+    role: read
+  - suffix: engram.k_weight
+    via: raw
+    role: read
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_engram.py
+    line: 771
+    end_line: 783
+  doc: engram 投影 + gate（覆盖残差流；官方 DecoderLayer 第一步）
+  category: engram
+  params:
+    hc_mult: ${model.hc_mult}
+- op: engram_wait
+  impl: exec_engram:_engram_wait
+  requires:
+  - key: engram.ids
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+  - key: engram.future
+    type: object
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - _engram_fut
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: layer.index
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx
+  provides:
+  - key: engram.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,6144]'
+    legacy:
+    - engram_kv
+  weights: []
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_engram.py
+    line: 652
+    end_line: 730
+  doc: join 后台取表 → embeddings（H2D）
+  category: engram
+- op: finalize
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: gate
+  impl: exec_ops:_gate
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.n_routed_experts
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  provides:
+  - key: moe.logits
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_experts]'
+    legacy:
+    - logits
+  weights:
+  - suffix: ffn.gate.weight
+    via: raw
+    role: read
+  - suffix: ffn.gate.weight.T
+    via: synthetic
+    role: read_packed
+    packed_key: ffn.gate.weight.T
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 774
+    end_line: 783
+  doc: 路由打分（FusedMatMul：T×5120 @ 384×5120）
+  category: moe
+- op: gate_topk
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - declared_only
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: opgraph 声明但当前配方未使用
+  category: moe
+- op: gather_tail
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - declared_only
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: opgraph 声明但当前配方未使用
+  category: boundary
+- op: gating
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: gating_sort
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: gmm
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: hc_post
+  impl: exec_ops:_hc_post
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: stream
+    optional: false
+    shape: '[T,hc_mult,H]'
+    legacy:
+    - x
+  - key: hidden.residual
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: stream
+    optional: false
+    shape: '[T,hc_mult,H]'
+    legacy:
+    - residual
+  - key: hc.post_t
+    type: tuple[Tensor,Tensor]
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_post_t
+  - key: hc.stage
+    type: str
+    storage: container
+    tier: container
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - _norm_stage
+  - key: process.backends
+    type: dict
+    storage: st
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - _backends
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.hc_mult
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_mult
+  provides:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: replace
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: hidden.residual
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: replace
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    condition: stage=attn
+    legacy:
+    - residual
+  weights: []
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 366
+    end_line: 413
+  doc: hyper-connection 后处理（mhc_post）；attn 段后同时刷新 residual
+  category: common
+  params:
+    hidden: ${model.hidden}
+    hc_mult: ${model.hc_mult}
+- op: hc_pre
+  impl: exec_ops:_hc_pre
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: stream
+    optional: false
+    shape: '[T,hc_mult,H]'
+    legacy:
+    - x
+  - key: hc.stage
+    type: str
+    storage: container
+    tier: container
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - _norm_stage
+  - key: hc.pre_t
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    shape: '[T,hc_mult]'
+    legacy:
+    - hc_pre_t
+  - key: hc.ffn_pre
+    type: Tensor
+    storage: cache
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    shape: '[T,hc_mult]'
+    legacy:
+    - _ffn_pre
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.hc_mult
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_mult
+  - key: model.hc_sinkhorn_iters
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_sinkhorn_iters
+  - key: model.hc_eps
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - hc_eps
+  - key: hc.pad_ref
+    type: int
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - hc_pad_ref
+  - key: hc.pad_cap
+    type: int
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - hc_pad_cap
+  - key: layer.index
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx
+  provides:
+  - key: hc.pre_t
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    shape: '[T,hc_mult]'
+    legacy:
+    - hc_pre_t
+  - key: hc.post_t
+    type: tuple[Tensor,Tensor]
+    storage: st
+    tier: module
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    legacy:
+    - hc_post_t
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: stream
+    optional: false
+    shape: '[T,hc_mult,H]'
+    legacy:
+    - x
+  - key: hc.ffn_pre
+    type: Tensor
+    storage: cache
+    tier: module
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    shape: '[T,hc_mult]'
+    condition: stage=ffn
+    legacy:
+    - _ffn_pre
+  weights:
+  - suffix: hc_attn_fn
+    via: raw
+    role: read
+    condition: stage=attn
+  - suffix: hc_attn_scale
+    via: raw
+    role: read
+    condition: stage=attn
+  - suffix: hc_attn_base
+    via: raw
+    role: read
+    condition: stage=attn
+  - suffix: hc_ffn_fn
+    via: raw
+    role: read
+    condition: stage=ffn
+  - suffix: hc_ffn_scale
+    via: raw
+    role: read
+    condition: stage=ffn
+  - suffix: hc_ffn_base
+    via: raw
+    role: read
+    condition: stage=ffn
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 289
+    end_line: 363
+  doc: hyper-connection 预处理（npu_hc_pre_v2）：出 post/comb/pre；ffn 段的 pre 跨层传递
+  category: common
+  params:
+    hidden: ${model.hidden}
+    hc_mult: ${model.hc_mult}
+    sinkhorn_iters: ${model.hc_sinkhorn_iters}
+- op: idx_k_write
+  impl: exec_indexer:_idx_k_write
+  requires:
+  - key: cmp.latent
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[N,512]'
+    legacy:
+    - cmp_latent
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - ratio
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: batch.seq_lens
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - seq_lens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - n_seqs
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: model.rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_theta
+  - key: model.rope_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_dim
+  - key: model.rope_scaling
+    type: dict
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_scaling
+  - key: model.compress_rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - compress_rope_theta
+  - key: model.candidate_block_size
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - candidate_block_size
+  - key: layer.roles.candidate_source
+    type: bool
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - is_candidate
+  provides:
+  - key: cache.idx.k
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    shape: '[1+nblk,128,1,64]'
+  - key: cache.idx.ks
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    shape: '[1+nblk,128,1,2,2]'
+  - key: cache.idx.nblk
+    type: int
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+  - key: cache.idx.qsli
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    condition: is_candidate
+  weights:
+  - suffix: attn.indexer.wk.weight
+    via: raw
+    role: read
+  - suffix: attn.indexer.k_norm.weight
+    via: raw
+    role: read
+  - suffix: attn.indexer.k_norm.weight.f32
+    via: synthetic
+    role: read_packed
+    packed_key: attn.indexer.k_norm.weight.f32
+  flags:
+  - boundary_only
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_indexer.py
+    line: 513
+    end_line: 526
+  doc: 索引 K 缓存写入（边界 split 的 KV 路径；官方 update_indexer_cache）
+  category: indexer
+  params:
+    candidate_block_size: 8
+- op: idx_prolog
+  impl: exec_indexer:_idx_prolog
+  requires:
+  - key: attn.qr
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,q_lora]'
+    legacy:
+    - qr
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - n_seqs
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - ratio
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: model.head_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - head_dim
+  - key: model.index_head_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  - key: model.index_n_heads
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  - key: model.rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_theta
+  - key: model.rope_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_dim
+  - key: model.rope_scaling
+    type: dict
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_scaling
+  - key: model.compress_rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - compress_rope_theta
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: cp.abs_positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_abs_positions
+  - key: cp.total_q
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_total_q
+  provides:
+  - key: idx.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads,64]'
+    legacy:
+    - idx_q
+  - key: idx.descale_q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads,2,2]'
+    legacy:
+    - idx_descale_q
+  - key: idx.w
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads]'
+    legacy:
+    - idx_w
+  weights:
+  - suffix: attn.indexer.wq_b.weight
+    via: _packed
+    role: read_packed
+    packed_key: attn.indexer.wq_b.weight
+  - suffix: attn.indexer.wq_b.scale
+    via: _packed
+    role: read_packed
+    packed_key: attn.indexer.wq_b.weight
+  - suffix: attn.indexer.weights_proj.weight
+    via: raw
+    role: read
+  - suffix: attn.indexer.wq_b.scale.pairs
+    via: synthetic
+    role: read_packed
+    packed_key: attn.indexer.wq_b.scale.pairs
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_indexer.py
+    line: 154
+    end_line: 226
+  doc: 索引器 query 侧（indexer_prologue_qw；CP 下按参考 M 补零）
+  category: indexer
+- op: kv_compress
+  impl: exec_ops:_kv_compress
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: geometry.full_len
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - L_full
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: position.hit_replay_tail
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - hit_replay_tail
+  - key: layer.index
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - ratio
+  - key: model.head_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - head_dim
+  - key: model.rope_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - rope_dim
+  - key: model.compress_rope_theta
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - compress_rope_theta
+  - key: model.rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_theta
+  - key: model.rope_scaling
+    type: dict
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_scaling
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: cache.suffix.cmp
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_cmp
+  - key: compressor.state_block
+    type: int
+    storage: ctx
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - state_block
+  - key: compressor.t_override
+    type: int
+    storage: ctx
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - _cmp_T
+  - key: compressor.pre
+    type: Tensor
+    storage: ctx
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - _cmp_pre
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - n_seqs
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: cache.cmp.state
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+  provides:
+  - key: cmp.latent
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T//ratio+1,512]'
+    legacy:
+    - cmp_latent
+  - key: cmp.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T//ratio+1,512]'
+    legacy:
+    - cmp_kv
+  - key: cache.cmp.pool
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+  - key: cache.cmp.nblk
+    type: int
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+  - key: cache.cmp.len
+    type: int|Tensor[B]
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    legacy:
+    - cmp_len
+  - key: cache.cmp.state
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+  weights:
+  - suffix: attn.compressor.wkv.weight
+    via: raw
+    role: read
+  - suffix: attn.compressor.wgate.weight
+    via: raw
+    role: read
+    condition: ratio>1
+  - suffix: attn.compressor.norm.weight
+    via: raw
+    role: read
+  - suffix: attn.compressor.norm.weight.f32
+    via: synthetic
+    role: read_packed
+    packed_key: attn.compressor.norm.weight.f32
+  flags:
+  - packed_variant
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 1085
+    end_line: 1404
+  dispatch: packed_if:batch.is_packed && !cp.active
+  doc: 压缩 KV 写入（DeepInfer 口径；CP 时先 gather hidden 再跑全长）
+  category: compressor
+  params:
+    ratio: ${layer.ratio}
+- op: kv_epilog
+  impl: exec_ops:_kv_epilog
+  requires:
+  - key: attn.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,512]'
+    legacy:
+    - kv
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: geometry.full_len
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - L_full
+  - key: model.sliding_window
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - S
+  - key: model.head_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - head_dim
+  - key: model.win_keep
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - win_keep
+  - key: position.win_abs
+    type: bool
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - win_abs
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - n_seqs
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: cache.suffix.win
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_win
+  - key: cache.win.pool
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+  provides:
+  - key: cache.win.pool
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    shape: '[win_slots,544]'
+  - key: cache.win.nblk
+    type: int
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+  weights: []
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 925
+    end_line: 1017
+  doc: KV cache epilog：把 kv 写进滑窗池 A/B（KvCompressEpilogV2）
+  category: attention
+  params:
+    sliding_window: ${model.sliding_window}
+    win_keep: ${model.win_keep}
+- op: kv_norm
+  impl: exec_ops:_kv_norm
+  requires:
+  - key: attn.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,512]'
+    legacy:
+    - kv
+  provides:
+  - key: attn.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    shape: '[T,512]'
+    legacy:
+    - kv
+  weights:
+  - suffix: attn.kv_norm.weight
+    via: raw
+    role: read
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 465
+    end_line: 467
+  doc: 压缩 KV 上的 RmsNorm
+  category: attention
+- op: mega_moe
+  impl: exec_moe:_mega_moe
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: moe.topk_idx
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,topk]'
+    legacy:
+    - topk_idx
+  - key: moe.topk_weight
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,topk]'
+    legacy:
+    - topk_weight
+  - key: geometry.full_len
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - L_full
+  - key: layer.index
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.moe_topk
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - rtopk
+    - topk
+  - key: moe.e_local
+    type: int
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - e_local
+  - key: geometry.chunk
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - chunk
+  - key: moe.nspan
+    type: int
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - moe_nspan
+  - key: model.moe_intermediate
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - I
+  - key: model.swiglu_limit
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - swiglu_limit
+  - key: process.src
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - _src
+  provides:
+  - key: moe.out
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - moe_out
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: replace
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  weights:
+  - suffix: ffn.experts.{E}.w1.weight
+    via: raw
+    role: read
+  - suffix: ffn.experts.{E}.w1.scale
+    via: raw
+    role: read
+  - suffix: ffn.experts.{E}.w2.weight
+    via: raw
+    role: read
+  - suffix: ffn.experts.{E}.w2.scale
+    via: raw
+    role: read
+  - suffix: ffn.experts.{E}.w3.weight
+    via: raw
+    role: read
+  - suffix: ffn.experts.{E}.w3.scale
+    via: raw
+    role: read
+  - suffix: ffn.shared_experts.w1.weight
+    via: raw
+    role: read
+  - suffix: ffn.shared_experts.w1.scale
+    via: raw
+    role: read
+  - suffix: ffn.shared_experts.w2.weight
+    via: raw
+    role: read
+  - suffix: ffn.shared_experts.w2.scale
+    via: raw
+    role: read
+  - suffix: ffn.shared_experts.w3.weight
+    via: raw
+    role: read
+  - suffix: ffn.shared_experts.w3.scale
+    via: raw
+    role: read
+  flags:
+  - fused
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_moe.py
+    line: 919
+    end_line: 1088
+  intrinsics:
+  - dispatch
+  - gmm
+  - swiglu_quant
+  - combine
+  - finalize
+  doc: 融合 MoE（MegaMoE：路由/分发/分组MM/SwiGLU/合并；按 chunk 分 span）
+  category: moe
+  params:
+    topk: ${model.moe_topk}
+- op: mqsmla
+  impl: exec_ops:_mqsmla
+  requires:
+  - key: attn.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads,head_dim]'
+    legacy:
+    - q
+  - key: cmp.latent
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    shape: '[T//ratio,512]'
+    legacy:
+    - cmp_latent
+  - key: idx.sparse
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cmp_sparse_indices
+    - idx_sparse
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: cp.total_q
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_total_q
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: batch.seq_lens
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - seq_lens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - n_seqs
+  - key: layer.index
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - ratio
+  - key: model.index_topk
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - index_topk
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: position.win_abs
+    type: bool
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - win_abs
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: cache.suffix.win
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_win
+  - key: cache.suffix.cmp
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_cmp
+  - key: cache.suffix.idx
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_idx
+  - key: cache.win.pool
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+  - key: cache.cmp.pool
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+  - key: cache.cmp.len
+    type: int|Tensor[B]
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - cmp_len
+  - key: cache.idx.k
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+  provides:
+  - key: attn.out
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads*head_dim]'
+    legacy:
+    - attn_out
+  weights:
+  - suffix: attn.attn_sink
+    via: F32
+    role: read
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 1503
+    end_line: 1905
+  doc: ds41 稀疏量化 MLA（窗口池 + 压缩索引）
+  category: attention
+  params:
+    index_topk: ${model.index_topk}
+- op: mul
+  impl: exec_ops:_mul
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - x
+  weights: []
+  flags:
+  - placeholder
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 1910
+    end_line: 1926
+  doc: 纯占位（数值恒等；默认不下发，DS41M_PAD_OPS=1 才进 trace）
+  category: placeholder
+- op: q_norm
+  impl: exec_ops:_q_norm
+  requires:
+  - key: attn.qr
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,q_lora]'
+    legacy:
+    - qr
+  - key: model.q_lora_rank
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  provides:
+  - key: attn.qr
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    shape: '[T,q_lora]'
+    legacy:
+    - qr
+  weights:
+  - suffix: attn.q_norm.weight
+    via: raw
+    role: read
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 448
+    end_line: 451
+  doc: q_lora 上的 RmsNorm
+  category: attention
+- op: qli
+  impl: exec_indexer:_qli
+  requires:
+  - key: idx.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads,64]'
+    legacy:
+    - idx_q
+  - key: idx.descale_q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads,2,2]'
+    legacy:
+    - idx_descale_q
+  - key: idx.w
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads]'
+    legacy:
+    - idx_w
+  - key: cmp.latent
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cmp_latent
+  - key: geometry.full_len
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - L_full
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - ratio
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: batch.seq_lens
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - seq_lens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - n_seqs
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: cache.suffix.idx
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_idx
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: model.rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_theta
+  - key: model.rope_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_dim
+  - key: model.rope_scaling
+    type: dict
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_scaling
+  - key: model.compress_rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - compress_rope_theta
+  - key: model.candidate_block_size
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - candidate_block_size
+  - key: model.candidate_topk_blocks
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - candidate_topk_blocks
+  - key: model.index_topk
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - index_topk
+  - key: layer.roles.candidate_source
+    type: bool
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - is_candidate
+  - key: indexer.k_ready
+    type: bool
+    storage: ctx
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - idx_k_ready
+  - key: cache.idx.k
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+  provides:
+  - key: idx.sparse
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,1,index_topk]'
+    legacy:
+    - cmp_sparse_indices
+    - idx_sparse
+  - key: idx.topk_length
+    type: Tensor
+    storage: cache
+    tier: module
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    shape: '[T]'
+    legacy:
+    - cmp_topk_length
+  - key: cache.idx.k
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    condition: '!idx_k_ready'
+  - key: cache.idx.ks
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    condition: '!idx_k_ready'
+  - key: cache.idx.nblk
+    type: int
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    condition: '!idx_k_ready'
+  - key: cache.idx.qsli
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    condition: is_candidate
+  weights:
+  - suffix: attn.indexer.wk.weight
+    via: raw
+    role: read
+  - suffix: attn.indexer.k_norm.weight
+    via: raw
+    role: read
+  - suffix: attn.indexer.k_norm.weight.f32
+    via: synthetic
+    role: read_packed
+    packed_key: attn.indexer.k_norm.weight.f32
+  flags:
+  - packed_variant
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_indexer.py
+    line: 529
+    end_line: 539
+  dispatch: packed_if:batch.is_packed && !cp.active
+  intrinsics:
+  - idx_k_cache
+  doc: QuantLightningIndexer（cp 下按块跑；内含 K 缓存写入）
+  category: indexer
+  params:
+    candidate_block_size: 8
+    candidate_topk_blocks: 2048
+- op: qsli
+  impl: exec_indexer:_qsli
+  requires:
+  - key: idx.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx_q
+  - key: idx.descale_q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx_descale_q
+  - key: idx.w
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - idx_w
+  - key: geometry.full_len
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - L_full
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - ratio
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: batch.seq_lens
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - seq_lens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - n_seqs
+  - key: cache.root
+    type: dict
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+    legacy:
+    - _shared
+  - key: cache.suffix.idx
+    type: str
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - suffix_idx
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: model.candidate_block_size
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - candidate_block_size
+  - key: model.candidate_topk_blocks
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - candidate_topk_blocks
+  - key: model.index_topk
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - index_topk
+  - key: layer.roles.candidate_source
+    type: bool
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - is_candidate
+  - key: cache.idx.qsli
+    type: Tensor
+    storage: cache
+    tier: cache
+    mutation: new
+    shadow: allow_multi
+    optional: true
+  provides:
+  - key: idx.sparse
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - cmp_sparse_indices
+    - idx_sparse
+  - key: idx.topk_length
+    type: Tensor
+    storage: cache
+    tier: module
+    mutation: new
+    shadow: allow_multi
+    optional: false
+    legacy:
+    - cmp_topk_length
+  weights: []
+  flags:
+  - packed_variant
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_indexer.py
+    line: 898
+    end_line: 907
+  dispatch: packed_if:batch.is_packed && !cp.active
+  doc: QuantSparseLightningIndexer（吃层 20 的候选块组合缓存）
+  category: indexer
+  params:
+    candidate_block_size: 8
+    candidate_topk_blocks: 2048
+- op: reroute
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: rmsnorm
+  impl: exec_ops:_rmsnorm
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: hc.stage
+    type: str
+    storage: container
+    tier: container
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - _norm_stage
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.rms_norm_eps
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - eps
+  provides:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  weights:
+  - suffix: attn_norm.weight
+    via: raw
+    role: read
+    condition: stage=attn
+  - suffix: ffn_norm.weight
+    via: raw
+    role: read
+    condition: stage=ffn
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 219
+    end_line: 224
+  doc: attn_norm / ffn_norm（按 hc.stage 选权重），原地归一化 x
+  category: common
+  params:
+    eps: ${model.rms_norm_eps}
+- op: rope
+  impl: exec_ops:_rope
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: attn.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    shape: '[T,n_heads,head_dim]'
+    legacy:
+    - q
+  - key: attn.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    shape: '[T,512]'
+    legacy:
+    - kv
+  - key: model.rope_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - rope_dim
+  - key: model.rope_theta
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - rope_theta
+  - key: model.compress_rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - compress_rope_theta
+  - key: model.rope_scaling
+    type: dict
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_scaling
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offset
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - n_seqs
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - ratio
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: cp.abs_positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_abs_positions
+  - key: cp.total_q
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_total_q
+  - key: geometry.full_len
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - L_full
+  provides:
+  - key: attn.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: stream
+    optional: false
+    legacy:
+    - q
+  - key: attn.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: stream
+    optional: false
+    legacy:
+    - kv
+  - key: attn.rope_done
+    type: set
+    storage: st
+    tier: module
+    mutation: new
+    shadow: hidden
+    optional: false
+    legacy:
+    - _rope_done
+  weights: []
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 504
+    end_line: 523
+  dispatch: done-set：q/kv 只 rope 一次（split 视图调用两次）
+  doc: inplace_partial_rotary_mul（q/kv 尾部 rope 维）
+  category: attention
+  params:
+    rope_dim: ${model.rope_dim}
+    rope_theta: ${model.rope_theta}
+- op: scatter_tail
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - declared_only
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: opgraph 声明但当前配方未使用
+  category: boundary
+- op: swiglu_quant
+  impl: null
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides: []
+  weights: []
+  flags:
+  - no_impl
+  calls: 1
+  rows_phase: same
+  doc: 未融合 MoE 链（megamoe=none 才走；当前配置被 mega_moe 取代）
+  category: moe
+- op: tmove
+  impl: exec_ops:_tmove
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  provides:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - x
+  weights: []
+  flags:
+  - placeholder
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 1910
+    end_line: 1926
+  doc: 纯占位（数值恒等；默认不下发，DS41M_PAD_OPS=1 才进 trace）
+  category: placeholder
+- op: topk_gate
+  impl: exec_ops:_topk_gate
+  requires:
+  - key: moe.logits
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_experts]'
+    legacy:
+    - logits
+  - key: input.ids
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - input_ids
+  - key: model.routed_scaling_factor
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - routed_scaling_factor
+  - key: model.moe_topk
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - rtopk
+    - topk
+  provides:
+  - key: moe.topk_idx
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,topk]'
+    legacy:
+    - topk_idx
+  - key: moe.topk_weight
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,topk]'
+    legacy:
+    - topk_weight
+  weights:
+  - suffix: ffn.gate.bias
+    via: raw
+    role: read
+  - suffix: ffn.gate.bias.f32
+    via: synthetic
+    role: read_packed
+    packed_key: ffn.gate.bias.f32
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 786
+    end_line: 821
+  doc: top-k 路由（bias 转 fp32）
+  category: moe
+  params:
+    topk: ${model.moe_topk}
+- op: wkv
+  impl: exec_ops:_wkv
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.head_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - head_dim
+  provides:
+  - key: attn.kv
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,512]'
+    legacy:
+    - kv
+  weights:
+  - suffix: attn.wkv.weight
+    via: _packed
+    role: read_packed
+    packed_key: attn.wkv.weight
+  - suffix: attn.wkv.scale
+    via: _packed
+    role: read_packed
+    packed_key: attn.wkv.weight
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 460
+    end_line: 462
+  doc: 压缩 KV 投影（512 维）
+  category: attention
+  params:
+    head_dim: ${model.head_dim}
+- op: wo_a
+  impl: exec_ops:_wo_a
+  requires:
+  - key: attn.out
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,o_groups,head_dim*64]'
+    legacy:
+    - attn_out
+  - key: attn.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - q
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: batch.cu
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cu_seqlens
+  - key: batch.n_seqs
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - n_seqs
+  - key: layer.ratio
+    type: int
+    storage: ctx
+    tier: layer
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - ratio
+  - key: position.offset
+    type: int
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - pos_offset
+  - key: position.offsets
+    type: list[int]
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - pos_offsets
+  - key: cp.positions
+    type: Tensor
+    storage: ctx
+    tier: pass
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - cp_positions
+  - key: model.rope_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - rope_dim
+  - key: model.rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - rope_theta
+  - key: model.compress_rope_theta
+    type: float
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - compress_rope_theta
+  - key: model.rope_scaling
+    type: dict
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - rope_scaling
+  - key: process.allow_placeholder
+    type: bool
+    storage: st
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - _allow_placeholder
+  - key: process.placeholder_used
+    type: set
+    storage: st
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: true
+    legacy:
+    - _placeholder_used
+  provides:
+  - key: attn.o_lora
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,o_groups*o_lora]'
+    legacy:
+    - o_lora
+  - key: attn.out
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: in_place
+    shadow: single_writer
+    optional: false
+    legacy:
+    - attn_out
+  weights:
+  - suffix: attn.wo_a.weight
+    via: _packed
+    role: read_packed
+    packed_key: attn.wo_a.weight
+  - suffix: attn.wo_a.scale
+    via: _packed
+    role: read_packed
+    packed_key: attn.wo_a.weight
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 727
+    end_line: 765
+  doc: o_lora 投影（TransposeQuantBatchMatMul；内含量化）
+  category: attention
+- op: wo_b
+  impl: exec_ops:_wo_b
+  requires:
+  - key: attn.o_lora
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,o_groups*o_lora]'
+    legacy:
+    - o_lora
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.o_groups
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  - key: model.o_lora_rank
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  provides:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: replace
+    shadow: stream
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  weights:
+  - suffix: attn.wo_b.weight
+    via: _packed
+    role: read_packed
+    packed_key: attn.wo_b.weight
+  - suffix: attn.wo_b.scale
+    via: _packed
+    role: read_packed
+    packed_key: attn.wo_b.weight
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 768
+    end_line: 771
+  doc: 输出投影：o_groups×o_lora → hidden
+  category: attention
+  params:
+    hidden: ${model.hidden}
+- op: wq_a
+  impl: exec_ops:_wq_a
+  requires:
+  - key: hidden.x
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,H]'
+    legacy:
+    - x
+  - key: model.hidden
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - H
+  - key: model.q_lora_rank
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  provides:
+  - key: attn.qr
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,q_lora]'
+    legacy:
+    - qr
+  weights:
+  - suffix: attn.wq_a.weight
+    via: _packed
+    role: read_packed
+    packed_key: attn.wq_a.weight
+  - suffix: attn.wq_a.scale
+    via: _packed
+    role: read_packed
+    packed_key: attn.wq_a.weight
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 443
+    end_line: 445
+  doc: MLA q 低秩投影（mxfp8 QMM）
+  category: attention
+- op: wq_b
+  impl: exec_ops:_wq_b
+  requires:
+  - key: attn.qr
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,q_lora]'
+    legacy:
+    - qr
+  - key: model.q_lora_rank
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  - key: model.head_dim
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+    legacy:
+    - head_dim
+  - key: model.n_attention_heads
+    type: int
+    storage: ctx
+    tier: const
+    mutation: new
+    shadow: single_writer
+    optional: false
+  provides:
+  - key: attn.q
+    type: Tensor
+    storage: st
+    tier: module
+    mutation: new
+    shadow: single_writer
+    optional: false
+    shape: '[T,n_heads,head_dim]'
+    legacy:
+    - q
+  weights:
+  - suffix: attn.wq_b.weight
+    via: _packed
+    role: read_packed
+    packed_key: attn.wq_b.weight
+  - suffix: attn.wq_b.scale
+    via: _packed
+    role: read_packed
+    packed_key: attn.wq_b.weight
+  flags: []
+  calls: 1
+  rows_phase: same
+  source:
+    file: exec_ops.py
+    line: 454
+    end_line: 457
+  doc: q 上投影（→ 64 头 × 512）
+  category: attention
+  params:
+    head_dim: ${model.head_dim}

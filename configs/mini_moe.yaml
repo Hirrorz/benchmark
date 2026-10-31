@@ -1,0 +1,72 @@
+# 单卡 + MegaMoE（M3）：mini_single 的副本
+# （MegaMoE 探针/联调专用）。层结构与算子图与 mini_single 一字不改；卡号用 `--device npu:N` 选。
+model:
+  name: deepseek_v4_1_flash
+  hidden: 5120
+  moe_intermediate: 2304
+  swiglu_limit: 10.0     # 官方 config.swiglu_limit（mega_moe activation_clamp）
+  n_layers: 40
+  n_routed_experts: 384
+  n_shared_experts: 1
+  topk: 6
+  sliding_window: 128
+  compress_ratios: [0,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+  kv_source_layers:   [2, 8, 14, 20]
+  index_source_layers: [2, 8, 14, 20, 24, 28, 32, 36]
+  candidate_source_layer: 20
+  engram_layers: [1, 14]
+  engram_offload: true
+  # ── 以下取自真权重 config.json 的 text_config（exec_ops 用）──
+  n_attention_heads: 64
+  head_dim: 512
+  qk_rope_head_dim: 64
+  q_lora_rank: 1280
+  o_lora_rank: 1024
+  o_groups: 8
+  hc_mult: 4
+  hc_sinkhorn_iters: 20
+  hc_eps: 1.0e-06
+  rms_norm_eps: 1.0e-20
+  scoring_func: sqrtsoftplus
+  routed_scaling_factor: 1.5
+  rope_theta: 10000
+  index_n_heads: 32
+  index_head_dim: 128
+  index_topk: 512
+
+parallel_config:
+  world_size: 1
+  cp_size: 1
+  moe_ep_size: 1
+  attn_tp_size: 1
+  dense_tp_size: 1
+  lmhead_tp_size: 1
+
+run:
+  seq_len: 1024
+  batch: 1
+  iters: 1
+  moe_chunk_max_len: 8192
+
+weights:
+  mode: synthetic
+  path: /mnt/xds/sfs/DeepSeek-V4.1-Flash-cann-mxfp8-mxfp4
+  engram_table_rows: 1048576
+  lazy_experts: true
+  share_across_layers: true    # ★ 假权重下所有层共用同一份权重（含专家）→ 省生成时间/显存；
+                               #   也是 假前缀 KV 跨层共享 的前提。真权重模式忽略此项
+
+backends:
+  megamoe: deepgemm
+  indexer_prolog_qw: ascendc
+  gate_topk: tilelang
+  engram: tilelang
+  swiglu: fused
+
+hit:
+  ratio: 0.0
+  source: fake
+  replay_tail: 140
+
+features:
+  decoder_replay: false

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>命令构建器 · 两套布局方案</title>
+<style>
+  :root{--ink:#141118;--muted:#6b6477;--line:#e8e3ee;--bg:#faf8fc}
+  *{box-sizing:border-box}
+  body{margin:0;background:
+      radial-gradient(900px 520px at 0% 0%, rgba(251,207,232,.55), transparent 60%),
+      radial-gradient(900px 520px at 100% 0%, rgba(186,230,253,.55), transparent 60%),
+      var(--bg);
+    color:var(--ink);font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:52px 24px 72px}
+  h1{font-size:30px;margin:0 0 8px;letter-spacing:-.02em}
+  .sub{color:var(--muted);margin:0 0 30px;font-size:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px}
+  .card{display:block;background:#fff;border:1px solid var(--line);border-radius:20px;
+    padding:20px;text-decoration:none;color:inherit;transition:.18s;
+    box-shadow:0 1px 2px rgba(20,17,24,.04),0 14px 34px rgba(20,17,24,.06)}
+  .card:hover{transform:translateY(-3px);box-shadow:0 22px 54px rgba(20,17,24,.14)}
+  .card h2{font-size:20px;margin:14px 0 4px}
+  .tag{color:#7c3aed;font-weight:700;font-size:12.5px;margin:0 0 8px}
+  .card p{color:var(--muted);font-size:13px;line-height:1.65;margin:0 0 10px}
+  .themes{font-size:12.5px}
+  .themes b{color:var(--ink)}
+  .swrow{display:flex;gap:18px;flex-wrap:wrap}
+  .swset{display:flex;align-items:center;gap:6px}
+  .swlbl{font-size:10.5px;color:var(--muted);letter-spacing:.06em}
+  .sw{width:30px;height:30px;border-radius:9px;border:1px solid rgba(0,0,0,.06)}
+  .open{font-size:13px;font-weight:800;color:#db2777}
+  .tip{margin-top:30px;color:var(--muted);font-size:12.5px;line-height:1.8}
+  code{background:#f1ecf7;padding:1px 6px;border-radius:5px;font-size:.92em}
+  kbd{background:#141118;color:#fff;border-radius:5px;padding:1px 6px;font-size:11px}
+</style></head><body><div class="wrap">
+  <h1>命令构建器 · 两套布局方案</h1>
+  <p class="sub">功能完全一致（同一份 HTML/JS，只是外面多套一层「布局包」）；两套都自带明暗双主题。</p>
+  <div class="grid">
+      <a class="card" href="bench_command_builder.layout_studio.html" target="_blank" rel="noopener">
+        <div class="swrow">
+          <div class="swset"><span class="swlbl">默认</span><span class="sw" style="background:#070b16"></span><span class="sw" style="background:#8b5cf6"></span><span class="sw" style="background:#22d3ee"></span></div>
+          <div class="swset"><span class="swlbl">切换</span><span class="sw" style="background:#f7f7fb"></span><span class="sw" style="background:#7c3aed"></span><span class="sw" style="background:#a78bfa"></span></div>
+        </div>
+        <h2>工作台 · Studio</h2>
+        <p class="tag">三栏 + 左导航</p>
+        <p>左：区块导航（随场景/高级模式自动变化，滚动联动高亮，底部常驻校验状态）；中：配置卡；右：实时预览。深色为「极光玻璃」，切浅色为「糖果渐变」。</p>
+        <p class="themes">默认 <b>深色（极光玻璃）</b> · 点右上角 ◐ 切到 <b>浅色（糖果渐变）</b></p>
+        <span class="open">打开预览 →</span>
+      </a>
+      <a class="card" href="bench_command_builder.layout_bento.html" target="_blank" rel="noopener">
+        <div class="swrow">
+          <div class="swset"><span class="swlbl">默认</span><span class="sw" style="background:#04070c"></span><span class="sw" style="background:#00e6a0"></span><span class="sw" style="background:#22d3ee"></span></div>
+          <div class="swset"><span class="swlbl">切换</span><span class="sw" style="background:#fdf4ff"></span><span class="sw" style="background:#db2777"></span><span class="sw" style="background:#7c3aed"></span></div>
+        </div>
+        <h2>Bento · 面板</h2>
+        <p class="tag">不对称磁贴 + 底部操作条</p>
+        <p>通用 7 栏 + 场景 5 栏并排、多点/队列整行、高级工具 6+6；每块一个渐变色头；底部常驻「校验状态 / 复制当前 / 生成命令」。浅色为「糖果渐变」，切深色为「霓虹终端」。</p>
+        <p class="themes">默认 <b>浅色（糖果渐变）</b> · 点右上角 ◐ 切到 <b>深色（霓虹终端）</b></p>
+        <span class="open">打开预览 →</span>
+      </a>
+  </div>
+  <p class="tip">
+    两套都是**单文件离线可用**：直接把这个 HTML 拷走就能开。<br>
+    场景/侧栏折叠记在浏览器 localStorage 里，两套共用；想从干净状态对比，开无痕窗口。<br>
+    选定一套后，用 <code>python3 tools/gen_layout_variants.py --merge &lt;studio|bento&gt; --out tools/bench_command_builder.html --force</code>
+    合并进主文件，再跑 <code>node tools/test_bench_builder.js</code> 回归。
+  </p>
+</div></body></html>
