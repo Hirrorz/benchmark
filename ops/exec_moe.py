@@ -1043,6 +1043,15 @@ def _mega_moe(st, ctx, w):
     T = x.shape[0]
     H, I, K = ctx["H"], ctx["I"], ctx["topk"]
     dev = x.device
+    # ★ 2026-11-01（A5 空 origin）：本 rank **无 token**（T==0）时，MegaMoE 必须仍参与集合
+    #   通信（否则其余 rank 在 HcclChannelAcquire 上等成 timeout 9）。做法：自造 **1 行合法
+    #   dummy**（零 hidden、id=0 的 topk、均分权重），算完丢弃；对外仍返回 0 行。
+    #   ★ 不依赖 `st["topk_idx"]`：空 origin 的 rank 在编排层会跳过 gate/topk_gate（见
+    #   runner 的 `_empty_T` 短路），st 里根本没有那两张表。
+    _empty = (int(T) == 0)
+    _T_call = 1 if _empty else int(T)
+    if _empty:
+        x = torch.zeros((1, int(x.shape[1])), dtype=x.dtype, device=dev)
 
     # 专家口径（EP1 与 EP≥2 走**同一套**）：
     #   gids  = 本 rank 权重里出现的全局专家号（weights.ep_slice 连续切分 → [lo, lo+e_local)）
@@ -1144,7 +1153,14 @@ def _mega_moe(st, ctx, w):
     # ★ raw 释放：后端自己决定（ascendc = 融合布局成为唯一副本后释放；deepgemm = 空操作）。
     #   必须在 `prepare` **之后**：融合布局要先从 raw 建出来。
     be.release_raw(ctx, prep)
-    x, ids, tw = be.inputs(st, x, ctx, e_global)
+    if _empty:
+        _ids0 = torch.zeros((1, K), dtype=torch.int32, device=x.device)
+        _tw0 = torch.full((1, K), 1.0 / max(1, K), dtype=torch.float32, device=x.device)
+        _st_call = dict(st, x=x, topk_idx=_ids0.reshape(1, -1),
+                        topk_weight=_tw0.reshape(1, -1))
+    else:
+        _st_call = st
+    x, ids, tw = be.inputs(_st_call, x, ctx, e_global)
     # ★ A2 探针：把 all2all 从时间账里剥掉（详见文件头 `_all_local_ids` 的注释）
     if _ALL_LOCAL_ON:
         ids = _all_local_ids(ids, lo, e_local, K)
@@ -1167,7 +1183,7 @@ def _mega_moe(st, ctx, w):
     # ★ 唯一的执行循环：按**实际建成的缓冲容量**切 span（末块可小于容量；两个后端都接受
     #   `y.size(0) ≤ cap`）。分块循环只有这一份，不再各写一套。
     _cap_use = int(_CACHE["cap"])
-    _spans = [(i, min(i + _cap_use, T)) for i in range(0, T, _cap_use)]
+    _spans = [(i, min(i + _cap_use, _T_call)) for i in range(0, _T_call, _cap_use)]
     # ★ 2026-10-21 per-DP dummy span：MegaMoE 是**同步**的 —— 各 rank 的 chunk 轮数必须相同。
     #   per-DP 时由 points_runner 把「全 DP 的最大 span 数」写进 ctx["moe_nspan"]；
     #   T 小的 rank 在多余轮次喂 **1 行占位**（y.size(0) ≤ cap 厂商支持），通信照常参与，
@@ -1178,7 +1194,7 @@ def _mega_moe(st, ctx, w):
     _memlog_mod.mem(f"mega_moe L{_ml_idx} T={T} nspan={len(_spans)} pre-spans")
     if _ENV_MOE_PREALLOC:
         # 预分配整段输出，逐 span 写入；不再持有全部 span 输出，也不做 cat。
-        y = torch.empty((T, H), dtype=x.dtype, device=x.device)
+        y = torch.empty((_T_call, H), dtype=x.dtype, device=x.device)
         for _i, _e in _spans:
             _yi = be.call(x[_i:_e], ids[_i:_e], tw[_i:_e], sb, prep, ctx)
             y[_i:_e].copy_(_yi)
@@ -1200,6 +1216,9 @@ def _mega_moe(st, ctx, w):
     if not _ENV_MOE_PREALLOC:
         y = _outs[0] if len(_outs) == 1 else torch.cat(_outs, 0)
     _memlog_mod.mem(f"mega_moe L{_ml_idx} T={T} post-cat")
+    if _empty:
+        # dummy 计算结果**丢弃**：对外仍是 0 行（不污染 y / gate / cache）
+        y = y[:0]
     y = y.view(T, H)
     st["moe_out"] = y
     st["x"] = y                     # 残差流：hc_post 吃它（官方模型侧同样直接替换 hidden）

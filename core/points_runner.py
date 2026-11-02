@@ -35,6 +35,22 @@ import threading
 import time
 
 
+# ───────────────── 结果指纹（2026-11-01）─────────────────
+# 换树 / 换开关后 `results.tsv` 里的数会混在一起，事后无法分辨是哪个口径算的。
+# 指纹算法在 `assemble`（纯 CPU 可测，见 tools/test_hit_geometry.py）；这里只落盘（缺陷 G6）。
+_RESULT_COLS = ("L", "M", "R", "H", "S", "keep", "actual_hit", "plan_hash", "backends",
+                # ★ 2026-11-01（B1 吸收 / P3-1）：三段命名 + 三段行数（只增列，老表照读）
+                "prefix_hit", "enc_replay", "dec_keep", "rows_q0_19", "rows_q21_39",
+                # ★ 2026-11-01（P3-2 吸收）：两级 metadata 复用/重建计数（geo=进程级几何缓存，
+                #   fwd=forward 级整表重建）。与 [meta-reuse] 打印同源。
+                "meta_geo_hit", "meta_geo_miss", "meta_fwd_hit", "meta_fwd_miss")
+
+
+class _SkipEmptyOrigin(Exception):
+    """A5：空 origin（1 行虚拟请求）不写 results.tsv —— 内部信号，由写表处的
+    `except Exception: pass` 吞掉（不改变既有行为，也不静默丢真实点位）。"""
+
+
 # ───────────────── 点位级失败隔离（2026-10-29）─────────────────
 def _load_done_tags(root: str) -> set:
     """`results.tsv` 里已完成的点位 tag（续跑跳过用）。`DS41M_POINT_REDO=1` 强制重采。"""
@@ -298,6 +314,12 @@ def run_points(cfg, source, a, dev, runner_mod=None):
                             raise SystemExit(f"✗ 点位 {pi} {who} 第 {bi} 批 hit ∈ [0,1)：{b.get('hit')!r}")
                         out.append({"L": _L, "hit": _h})
                     if not out:
+                        # ★ A5：`DS41M_ALLOW_EMPTY_DP=1` 允许该 DP 无 token（T=0 空 origin）
+                        if os.environ.get("DS41M_ALLOW_EMPTY_DP", "0").strip().lower() in (
+                                "1", "on", "true", "yes"):
+                            print(f"  [empty-dp] 点位 {pi} {who}：0 token（A5 空 origin 测试）",
+                                  flush=True)
+                            return []
                         raise SystemExit(f"✗ 点位 {pi} {who} 的 batches 为空")
                     return out
                 _all_dps = [(int(d.get("rank", i)), _specs_of(d, f"dp{i}"))
@@ -328,13 +350,40 @@ def run_points(cfg, source, a, dev, runner_mod=None):
                 specs = [{"L": L0, "hit": h0}] * nb0
 
             nb = len(specs)
-            L = max(int(b["L"]) for b in specs)          # 池按最长序列开
-            h = max(float(b["hit"]) for b in specs)      # meta.hit 只用于日志/抑制判断
+            # ★ 2026-11-01（A5 验证脚手架）：DS41M_ALLOW_EMPTY_DP=1 时允许某 DP **0 token**
+            #   （EP8 下"7 个 rank 有 token、1 个 rank T=0"的真实场景）。此时 L/h 取同点位
+            #   其它 DP 的值（池/元数据几何照样按最长序列建，只是本 rank 没有行要算）。
+            if nb == 0:
+                _ref = next((sp for _r, sp in _all_dps if sp), [])
+                if not _ref:
+                    raise SystemExit(f"✗ 点位 {pi}: 所有 DP 都空")
+                L = max(int(b["L"]) for b in _ref)
+                h = max(float(b["hit"]) for b in _ref)
+                _empty_origin = True
+            else:
+                L = max(int(b["L"]) for b in specs)          # 池按最长序列开
+                h = max(float(b["hit"]) for b in specs)      # meta.hit 只用于日志/抑制判断
+                _empty_origin = False
             rep = bool(pt.get("replay", True))
             rtail = int(pt.get("replay_tail", base_hit.get("replay_tail", 0)) or 0)
             # ★ DeepInfer KEEP_TOKENS 对齐：与 assemble.replay_tail_of 同口径（V4.1 140）。
             rtail = assemble.replay_tail_of({"model": cfg["model"],
                                              "hit": {"replay_tail": rtail}})
+            # ★ 2026-11-01（铁律 0）：命中几何**显式预检**——`M>0` 且 `R<=L`。
+            #   以前非法几何（如 1k@0.1：L=1024, M=922, R=1062>L）只能靠生成脚本
+            #   `tools/finish_cp2cp4.sh:164` 的 `continue` 静默丢点 ⇒ 点位矩阵缺测且没人知道。
+            #   现在整轮直接报错并点名"哪个点位/哪一批、L/M/R 各是多少"。
+            for _bi, _b in enumerate(specs, 1):
+                _g = {"model": cfg["model"],
+                      "hit": {"ratio": float(_b.get("hit", 0) or 0),
+                              "non_cached_tokens": int(_b.get("non_cached_tokens", 0) or 0),
+                              "replay_tail": rtail}}
+                if assemble.hit_is_on(_g):
+                    try:
+                        assemble.check_hit_geometry(_g, int(_b["L"]),
+                                                    where=f"点位 {pi} 第 {_bi} 批")
+                    except ValueError as _e:
+                        raise SystemExit(f"✗ {_e}")
 
             def _m_of(b):
                 return assemble.hit_m({"hit": {
@@ -347,6 +396,14 @@ def run_points(cfg, source, a, dev, runner_mod=None):
                         or int(b.get("non_cached_tokens", 0) or 0) > 0)
 
             rows = [(_m_of(b) + rtail) if _hit_on(b) else int(b["L"]) for b in specs]
+            # ★ 2026-11-01（A5 空 origin 正解）：本 DP 无 token 时不"跳过算子"，而是用
+            #   **1 行虚拟请求**走**完整算子栈** —— 集合通信（engram 的逐层 2-rank 域 +
+            #   MegaMoE 的 all2all）轮次与形状才能和正常 rank 对齐（实测"跳过算子"会让
+            #   对端 barrier 超时：`rank barrier timeout target=2 signal=1`）。
+            #   虚拟请求 = 关 hit（1 行 plain prefill）、几何 cu=[0,1]/row_lens=[1]；
+            #   跑完结果丢弃（只参与通信，不产生自身行）。
+            if _empty_origin:
+                rows = [1]
             cu = [0]
             for r in rows:
                 cu.append(cu[-1] + int(r))
@@ -372,12 +429,20 @@ def run_points(cfg, source, a, dev, runner_mod=None):
                     _tr = bool(_rep_on and _pre > _w)
                     _trims.append(_tr)
                     _post_spans.append(-(-(_w * len(_sp)) // _chunk) if _tr else None)
-                if len(set(_trims)) != 1:
+                # ★ 2026-11-01（A5）：空 DP（0 token）不参与"裁不裁尾"的裁决 —— 它没有行，
+                #   也不该把自己的 `_tr=False` 当成反例；按有 token 的 DP 的多数派补齐。
+                _nz_trims = [t for (_r, _sp), t in zip(_all_dps, _trims) if _sp]
+                if len(set(_nz_trims)) != 1:
                     raise SystemExit(
                         "✗ per-DP：有的 DP 会裁尾、有的不会（各自 pre T 与 W 的关系不同）——不支持；"
                         "请把各 DP 的 T 调到同一侧")
+                _tr0 = bool(_nz_trims[0]) if _nz_trims else False
+                _trims = [(_tr0 if not _sp else t)
+                          for (_r, _sp), t in zip(_all_dps, _trims)]
+                _post_spans = [(-(-(_w * len(_sp)) // _chunk) if t else None)
+                               for (_r, _sp), t in zip(_all_dps, _trims)]
                 _nsp_pre = max(_pre_spans)
-                _nsp_post = max(int(x) for x in _post_spans if x) if _trims[0] else 0
+                _nsp_post = max(int(x) for x in _post_spans if x) if _tr0 else 0
                 _dummy_ok = os.environ.get("DS41M_MOE_DUMMY_SPAN", "1").strip().lower() not in (
                     "0", "off", "false", "no")
                 _uneq = (len(set(_pre_spans)) > 1
@@ -396,7 +461,46 @@ def run_points(cfg, source, a, dev, runner_mod=None):
             pkd = (nb > 1) or _unify
             # 点位几何写回 cfg（层栈/池/元数据全按它建）
             cfg["run"]["seq_len"] = L
-            cfg["hit"] = dict(base_hit, ratio=h, replay_tail=rtail, source="fake")
+            # ★ A5 空 origin：虚拟请求是**关 hit** 的 1 行 plain prefill（否则 runner 会按
+            #   hit 几何去切 R 行，而本 rank 只有 1 行可切）。
+            # ★ C5 收尾：命中策略的写入也走 metadata 单源（整块 dict 形态，未知字段留在镜像里）
+            import metadata as _md_h
+            _md_h.set_hit_dict(cfg, dict(base_hit,
+                                        ratio=(0.0 if _empty_origin else h),
+                                        replay_tail=rtail, source="fake"))
+            # ★ 2026-11-01：本点位几何（H=前缀行、E=重算的 replay 行、S=query 起点）落盘用。
+            #   · 命中关闭：H=0、E=0、S=0、M=L、R=L；
+            #   · 命中开启：E=keep（本仓命中段**不用**额外 encoder replay，固定 0）、
+            #     M=non_cached、R=M+keep、H=L-M、S=L-R（= 尾部起点，与 runner 的 pos_off 同口径）。
+            _hb = bool(h) or any(int(b.get("non_cached_tokens", 0) or 0) > 0 for b in specs)
+            if _empty_origin:
+                # 虚拟请求：1 行、无 hit ⇒ M=0/R=1/H=L/S=L-1（照着写，便于日志辨认）
+                _L_tot = int(L)
+                _M_geo = 0
+                _R_geo = 1
+                _hb = False
+            else:
+                _L_tot = sum(int(b["L"]) for b in specs)    # 本 pass 全部逻辑 token 数
+                _M_geo = sum(int(_m_of(b)) for b in specs) if _hb else int(_L_tot)
+                _R_geo = sum(int(r) for r in rows)
+            _H_geo = int(_L_tot) - _M_geo
+            _S_geo = (max(0, int(L) - int(rows[0]))          # 首段 query 起点（多批看首段）
+                      if rows else 0)                        # A5：空 DP 没有 query 行
+            _geo = dict(L=int(L), L_tot=int(_L_tot), M=int(_M_geo), R=int(_R_geo),
+                        H=int(_H_geo), S=int(_S_geo), keep=int(rtail) if _hb else 0,
+                        rows=[int(r) for r in rows], nb=int(nb),
+                        actual_hit=(1.0 - _M_geo / max(1, int(_L_tot))) if _hb else 0.0)
+            # ★ 2026-11-01（B1 吸收，GPT §4.2 改写口径）：三段**显式命名**。
+            #   本仓语义：prefix_hit = 前缀命中行（= H = L-M）；enc_replay = 额外 encoder
+            #   replay（本仓命中段**固定为 0**，只做尾段重算）；dec_keep = DeepInfer KEEP
+            #   （window + 最大回退，默认 140）。**只命名与打印，不改计算**。
+            _geo["prefix_hit"] = int(_H_geo)
+            _geo["enc_replay"] = 0
+            _geo["dec_keep"] = int(_geo["keep"])
+            # ★ 2026-11-01（P3-1，PERF_RULES 口径）：三段**行数**——层 0..19 与层 20 吃 R 行
+            #   （层 20 = 边界层，cut 前），层 21..39 吃裁后行数（min(keep, R)；replay 关时 = R）。
+            _geo["rows_q0_19"] = int(_R_geo)
+            _geo["rows_q21_39"] = int(min(int(_geo["keep"]) or int(_R_geo), int(_R_geo)))
             if pkd:
                 import metadata as _md
                 # varlen 唯一口径：布局进 metadata（`_packed` 只是它的镜像）
@@ -425,6 +529,9 @@ def run_points(cfg, source, a, dev, runner_mod=None):
             _e = int(_pc.get("moe_ep_size", _w) or _w)
             _d = max(1, _w // max(1, _c))
             _flat_pfx = f"cp{_c}dp{_d}ep{_e}"
+            # ★ 2026-11-01：结果指纹（几何 + 并行 + 实际后端）。换树/换开关 → 变（缺陷 G6）。
+            _bk = assemble.backends_of(_c)
+            _ph = assemble.plan_hash(int(L), _M_geo, _R_geo, rep, _c, _w, _bk)
             if per_dp and not _same_all:
                 tag = (f"{_flat_pfx}_{pt.get('tag') or 'perdp'}_batch{len(specs)}"
                        f"_replay{'on' if rep else 'off'}_prefill")
@@ -481,9 +588,20 @@ def run_points(cfg, source, a, dev, runner_mod=None):
                     else seed0 + 7919 * b + (1009 * int(rank) if per_dp else 0))
                    for b in range(nb)]
             seqs = [R.make_input(cfg, int(rows[b]), seed=_sd[b]) for b in range(nb)]
-            batch_inputs = [torch.cat(seqs, dim=0)] if pkd else seqs
-            T_run = int(sum(rows)) if pkd else int(rows[0])
-            npass = 1 if pkd else nb
+            # ★ 2026-11-01（A5 空 origin）：本 DP 无 token 时**不走"跳过算子"**，而是造
+            #   **1 行虚拟请求**跑完整栈 —— engram（逐层 2-rank HCCL 域）与 MegaMoE 的
+            #   all2all 都必须**每个 rank 都到场**，否则对端 `rank barrier timeout`。
+            #   虚拟请求关 hit（1 行 plain prefill），结果在下面落盘前丢弃。
+            if _empty_origin:
+                batch_inputs = [R.make_input(cfg, 1, seed=0)]
+                T_run = 1
+            elif pkd:
+                batch_inputs = [torch.cat(seqs, dim=0)]
+                T_run = int(sum(rows))
+            else:
+                batch_inputs = seqs
+                T_run = int(rows[0])
+            npass = 1 if (pkd or _empty_origin) else max(1, nb)
             pdir = os.path.join(root, tag, "prefill")
             if per_dp:
                 os.makedirs(os.path.join(root, tag), exist_ok=True)
@@ -505,6 +623,17 @@ def run_points(cfg, source, a, dev, runner_mod=None):
                   f"  specs={_tag_specs}{' per-DP' if per_dp else ''} replay={'on' if rep else 'off'}"
                   f"  T_main={meta['T_main']} cut={meta['cut']}"
                   f"  prof={'y' if (a.prof and prof_here) else 'n'}", flush=True)
+            # ★ 2026-11-01：几何 + 指纹 + 实际后端一并打印（与 results.tsv 新列同源）。
+            print(f"  [geo] L={_geo['L']} M={_geo['M']} R={_geo['R']} H={_geo['H']}"
+                  f" S={_geo['S']} keep={_geo['keep']}"
+                  f"  target_hit={h:.4g} actual_hit={_geo['actual_hit']:.4g}"
+                  f"  plan_hash={_ph}", flush=True)
+            # ★ 2026-11-01（B1 / P3-1）：三段命名 + 三段行数（与 results.tsv 新列同源）
+            print(f"  [segs] prefix_hit={_geo['prefix_hit']} enc_replay={_geo['enc_replay']}"
+                  f" dec_keep={_geo['dec_keep']}"
+                  f" | rows Q0-19={_geo['rows_q0_19']} Q20={_geo['R']}"
+                  f" Q21-39={_geo['rows_q21_39']}", flush=True)
+            print(f"  [backend] {_bk}", flush=True)
             if rank == 0:                    # pure 模式也能看到：第几个点 / 规格 / 开始时间
                 print(f"[point {pi}/{len(pts)}] 开始 {time.strftime('%H:%M:%S')}  {tag}"
                       f"  specs={_tag_specs} replay={'on' if rep else 'off'}"
@@ -650,13 +779,39 @@ def run_points(cfg, source, a, dev, runner_mod=None):
             if rank == _report_rank(a, getattr(a, "world", 1)):
                 try:
                     _rf = os.path.join(root, "results.tsv")
+                    if _empty_origin:
+                        # ★ A5：空 origin 的"耗时"没有意义（只算 1 行虚拟请求），不写进结果表，
+                        #   免得污染矩阵；几何与后端照样打印在上面的 [geo]/[backend]。
+                        print(f"  [empty-dp] 点位 {pi}：空 origin（1 行虚拟请求）跑完，"
+                              f"不写 results.tsv", flush=True)
+                        raise _SkipEmptyOrigin()
                     _ms_pass = _pipe_ms if _pipe else (_val * 1000.0 / max(1, npass))
                     _new = not os.path.exists(_rf)
+                    # ★ 2026-11-01（缺陷 G6）：除稳态数外，落盘**实际几何**（L/M/R/H/S/实际
+                    #   hit）与**指纹**（plan_hash + 实际后端）。旧表只有 tag 与耗时，
+                    #   换树/换开关后数字混用无法辨认。新列一律追加在 `ts` 之后，
+                    #   读取方都是按列名取（csv.DictReader / 首列 tag），旧表不动也读得通。
+                    _ms_meta = {}
+                    try:
+                        _ms_meta = R.exec_ops.meta_snapshot()
+                    except Exception:              # noqa: BLE001 —— 诊断列，缺了不致命
+                        _ms_meta = {}
+                    _extra = (f"\t{_geo['L']}\t{_geo['M']}\t{_geo['R']}\t{_geo['H']}"
+                              f"\t{_geo['S']}\t{_geo['keep']}\t{_geo['actual_hit']:.6f}"
+                              f"\t{_ph}\t{_bk}"
+                              f"\t{_geo['prefix_hit']}\t{_geo['enc_replay']}"
+                              f"\t{_geo['dec_keep']}\t{_geo['rows_q0_19']}"
+                              f"\t{_geo['rows_q21_39']}"
+                              f"\t{_ms_meta.get('geo_hit', -1)}"
+                              f"\t{_ms_meta.get('geo_miss', -1)}"
+                              f"\t{_ms_meta.get('fwd_hit', -1)}"
+                              f"\t{_ms_meta.get('fwd_miss', -1)}")
                     with open(_rf, "a", encoding="utf-8") as _fh:
                         if _new:
-                            _fh.write("tag\tsteady_s\tms_per_forward\terrors\tts\n")
+                            _fh.write("tag\tsteady_s\tms_per_forward\terrors\tts\t"
+                                      + "\t".join(_RESULT_COLS) + "\n")
                         _fh.write(f"{tag}\t{_val:.4f}\t{_ms_pass:.2f}\t{nerr}\t"
-                                  f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+                                  f"{time.strftime('%Y-%m-%dT%H:%M:%S')}{_extra}\n")
                 except Exception:              # noqa: BLE001
                     pass
             if nerr:                       # 只计数看不出原因 → 打前 3 条（层/算子/异常）

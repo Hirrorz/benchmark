@@ -763,7 +763,11 @@ def _rope_tables(ctx, T, device):
 def _rope(st, ctx, w):
     """官方 modeling_deepseek.py:1050 → inplace_partial_rotary_mul（原地改 x 尾部 rope 维）。"""
     T = st["x"].shape[0]
+    _ts = time.perf_counter() if _ENV_HOSTTIME_SUB else 0.0
     cos, sin = _rope_tables(ctx, T, st["x"].device)
+    if _ts:
+        _ht_add("rope.tbl", time.perf_counter() - _ts)
+        _ts = time.perf_counter()
     part = ctx["rope_dim"]
     # 边界层拆分后 rope 会被调用两次（先 kv、后 q）；用 done-set 防止重复 rope。
     done = st.get("_rope_done")
@@ -775,11 +779,15 @@ def _rope(st, ctx, w):
         t = st[key]
         # ★ T-042：view 出来的 4D 视图本来就连续（q/kv 都是 _qmm 的连续输出）→ 短路
         t4 = _contig(t.view(T, -1, 1, t.shape[-1]) if t.dim() == 3 else t.view(T, 1, 1, -1))
-        _rope_dump(1, t4, cos, sin, [t4.shape[-1] - part, t4.shape[-1]],
-                   "interleave", ctx)
+        if _ts:
+            _ht_add("rope.view", time.perf_counter() - _ts)
+            _ts = time.perf_counter()
         torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
             t4, cos, sin, rotary_mode="interleave",
             partial_slice=[t4.shape[-1] - part, t4.shape[-1]])
+        if _ts:
+            _ht_add("rope.k", time.perf_counter() - _ts)
+            _ts = time.perf_counter()
         st[key] = t4.view(T, *t.shape[1:])
         done.add(key)
     # ★ 2026-10-28（CP 通信掩盖）：kv rope 完成 = 本层 KV 定稿 → 立刻在**侧流**发起
@@ -790,7 +798,11 @@ def _rope(st, ctx, w):
     if "kv" in done and st.get("_cp_kv_pre") is None and _CP_KV_PREFETCH:
         _cpk = _cp_of(ctx)
         if _cpk is not None:
+            if _ts:
+                _tp = time.perf_counter()
             _launch_cp_kv_gather(st, ctx, _cpk)
+            if _ts:
+                _ht_add("rope.pre", time.perf_counter() - _tp)
 
 
 def _rope_at_pos(pos, ctx, device, n=None):
@@ -1195,8 +1207,6 @@ def _wo_a(st, ctx, w):
         #   前缀（stage A, off=0）与全量 prefill 不受影响 ✓ → 逐位回归安全。
         # ★ 与正向 rope 同一实现（packed 用绝对位置对全长表 gather；单序列走切片）
         cos, sin = _rope_tables(ctx, T, o.device)
-        _rope_dump(2, o.unsqueeze(2), cos, _neg_sin(sin),
-                   [o.shape[-1] - ctx["rope_dim"], o.shape[-1]], "interleave", ctx)
         torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
             o.unsqueeze(2), cos, _neg_sin(sin), rotary_mode="interleave",
             partial_slice=[o.shape[-1] - ctx["rope_dim"], o.shape[-1]])
@@ -1385,13 +1395,26 @@ def rebase_window_pool(st, ctx, T_old: int, W: int) -> int:
             moved = 1
         return moved
     P = batch_layout.rows_blocks_per_seq(ctx, BS)
+    # ★ 2026-11-01（P1-1d）：搬移的**目标**几何必须用 compact 后的行数（每请求 W 行），
+    #   因为层 21 起 `_kv_epilog`/`_mqsmla` 都按下标里现算的 `_P_new` 寻址
+    #   （`slot = ((sid*P + 1 + lrow//BS)*BS + lrow%BS)`，见 exec_ops `_kv_epilog`）。
+    #   compact 前每条序列占 P_old 块、compact 后只占 P_new 块：sid=0 时
+    #   `(0*P+1)*BS` 与 P 无关（所以单序列/第 0 条一直是对的），**sid≥1 会整体错位** ——
+    #   实测：只在 seq1 从层 21 起与全长路径分叉（seq0 逐位一致），正是这个原因。
+    _cu_i = [int(v) for v in (ctx.get("cu_seqlens") or [])]
+    _rows_new = ([W] * nseq) if nseq > 1 else [W]
+    _ctx_new = dict(ctx, T=nseq * W,
+                    cu_seqlens=[W * i for i in range(nseq + 1)],
+                    row_lens=_rows_new)
+    P_new = batch_layout.rows_blocks_per_seq(_ctx_new, BS)
     for sid in range(nseq):
-        R = int(cu[sid + 1]) - int(cu[sid])
+        R = int(cu[sid + 1]) - int(cu[sid]) if len(cu) > sid + 1 else int(T_old)
         if W >= R:
             continue
         base = (sid * P + 1) * BS
         vals = pool.narrow(0, base + R - W, W).clone()
-        pool.narrow(0, base, W).copy_(vals)
+        dst = (sid * P_new + 1) * BS
+        pool.narrow(0, dst, W).copy_(vals)
         moved += 1
     return moved
 
@@ -1456,6 +1479,8 @@ def _kv_epilog(st, ctx, w):
     #   kv all-gather 成全局顺序，再用 full_ctx 写 A/B 两块池。q 仍是本地行，
     #   由 _mqsmla 用 cp_positions 的全局窗口索引去读 full pool。
     _cp = _cp_of(ctx)
+    # ★ B5 校验要用**合并前的本地张量**（合并后是全局长序，拿它当本地张量比会全错）
+    _kv_local_before_merge = kv if _cp is not None else None
     if _cp is not None:
         # ★ 2026-10-28：优先消费 `_rope` 里侧流发起的 gather（只等事件，与 q 投影并行）；
         #   张量身份/CP 状态对不上则回退同步 gather（用另一块缓冲，避免和可能仍在写的
@@ -1482,11 +1507,67 @@ def _kv_epilog(st, ctx, w):
         T = int(kv.shape[0])
         off = 0
         L_full = T
+        # ★ 2026-11-01（B5）：`DS41M_CP_KV_GATHER=check` —— **只校验不改路径**：
+        #   用 `merge_global_rows` 取尾部窗口那一段，与全量 gather 的对应切片**逐位比对**。
+        #   这是"选择性 gather 数值上可信"的运行时证据；`=selective` 的接线等这关过了再做。
+        if os.environ.get("DS41M_CP_KV_GATHER", "").strip().lower() == "check":
+            try:
+                _wa = min(int(ctx.get("win_keep") or ctx["S"]), T)
+                _need = min(T, _wa + int(BS) - 1)
+                _lo = max(0, T - _need)
+                _sel = _cp.merge_global_rows(_kv_local_before_merge, _lo, T)
+                _ref = kv[_lo:T]
+                _eq = bool(torch.equal(_sel, _ref))
+                _d = (float((_sel.float() - _ref.float()).abs().max())
+                      if _sel.shape == _ref.shape else float("nan"))
+                print(f"  [kv-gather-check] L{ctx.get('idx')} T={T} 取[{_lo},{T}) "
+                      f"{tuple(_sel.shape)} vs 全量切片 {tuple(_ref.shape)} "
+                      f"逐位={'相同' if _eq else '不同'} max|Δ|={_d:.3e}", flush=True)
+                if not _eq:
+                    raise RuntimeError(
+                        f"[kv-gather-check] L{ctx.get('idx')}：选择性 gather 与全量 gather "
+                        f"不一致（max|Δ|={_d:.3e}）——不许静默继续")
+            except RuntimeError:
+                raise
+            except Exception as _ge:                   # noqa: BLE001
+                print(f"  [kv-gather-check] 失败 {type(_ge).__name__}: {_ge}", flush=True)
 
     # A：持久窗口池（保留最后 window+回退 个 token；T 比它短时就写 T 个）
     # ★ DeepInfer `slot_mapping_store_swa` 同款：swa_block_size = window + max_backtracking，
     #   多存回退余量，DSpark/next-n 回退后仍能读到完整窗口（读取侧窗口仍是 S=128）。
     wa = min(int(ctx.get("win_keep") or ctx["S"]), T)
+    # ★ 2026-11-01（B5 接线，`DS41M_CP_KV_GATHER=selective`）：replay 段的 KV 只取尾部窗口那一段。
+    #   前提已被 `=check` 证明：`merge_global_rows(local, lo, T)` 与 `kv[lo:T]` **逐位相同**
+    #   （作业 248：400/400 层 max|Δ|=0）。这里只把"取多少行"收窄，**写入落点不变**：
+    #   窗口池 A 仍写 `[-wa:]`，scratch 池 B 仍用同一套 `slot` 公式（只是少写 `[0,lo)` 那些行）。
+    _sel_on = (os.environ.get("DS41M_CP_KV_GATHER", "").strip().lower() == "selective"
+               and _cp is not None and _kv_local_before_merge is not None
+               and int(ctx.get("n_seqs", 1) or 1) == 1)
+    _keep_rows = int(ctx.get("keep") or os.environ.get("DS41M_REPLAY_KEEP", "140") or 140)
+    if _sel_on and T > _keep_rows:
+        # ★ 2026-11-01（B5 结论，作业 249/251）：选择性 gather 的**前提不成立**。
+        #   层 20（裁剪前）本层所有 T 行都要参与 attention ⇒ 需要的 KV 就是全部 T 行，
+        #   不可能"只取尾部窗口"；而层 21+ 已经是 compact 段（T≈keep≈140），全量 gather
+        #   本来就只有 140 行 —— 也就是说当前几何下**没有**可省的搬运量。
+        #   之前 `halo_report` 报的 87%–99% 是拿"全序列 L"当分母算的，属于口径错误（已撤回）。
+        #   按铁律 0：这条路径**显式拒绝**，不许留一条会算错的捷径。
+        raise RuntimeError(
+            f"[kv-gather] selective 在本层不可用：T={T} > keep={_keep_rows}"
+            f"（L{ctx.get('idx')}）—— 该层全部行都要参与 attention，需要的就是全部 KV。"
+            f"见 WORKPLAN「B5 结论」；请用 DS41M_CP_KV_GATHER=full（默认）。")
+    _kv_use, _sel_lo = kv, 0
+    if _sel_on and T > wa:
+        _need = min(T, int(wa) + int(BS) - 1)
+        _sel_lo = max(0, T - _need)
+        try:
+            _kv_use = _cp.merge_global_rows(_kv_local_before_merge, _sel_lo, T)
+        except Exception as _se:                       # noqa: BLE001
+            raise RuntimeError(f"[kv-gather] 选择性 gather 失败（L{ctx.get('idx')}）：{_se}") from _se
+        if (os.environ.get("RANK", "0") == "0"
+                and int(ctx.get("idx", -1)) == int(os.environ.get("DS41M_KVG_LOG_LAYER", "0"))):
+            print(f"  [kv-gather] L{ctx.get('idx')} T={T} 只取[{_sel_lo},{T}) "
+                  f"{int(_kv_use.shape[0])} 行（全量 {T} 行，省 "
+                  f"{100.0 * (T - int(_kv_use.shape[0])) / max(1, T):.1f}%）", flush=True)
     cache_a = _cache_buf(st, "_win_pool", WIN_SLOTS, KV_ROW_W, device, torch.float8_e4m3fn)
     _slot_a = (
         _meta(("winpool_slot", int(wa), int(off), str(device)),
@@ -1498,7 +1579,7 @@ def _kv_epilog(st, ctx, w):
                                      % WIN_SLOTS)))
     # ★ T-042：`kv[-wa:]` 是首维切片、kv 本身连续 → 这个切片就连续，短路掉 contiguous()
     torch.ops.custom.kv_compress_epilog_v2(
-        cache_a.view(-1, cache_a.shape[-1]), _contig(kv[-wa:]), _slot_a,
+        cache_a.view(-1, cache_a.shape[-1]), _contig(_kv_use[-wa:]), _slot_a,
         quant_group_size=32, quant_mode="mxfp8_bf16", round_scale=True)
 
     # B：本步 scratch（官方 hit：窗口跑在 per-step scratch 上，索引重定基）
@@ -1545,8 +1626,9 @@ def _kv_epilog(st, ctx, w):
             #   之前把 pos<128 写成 -1 是错的 —— 那样短序列（T<128）一个 KV 都写不进去。
             slot = _meta(("fullpool_slot", int(T), int(off), str(device)),
                          lambda: (1 + pos // BS) * BS + pos % BS)
+    _slot_b = slot[_sel_lo:] if _kv_use is not kv else slot
     torch.ops.custom.kv_compress_epilog_v2(
-        pool.view(-1, pool.shape[-1]), kv, slot,
+        pool.view(-1, pool.shape[-1]), _kv_use, _slot_b,
         quant_group_size=32, quant_mode="mxfp8_bf16", round_scale=True)
     _hold(st)["_full_pool_nblk" + _sfx(ctx, "win")] = nblk
 
@@ -1554,47 +1636,6 @@ def _kv_epilog(st, ctx, w):
 # ── 2026-10-31（208 agent 要求）：rope 调用实参 dump ──────────────────────
 #   hit + CP2 的 pass2 在 aclnnInplacePartialRotaryMul 崩 507035（vector core）。
 #   每次调用前把实参落盘，用于 pass1 vs pass2 对照。写文件（--pure-log 吞 stdout）。
-def _rope_dump(site, x, cos, sin, partial, mode, ctx=None):
-    import json as _j
-    import os as _o
-    _d = _o.environ.get("DS41M_ROPE_DUMP", "").strip()
-    if not _d:
-        return
-    try:
-        _o.makedirs(_d, exist_ok=True)
-        _c = ctx or {}
-        _rec = {
-            "site": int(site),
-            "pass": int(getattr(_CORE, "PASS_NO", 0) or 0) if _CORE else 0,
-            "pid": _o.getpid(),
-            "x_shape": list(x.shape), "x_stride": list(x.stride()),
-            "x_dtype": str(x.dtype), "x_contig": bool(x.is_contiguous()),
-            "x_numel": int(x.numel()), "x_ptr": int(x.data_ptr()),
-            "cos_shape": list(cos.shape), "cos_stride": list(cos.stride()),
-            "cos_numel": int(cos.numel()), "cos_ptr": int(cos.data_ptr()),
-            "cos_contig": bool(cos.is_contiguous()),
-            "sin_shape": list(sin.shape), "sin_stride": list(sin.stride()),
-            "sin_numel": int(sin.numel()), "sin_ptr": int(sin.data_ptr()),
-            "sin_contig": bool(sin.is_contiguous()),
-            "partial": list(partial) if partial else None,
-            "mode": str(mode),
-            "idx": int(_c.get("idx", -1) or -1),
-            "off": int(_c.get("pos_offset", 0) or 0),
-            "T": int(_c.get("T", 0) or 0),
-            "L_full": int(_c.get("L_full", 0) or 0),
-            "alias_x_cos": int(x.data_ptr()) == int(cos.data_ptr()),
-            "alias_x_sin": int(x.data_ptr()) == int(sin.data_ptr()),
-            # 关键判据：cos 表行数是否覆盖 x 的行数
-            "cos_rows": int(cos.shape[0]) if cos.dim() else 0,
-            "x_rows": int(x.shape[0]) if x.dim() else 0,
-            "rows_ok": (int(cos.shape[0]) >= int(x.shape[0]))
-                       if (cos.dim() and x.dim()) else None,
-        }
-        _f = _o.path.join(_d, "rope_%d_s%d.jsonl" % (_rec["pid"], _rec["site"]))
-        with open(_f, "a") as _fh:
-            _fh.write(_j.dumps(_rec) + "\n")
-    except Exception:
-        pass
 
 
 def _cmp_state_of(st, ctx, ratio, D, device):
@@ -1764,48 +1805,6 @@ def _kv_compress_cp_segments(st, ctx, w, cp):
             lat_parts.append(_lat)
         if _kv is not None:
             kv_parts.append(_kv)
-    # ★★ 2026-10-31（208 agent 指定的形状隔离实验）：DS41M_CMP_SHAPE_ISO=1
-    #   段 0（gs=0、无 carry）理论上应与全量逐位相同。这里同进程再跑一次全量，
-    #   比段 0 覆盖的行，判定"分段调用是否改变数值"。
-    if (os.environ.get("DS41M_CMP_SHAPE_ISO", "").strip().lower()
-            in ("1", "on", "true", "yes") and ratio > 1 and len(blocks) >= 1
-            and int(ctx.get("idx", -1)) == int(os.environ.get("DS41M_SHAPE_ISO_LAYER", "2"))):
-        try:
-            _x_full = cp.merge_global(x)
-            _tot = int(_x_full.shape[0])
-            st_iso = dict(st)
-            st_iso["x"] = _x_full
-            # ★ 用独立 state 块（3），否则会覆盖段 0 正在用的块 1，对照全被污染
-            c_iso = dict(ctx, pos_offset=off0, L_full=L_full, T=_tot, _cmp_T=_tot,
-                         _cmp_sb=3, _cp_full=1, cu_seqlens=[0, _tot],
-                         seq_lens=[L_full], row_lens=[_tot], n_seqs=1)
-            c_iso.pop("cp_positions", None)
-            c_iso.pop("cp_total_q", None)
-            kv_compress(st_iso, c_iso, w)
-            _lf_iso = st_iso.get("cmp_latent")
-            _ls0 = lat_parts[0] if lat_parts else None
-            if torch.is_tensor(_lf_iso) and torch.is_tensor(_ls0):
-                # 段 0 的官方行数（floor）
-                _gs0 = int(blocks[0][1])
-                _nv0 = int(blocks[0][2])
-                _lo = (off0 + _gs0) // ratio
-                _n0 = (off0 + _gs0 + _nv0) // ratio - _lo
-                _n0 = min(_n0, int(_ls0.shape[0]), int(_lf_iso.shape[0]) - _lo)
-                _a = _ls0[:_n0].float()
-                _b = _lf_iso[_lo:_lo + _n0].float()
-                _dd = (_a - _b).abs()
-                _eq = bool(torch.equal(_ls0[:_n0], _lf_iso[_lo:_lo + _n0]))
-                _rows = torch.nonzero((_a != _b).any(-1)).flatten().tolist()
-                print(f"  [shape-iso] idx={ctx.get('idx')} rank={cp.plan.cp_rank} "
-                      f"seg0_rows={_n0} equal={_eq} diff_rows={len(_rows)} "
-                      f"max|d|={float(_dd.max()):.6g} "
-                      f"mean|d|={float(_dd.mean()):.6g} rows[:12]={_rows[:12]}",
-                      flush=True)
-                print(f"  [shape-iso] VERDICT: "
-                      f"{'shape-invariant (seg 实现有 bug)' if _eq else 'shape-dependent (官方固有)'}",
-                      flush=True)
-        except Exception as _e6:                    # noqa: BLE001
-            print(f"  [shape-iso] 失败 {type(_e6).__name__}: {_e6}", flush=True)
 
     if lat_parts:
         # ★ 保留**逐段本地 latent**：索引 K 的行级 gather（官方 update_cp_indexer_cache）
@@ -1822,79 +1821,6 @@ def _kv_compress_cp_segments(st, ctx, w, cp):
     if _dbg:
         print(f"  [cp-seg] rank={os.environ.get('RANK')} lat_rows={int(st['cmp_latent'].shape[0])} "
               f"(CP1 全量应为 {L_full // max(1, ratio)})", flush=True)
-    # ── 诊断（DS41M_CP_SEG_AB=1）：同进程再走一遍旧的全量复算，逐行比 latent ──
-    #    用来判定"分段调用算子"与"全量调用"本身是否等价（排除跨进程 fake 池差异）。
-    if os.environ.get("DS41M_CP_SEG_AB", "").strip().lower() in ("1", "on", "true", "yes"):
-        try:
-            st3 = dict(st)
-            x_full = cp.merge_global(st["x"].reshape(-1, H))
-            tot = int(x_full.shape[0])
-            st3["x"] = x_full
-            cf = dict(ctx, pos_offset=off0, L_full=L_full, T=tot, _cmp_T=tot,
-                      _cp_full=1, cu_seqlens=[0, tot], seq_lens=[L_full],
-                      row_lens=[tot], n_seqs=1)
-            cf.pop("cp_positions", None)
-            cf.pop("cp_total_q", None)
-            kv_compress(st3, cf, w)
-            _lf = st3.get("cmp_latent")
-            _lg = st.get("cmp_latent")
-            if torch.is_tensor(_lf) and torch.is_tensor(_lg):
-                # ★ 2026-10-31（208 agent 口径）：按**全局压缩行号**对齐。
-                #   full 走 packed 路径，产出 = n_real + n_pad（多 1 行 pad）；
-                #   seg 已按 ke//r-qs//r 正确筛掉 pad。
-                #   ⇒ 比 full[:n_valid] vs seg[:n_valid]，不是 min(两臂行数)。
-                _nv_ab = max(0, (off0 + int(cp.plan.total_q)) // max(1, ratio)
-                             - off0 // max(1, ratio))
-                n = min(_nv_ab, int(_lf.shape[0]), int(_lg.shape[0]))
-                _dd_ab = os.environ.get("DS41M_SEG_AB_DUMP", "").strip()
-                if _dd_ab and int(ctx.get("idx", -1)) == 2:
-                    try:
-                        os.makedirs(_dd_ab, exist_ok=True)
-                        torch.save(dict(
-                            full_lat=_lf.detach().cpu(),
-                            seg_lat=_lg.detach().cpu(),
-                            blocks=[(int(a), int(b), int(c)) for a, b, c in blocks],
-                            off0=int(off0), L_full=int(L_full), ratio=int(ratio),
-                            ps=int(_ps), D=int(D), T_full=int(cp.plan.total_q),
-                            cp_size=int(cp.plan.cp_size), rank=int(cp.plan.cp_rank),
-                        ), os.path.join(_dd_ab, f"segab_L{ctx.get('idx')}_r{cp.plan.cp_rank}.pt"))
-                        print(f"  [cp-seg-ab-dump] saved L{ctx.get('idx')} r{cp.plan.cp_rank}",
-                              flush=True)
-                    except Exception as _e5:          # noqa: BLE001
-                        print(f"  [cp-seg-ab-dump] 失败 {type(_e5).__name__}: {_e5}",
-                              flush=True)
-                print(f"  [cp-seg-ab-geom] idx={ctx.get('idx')} "
-                      f"full_rows={int(_lf.shape[0])} seg_rows={int(_lg.shape[0])} "
-                      f"aligned_n={n} (n_valid={_nv_ab})", flush=True)
-                d = (_lf[:n].float() != _lg[:n].float()).any(-1)
-                _bad = torch.nonzero(d).flatten()
-                _first = int(_bad[0]) if _bad.numel() else -1
-                _md = float((_lf[:n].float() - _lg[:n].float()).abs().max())
-                print(f"  [cp-seg-ab] idx={ctx.get('idx')} rows={n} diff={int(d.sum())} "
-                      f"first={_first} max|d|={_md:.4g} full_rows={int(_lf.shape[0])} "
-                      f"seg_rows={int(_lg.shape[0])}", flush=True)
-                # ★ 差异行清单 + 分布（判定"整段型 vs 离散型"、是否只在段首）
-                try:
-                    _rows = [int(x) for x in _bad[:200]]
-                    print(f"  [cp-seg-ab-rows] idx={ctx.get('idx')} "
-                          f"n_diff={int(d.sum())} rows[:60]={_rows[:60]}", flush=True)
-                    _ps_seg = int(blocks[0][2]) if blocks else 1
-                    _ps_cmp = max(1, _ps_seg // max(1, ratio))
-                    _mod_seg = {}
-                    _mod_cmp = {}
-                    for _r in [int(x) for x in _bad]:
-                        _mod_seg[_r % _ps_seg] = _mod_seg.get(_r % _ps_seg, 0) + 1
-                        _mod_cmp[_r % _ps_cmp] = _mod_cmp.get(_r % _ps_cmp, 0) + 1
-                    _top_seg = sorted(_mod_seg.items(), key=lambda kv: -kv[1])[:6]
-                    _top_cmp = sorted(_mod_cmp.items(), key=lambda kv: -kv[1])[:6]
-                    print(f"  [cp-seg-ab-dist] idx={ctx.get('idx')} "
-                          f"ps_seg={_ps_seg} ps_cmp={_ps_cmp} "
-                          f"top(row%ps_seg)={_top_seg} top(row%ps_cmp)={_top_cmp}",
-                          flush=True)
-                except Exception as _e4:              # noqa: BLE001
-                    print(f"  [cp-seg-ab-rows] 失败 {type(_e4).__name__}: {_e4}", flush=True)
-        except Exception as _e:                       # noqa: BLE001
-            print(f"  [cp-seg-ab] 失败 {type(_e).__name__}: {_e}", flush=True)
 
 
 def _cp_cmp_gather_rows(st, ctx, cp, blocks, off0, L_full, ratio, ps, D, lat_parts=None):
@@ -2124,10 +2050,29 @@ def _kv_compress(st, ctx, w):
         #   相同的 packed 压缩实现**。以前这里直接调 `_kv_compress`（non-packed legacy），
         #   plain 下两条实现逐位等价（所以 plain CP 一直是对的），但命中段（off>0）不等价：
         #   实测层 2 的 `cmp_kv` 首个分叉、下游全错。ctx2 按 CP1 的单序列 packed 几何摆好。
-        ctx2 = dict(ctx, pos_offset=int(getattr(_cp_cmp, "pos_offset", 0) or 0),
-                    L_full=_Lg, T=tot, _cp_full=1,
-                    cu_seqlens=[0, int(tot)], seq_lens=[int(_Lg)],
-                    row_lens=[int(tot)], n_seqs=1)
+        # ★ 2026-11-01（P1-1b，缺陷 G9）：packed 多请求时 merged 张量是**各序列拼接**
+        #   （`merge_global` 的全局行序 = cu 序），所以 ctx 必须逐请求给 cu/seq_lens/
+        #   row_lens —— 旧代码一律写 `cu=[0,tot]`、`n_seqs=1`，把 2R 行当成**一条**
+        #   长 L 的序列压缩 ⇒ 形状校验失败（实测 aclnnMatmul 161002）。单请求逐字不变。
+        _cp_rows = [int(v) for v in _cp_cmp.plan.seq_lens]
+        _cp_ns = len(_cp_rows)
+        if _cp_ns > 1:
+            if len(set(_cp_rows)) > 1:
+                raise RuntimeError(
+                    f"CP 压缩全量复算：packed 多请求要求各请求行数相同（当前 {_cp_rows}）；"
+                    f"不等长时请用 DS41M_CP_CMP_FLOW=seg 或按 batch=1 跑")
+            _cu_m = [0]
+            for _v in _cp_rows:
+                _cu_m.append(_cu_m[-1] + _v)
+            ctx2 = dict(ctx, pos_offset=int(getattr(_cp_cmp, "pos_offset", 0) or 0),
+                        L_full=_Lg, T=tot, _cp_full=1,
+                        cu_seqlens=_cu_m, seq_lens=[int(_Lg)] * _cp_ns,
+                        row_lens=list(_cp_rows), n_seqs=_cp_ns)
+        else:
+            ctx2 = dict(ctx, pos_offset=int(getattr(_cp_cmp, "pos_offset", 0) or 0),
+                        L_full=_Lg, T=tot, _cp_full=1,
+                        cu_seqlens=[0, int(tot)], seq_lens=[int(_Lg)],
+                        row_lens=[int(tot)], n_seqs=1)
         ctx2.pop("cp_positions", None)
         ctx2.pop("cp_total_q", None)
         if os.environ.get("DS41M_CMP_ARGDBG"):
@@ -2381,8 +2326,6 @@ def _kv_compress(st, ctx, w):
     # 压缩 rope：ratio>0 → comp 表（YaRN，base=160000）；位置 = p×ratio（组首 token）
     # 命中：尾部压缩行的绝对行号从 off//ratio 起（前缀的压缩行已缓存）
     cos, sin = _comp_rope_tables(int(kv.shape[0]), ratio, ctx, device, row_off=off // max(1, ratio))
-    _rope_dump(3, kv.view(-1, 1, 1, D), cos, sin,
-               [D - ctx["rope_dim"], D], "interleave", ctx)
     torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
         kv.view(-1, 1, 1, D), cos, sin, rotary_mode="interleave",
         partial_slice=[D - ctx["rope_dim"], D])
@@ -3306,13 +3249,17 @@ def _meta(key, build):
     t = META.get(key)
     if t is None:
         t = META[key] = build()
+        META_STATS["geo_miss"] += 1
         if _META_TRACE:
             import sys as _s
             _s.stderr.write(f"  [meta-miss] pass={PASS_NO} {key}\n")
-    elif _META_VERIFY:
-        _t2 = build()
-        if not _meta_eq(t, _t2):
-            raise RuntimeError(f"[meta-verify] 缓存值与现算不一致：pass={PASS_NO} key={key}")
+    else:
+        META_STATS["geo_hit"] += 1
+        if _META_VERIFY:
+            _t2 = build()
+            if not _meta_eq(t, _t2):
+                raise RuntimeError(
+                    f"[meta-verify] 缓存值与现算不一致：pass={PASS_NO} key={key}")
     return t
 
 
@@ -3323,6 +3270,20 @@ def _meta(key, build):
 #   （`core/runner.py:955` 每个前向 +1）当 epoch：键随前向自动失效，跨 forward 不会串味。
 #   注意：**只放"同一次前向内、跨层逐位相同"的纯函数结果**（输入张量按 data_ptr 进键）。
 _FWD_META = [None, {}]
+# ★ 2026-11-01（P3-2 吸收）：两级 metadata 的**复用 vs 重建**计数（每个 forward 归零）。
+#   `geo_*` = 进程级 `_meta`（几何/池，跨 forward 复用）；`fwd_*` = forward 级 `_meta_fwd`
+#   （每次前向整表重建，语义 = DeepInfer cross_layer_runtime）。
+#   用途：回答"这条点位的耗时里有多少是重建 metadata"。只计数，无行为影响。
+META_STATS = {"geo_hit": 0, "geo_miss": 0, "fwd_hit": 0, "fwd_miss": 0}
+
+
+def meta_reset():
+    for _k in META_STATS:
+        META_STATS[_k] = 0
+
+
+def meta_snapshot():
+    return dict(META_STATS)
 
 
 def _meta_fwd(key, build):
@@ -3334,13 +3295,17 @@ def _meta_fwd(key, build):
     d = _FWD_META[1]
     if key not in d:
         d[key] = build()
+        META_STATS["fwd_miss"] += 1
         if _META_TRACE:
             import sys as _s
             _s.stderr.write(f"  [meta-fwd-miss] pass={ep} {key}\n")
-    elif _META_VERIFY:
-        _t2 = build()
-        if not _meta_eq(d[key], _t2):
-            raise RuntimeError(f"[meta-fwd-verify] 缓存值与现算不一致：pass={ep} key={key}")
+    else:
+        META_STATS["fwd_hit"] += 1
+        if _META_VERIFY:
+            _t2 = build()
+            if not _meta_eq(d[key], _t2):
+                raise RuntimeError(
+                    f"[meta-fwd-verify] 缓存值与现算不一致：pass={ep} key={key}")
     return d[key]
 
 
@@ -3411,6 +3376,13 @@ def meta_clear():
 
 PHASE: dict = {}
 HOSTTIME: dict = {}          # DS41M_HOSTTIME=1 时的逐算子 host 墙钟累计（runner 里写）
+HOSTTIME_N: dict = {}        # 同一次下发的**调用次数**（算 per-call µs；与 HOSTTIME 同时清）
+
+
+def _ht_add(key: str, dt: float):
+    """host 分段计时（DS41M_HOSTTIME=1 时由算子内部调用）。"""
+    HOSTTIME[key] = HOSTTIME.get(key, 0.0) + dt
+    HOSTTIME_N[key] = HOSTTIME_N.get(key, 0) + 1
 
 
 def mq_table():
@@ -3457,8 +3429,15 @@ def hosttime_table(pass_secs=None):
     print(f"  ── 逐算子 host 耗时（合计 {tot:.2f}s"
           + (f" / wall {pass_secs:.2f}s" if pass_secs else "") + "）──")
     _lim = len(HOSTTIME) if _all else 15
+    # ★ 2026-10-31：带**调用次数**与 per-call µs —— 区分「下发次数多」与「单次太贵」
+    #   （assembly 成本落在 per-call 里；~26µs 是纯 dispatch 的量级参考）。
+    _ntot = sum(HOSTTIME_N.values()) or 0
     for k, v in sorted(HOSTTIME.items(), key=lambda kv: -kv[1])[:_lim]:
-        print(f"    {k:<14} {v:7.4f}s")
+        _n = int(HOSTTIME_N.get(k, 0) or 0)
+        _per = (v / _n * 1e6) if _n else 0.0
+        print(f"    {k:<14} {v:7.4f}s  n={_n:<4d} {_per:7.1f}µs/次")
+    print(f"    [op-count] 合计 {_ntot} 次下发 / pass（per-call 均值 "
+          f"{tot / _ntot * 1e6:.1f}µs）" if _ntot else "    [op-count] 无")
     if pass_secs:
         # 阶段外未归账 = wall − (造输入 + 层前 + 算子循环)：逐层尾段（抢跑 event 同步、
         #   层切换）与 pass 首尾。**同步等待设备的时间落在这里**，不是 host CPU 成本。
@@ -3695,8 +3674,6 @@ def _kv_compress_pk(st, ctx, w):
         pos, _ = batch_layout.local_positions(ctx, n, device)   # 已含逐序列偏移
         _n = max(1, max(int(lens[i]) + int(_offs[i]) for i in range(nseq)))
     cos, sin = _CORE._rope_at_pos(pos, ctx, device, n=_n)
-    _rope_dump(4, kv.view(-1, 1, 1, D), cos, sin,
-               [D - ctx["rope_dim"], D], "interleave", ctx)
     torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
         kv.view(-1, 1, 1, D), cos, sin, rotary_mode="interleave",
         partial_slice=[D - ctx["rope_dim"], D])

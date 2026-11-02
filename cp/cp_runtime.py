@@ -135,8 +135,14 @@ def all_gather_global(x_local: torch.Tensor, plan: CpPlan, group,
     #   （S ≤ chunk）以前全落在旧分支上，forward 尾部 6–8ms 全花在这。
     _ch = (int(chunk) if chunk is not None
            else int(os.environ.get("DS41M_CP_AG_CHUNK", "16384") or 0))
-    _inv_ok = (len(plan.inverse_reverse) == world * int(x.shape[0])
-               and all(v >= 0 for v in plan.inverse_reverse))
+    S = int(x.shape[0])
+    # ★ 2026-10-31：`all(v>=0 ...)` 是 O(world*S) 的 Python 扫描（plain 64k 时 65536 项/
+    #   次 × 40 层）。它是 plan 的**几何常量** ⇒ 每 plan 只算一次（plan._rt 缓存）。
+    _inv_ok = plan._rt.get("inv_ok")
+    if _inv_ok is None:
+        _inv_ok = (len(plan.inverse_reverse) == world * int(plan.local_rows)
+                   and all(v >= 0 for v in plan.inverse_reverse))
+        plan._rt["inv_ok"] = _inv_ok
     _scatter = _ch > 0 and _inv_ok
     if _scatter:
         _rest = tuple(x.shape[1:])
@@ -146,7 +152,6 @@ def all_gather_global(x_local: torch.Tensor, plan: CpPlan, group,
             full = torch.empty((plan.total_q,) + _rest,
                                dtype=x.dtype, device=x.device)
         inv = _plan_tensor(plan, "inv", plan.inverse_reverse, x.device)
-        S = int(x.shape[0])
         for s0 in range(0, S, _ch):
             e0 = min(S, s0 + _ch)
             n = e0 - s0
@@ -156,22 +161,73 @@ def all_gather_global(x_local: torch.Tensor, plan: CpPlan, group,
             if g is None:
                 g = torch.empty((world * n,) + _rest,
                                 dtype=x.dtype, device=x.device)
+            _th = os.environ.get("DS41M_HOSTTIME", "").strip().lower() in ("1", "on", "true", "yes")
+            _tc = __import__("time").perf_counter() if _th else 0.0
             try:
                 dist.all_gather_into_tensor(g, part.contiguous(), group=group)
             except Exception:                           # noqa: BLE001
                 parts = [torch.empty_like(part) for _ in range(world)]
                 dist.all_gather(parts, part, group=group)
                 g = torch.cat(parts, dim=0)
+            if _tc:
+                try:
+                    import exec_ops as _eo
+                    _eo._ht_add("ag.hccl", __import__("time").perf_counter() - _tc)
+                except Exception:                   # noqa: BLE001
+                    pass
             for r in range(world):
                 full.index_copy_(0, inv[r * S + s0:r * S + e0],
                                  g[r * n:(r + 1) * n])
         out = full
     else:
-        parts = [torch.empty_like(x) for _ in range(world)]
-        dist.all_gather(parts, x, group=group)
-        full = torch.cat(parts, dim=0)
-        idx = _plan_tensor(plan, "reverse", plan.reverse_index, x.device)
-        out = full.index_select(0, idx)
+        # ★★ 2026-10-31（host-bound 第 1 刀）：旧回退是
+        #   `dist.all_gather(parts, x)`（list API，world 次 collective）+ `cat` +
+        #   `index_select` —— 实测 143.5µs + 35.4µs + 21.6µs/次，而 pad 只发生在
+        #   命中/尾段 plan（S 小）。改成：**一个** `all_gather_into_tensor` 进固定缓冲，
+        #   再按 `inverse_reverse >= 0` 掩码散写（pad 行跳过）；字节/数值与原实现**逐位相同**。
+        #   `DS41M_CP_AG_PADSCATTER=0` 回退旧实现（A/B 用）。
+        _padsc = os.environ.get("DS41M_CP_AG_PADSCATTER", "1").strip().lower() not in (
+            "0", "off", "false", "no")
+        _th = os.environ.get("DS41M_HOSTTIME", "").strip().lower() in ("1", "on", "true", "yes")
+        _tm2 = __import__("time")
+        _tA = _tm2.perf_counter() if _th else 0.0
+        if _padsc:
+            _rest = tuple(x.shape[1:])
+            g = _cached_buf(plan, f"{buf_key}:pg{world}x{S}", (world * S,) + _rest,
+                            x.dtype, x.device)
+            if g is None:
+                g = torch.empty((world * S,) + _rest, dtype=x.dtype, device=x.device)
+            _tB = _tm2.perf_counter() if _th else 0.0
+            dist.all_gather_into_tensor(g, x, group=group)
+            _tC = _tm2.perf_counter() if _th else 0.0
+            # gathered 缓冲就是 rank 序拼接（= 旧 cat 的结果）⇒ 一次 index_select 还原全局序。
+            # pad 行不会出现在 reverse_index 里，无需掩码；全程 1 个集合通信 + 1 个 gather。
+            idx = _plan_tensor(plan, "reverse", plan.reverse_index, x.device)
+            out = g.index_select(0, idx)
+            if _th:
+                try:
+                    import exec_ops as _eo
+                    _eo._ht_add("ag.alloc", _tB - _tA)
+                    _eo._ht_add("ag.hccl", _tC - _tB)
+                    _eo._ht_add("ag.post", _tm2.perf_counter() - _tC)
+                except Exception:                   # noqa: BLE001
+                    pass
+        else:
+            parts = [torch.empty_like(x) for _ in range(world)]
+            _tB = _tm2.perf_counter() if _th else 0.0
+            dist.all_gather(parts, x, group=group)
+            _tC = _tm2.perf_counter() if _th else 0.0
+            full = torch.cat(parts, dim=0)
+            idx = _plan_tensor(plan, "reverse", plan.reverse_index, x.device)
+            out = full.index_select(0, idx)
+            if _th:
+                try:
+                    import exec_ops as _eo
+                    _eo._ht_add("ag.alloc", _tB - _tA)
+                    _eo._ht_add("ag.list", _tC - _tB)
+                    _eo._ht_add("ag.post", _tm2.perf_counter() - _tC)
+                except Exception:               # noqa: BLE001
+                    pass
     if _ts:
         torch.npu.synchronize()
         _dt = _tm.perf_counter() - _t0
@@ -185,8 +241,84 @@ def all_gather_global(x_local: torch.Tensor, plan: CpPlan, group,
     return out
 
 
+def _row_source(p: int, ps: int, cp_size: int) -> tuple:
+    """全局位置 `p` 的值在哪个 rank 的本地第几行：`(owner_rank, local_row)`。
+
+    mirror 布局：块 `b = p // ps`，持有者 `min(b, 2·cp−1−b)`；
+    head 块（`b < cp`）在本 rank 的 `[0, ps)`，tail 块在 `[ps, 2·ps)`。
+    """
+    b = int(p) // int(ps)
+    owner = int(min(b, 2 * int(cp_size) - 1 - b))
+    base = 0 if b < int(cp_size) else int(ps)
+    return owner, base + (int(p) - b * int(ps))
+
+
+def merge_global_rows(x_local: torch.Tensor, plan: CpPlan, pos_lo: int, pos_hi: int,
+                      group=None, buf_key: str | None = None) -> torch.Tensor:
+    """**只取**全局位置 `[pos_lo, pos_hi)` 的行（B5 / GPT `partition=mirror_aligned` 的落地）。
+
+    返回紧凑张量，第 i 行 = 全局位置 `pos_lo + i` 的值（与 `merge_global(...)[pos_lo:pos_hi]`
+    **逐位相同**是硬要求，见 `DS41M_CP_KV_GATHER=check`）。
+
+    只支持**单序列** plan：多序列时"全局位置"需要 cu 换算，等 G7/G10 的等长限制解除后再说；
+    这里显式拒绝（不静默降级）。
+    """
+    if len(plan.seq_lens) != 1:
+        raise ValueError(
+            f"merge_global_rows 只支持单序列 plan（当前 {len(plan.seq_lens)} 个）；"
+            f"多序列请继续用 merge_global")
+    L = int(plan.seq_lens[0])
+    ps = int(plan.local_lens[0]) // 2
+    lo = max(0, int(pos_lo))
+    hi = min(int(pos_hi), L)
+    if hi <= lo:
+        return x_local[:0]
+    if ps <= 0:
+        raise ValueError(f"merge_global_rows: ps={ps} 非法（plan.local_lens={plan.local_lens}）")
+    world = dist.get_world_size(group) if dist.is_initialized() else 1
+    if world == 1:
+        return x_local[lo:hi]
+
+    pos = list(range(lo, hi))
+    src = [_row_source(p, ps, plan.cp_size) for p in pos]
+    me = int(plan.cp_rank)
+    my_rows = [r for (o, r) in src if o == me]
+    dev = x_local.device
+    if my_rows:
+        _idx = torch.tensor(my_rows, dtype=torch.long, device=dev)
+        send = x_local.index_select(0, _idx).contiguous()
+    else:
+        send = x_local[:0]
+    # ① 交换各 rank 的发送行数（用 uint8 占位张量，避免 dtype 差异）
+    _cnt = torch.tensor([len(my_rows)], dtype=torch.long, device=dev)
+    _cnts = [torch.zeros_like(_cnt) for _ in range(world)]
+    dist.all_gather(_cnts, _cnt, group=group)
+    cnts = [int(v.item()) for v in _cnts]
+    maxn = max(1, max(cnts))
+    # ② pad 到 maxn 后一次性 all_gather_into_tensor
+    #   ★ 注意 API 语义：`inp` 是**本地分片**（maxn 行），`out` 是 `world*maxn` 行。
+    _tail = tuple(send.shape[1:])
+    _inp = torch.zeros((maxn,) + _tail, dtype=x_local.dtype, device=dev)
+    if len(my_rows):
+        _inp[:len(my_rows)] = send
+    _out = torch.empty((world * maxn,) + _tail, dtype=x_local.dtype, device=dev)
+    dist.all_gather_into_tensor(_out, _inp.contiguous(), group=group)
+    # ③ 每行在"本 rank 发送序列"里的序号（所有 rank 算得一致）
+    _rank_counts = cnts
+    _seen = [0] * world
+    _rank_of = []
+    for (o, _r) in src:
+        _rank_of.append(o)
+    _k = []
+    for o in _rank_of:
+        _k.append(_seen[o])
+        _seen[o] += 1
+    _gidx = [o * maxn + k for o, k in zip(_rank_of, _k)]
+    _gt = torch.tensor(_gidx, dtype=torch.long, device=dev)
+    return _out.index_select(0, _gt).contiguous()
+
+
 # ── 侧流 async all-gather（2026-10-28，DeepInfer `cp.all_gather()` 的 wait-句柄同款）──
-#   动机：KV 的 all-gather 原来在 `_kv_epilog` 里同步做，主流水线要等满整段 AG
 #   （实测 256k CP2 h0.97：主流水线等待占 AG 时长 84%，4.5ms/forward）。
 #   现在 kv rope 一完成就在**侧流**发起，`_kv_epilog` 只 wait event。数值同一条
 #   all-gather（单块、字节不变），逐位不变。
@@ -231,11 +363,23 @@ def all_gather_global_async(x_local: torch.Tensor, plan: CpPlan, group,
     # 单块只在 S 不太大时用：单块缓冲 = world×S 行（1M/CP8 时 ≈1 GiB），
     # 超过阈值退回默认分块（字节不变 ⇒ 数值不变）。
     _max_rows = int(os.environ.get("DS41M_CP_KV_PREF_MAX_ROWS", "65536") or 65536)
+    import time as _tm
+    _ht = os.environ.get("DS41M_HOSTTIME", "").strip().lower() in ("1", "on", "true", "yes")
+    _t0 = _tm.perf_counter() if _ht else 0.0
     with torch.npu.stream(side):
         out = all_gather_global(x, plan, group,
                                 chunk=(S if S <= _max_rows else None), buf_key=buf_key)
+        _t1 = _tm.perf_counter() if _ht else 0.0
         ev = torch.npu.Event()
         ev.record()
+        if _ht:
+            _t2 = _tm.perf_counter()
+            try:
+                import exec_ops as _eo
+                _eo._ht_add("ag.call", _t1 - _t0)
+                _eo._ht_add("ag.ev", _t2 - _t1)
+            except Exception:                       # noqa: BLE001
+                pass
     return out, ev
 
 

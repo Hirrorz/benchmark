@@ -114,8 +114,11 @@ if [ -n "$DS41_DEPS" ]; then DEPS=$DS41_DEPS
 elif [ -d "$RT/deps/yaml" ]; then DEPS=$RT/deps                    # 包内实体拷贝
 elif [ -d "/root/py311deps/yaml" ]; then DEPS=/root/py311deps      # 本机老路径
 elif [ -d "$_pack_root/deps/yaml" ]; then DEPS=$_pack_root/deps
+# ★ 2026-11-01：**共享盘**上的公共依赖（099 已装、208 缺；拷贝自 099 的站点包）。
+#   位置与三台共享的 `/mnt/xds/sfs` 同盘，只走 PYTHONPATH 前置，不动系统 site-packages。
+elif [ -d "/mnt/xds/sfs/l00972766/deps_py/yaml" ]; then DEPS=/mnt/xds/sfs/l00972766/deps_py
 else DEPS=""; fi
-[ -n "$DEPS" ] && say "deps: $DEPS" || say "⚠️  没有 yaml 等纯 py 依赖 → 请 pip install pyyaml sympy requests"
+[ -n "$DEPS" ] && say "deps: $DEPS" || say "⚠️  没有 yaml 等纯 py 依赖 → 请 pip install pyyaml sympy requests（或拷到 /mnt/xds/sfs/l00972766/deps_py）"
 
 # ── ⑦ torch/torch_npu 站点包：镜像自带优先，其次覆盖层（轻量包不打这 2 GB）──────
 _py_sp=/usr/local/python3.11.16/lib/python3.11/site-packages     # 950-DT 镜像自带位置
