@@ -100,7 +100,7 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
 
 
-def build_cp_plan(seq_lens, cp_size: int, cp_rank: int) -> CpPlan:
+def _build_cp_plan_uncached(seq_lens, cp_size: int, cp_rank: int) -> CpPlan:
     """构造一个 rank 的 head-tail/mirror 布局。
 
     seq_lens: 每个请求的逻辑长度（列表）。
@@ -258,3 +258,23 @@ def compact_boundary_index(compact_plan: CpPlan, gathered_reverse) -> tuple[int,
     for gi in compact_plan.local_index:
         out.append(int(gathered_reverse[gi]) if gi >= 0 else -1)
     return tuple(out)
+
+
+# `CpPlan` 是**不可变 dataclass**（`_rt` 只是运行时张量缓存，key 都含几何），
+# 而 `build_cp_plan` 是纯函数 ⇒ 按 `(lens, cp_size, cp_rank)` 缓存即可。
+# L20 边界（keep=512）与 L21 replay 裁剪（keep=140）每 forward 各调一次，
+# 命中后省掉整段 CP 布局推导（含 O(total_q) 的 reverse_index 构造）。
+_CP_PLAN_CACHE: dict = {}
+
+
+def build_cp_plan(seq_lens, cp_size: int, cp_rank: int) -> CpPlan:
+    """缓存版 `build_cp_plan`：几何相同就复用同一个不可变 CpPlan。"""
+    key = (tuple(int(x) for x in seq_lens), int(cp_size), int(cp_rank))
+    hit = _CP_PLAN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    plan = _build_cp_plan_uncached(list(key[0]), key[1], key[2])
+    if len(_CP_PLAN_CACHE) > 64:            # 防跨点位累积（几何本来就少）
+        _CP_PLAN_CACHE.clear()
+    _CP_PLAN_CACHE[key] = plan
+    return plan

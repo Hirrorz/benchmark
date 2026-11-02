@@ -15,41 +15,43 @@
 import torch
 
 
-def candidate_block_max(p_sum, k_lens, block_size):
-    """块内取 max。
+def candidate_block_max(x, k_lens, block_size):
+    """每行按块取 max，并把**最后一个有效块**置 +inf（边界块必被选中）。
 
-    p_sum   : [T, N] bf16/fp32（logits，N = 压缩 K 行数）
-    k_lens  : [T] int32（每行可见长度）
-    block_size: 8 或 16
-
-    返回 (block_scores [T, ceil(N/block)], valid_blocks [num_valid])
+    与 DeepInfer `candidate_block_max_ref`（candidate_blocks.py:51-76）逐句同构：
+    补齐到整块 → 掩码 → 块内 `amax` → 夹到 dtype 上限 → 末块置 inf → 原地 scatter。
+    两处对我们有实质意义：
+      * `clamp_max_(finfo.max)`：`+inf` 不能直接进 bf16（会溢出成 NaN 语义），
+        DeepInfer 把整块分数先夹到 dtype 上限，末块再写 inf —— 我们之前漏了这一步；
+      * 全程原地（`masked_fill_` / `clamp_max_` / `scatter_`），少两次中间张量。
     """
-    T, N = p_sum.shape
-    nblk = (N + block_size - 1) // block_size
-    pad = nblk * block_size - N
-    x = p_sum.float()
-    if pad:
-        x = torch.cat([x, torch.full((T, pad), float("-inf"), dtype=x.dtype,
-                                     device=x.device)], dim=1)
-    # 把超出 k_lens 的位置也置 -inf
-    idx = torch.arange(nblk * block_size, device=x.device).unsqueeze(0)
-    mask = idx < k_lens.unsqueeze(1)
-    x = torch.where(mask, x, torch.full_like(x, float("-inf")))
-    scores = x.reshape(T, nblk, block_size).max(dim=-1).values
-    # ★ 官方 `candidate_block_max_ref`（candidate_blocks.py:70-75）：
-    #   把每行**最后一个有效块**强制置 +inf，保证边界块一定被选中。
-    valid_blocks = ((k_lens + block_size - 1) // block_size).clamp(max=nblk)
-    last_blocks = (valid_blocks - 1).clamp(min=0).unsqueeze(1).long()
+    # ★ 2026-11-02：dtype 对齐 DeepInfer —— `candidate_block_max_ref` 全程 bf16
+    #   （candidate_blocks.py:60 `torch.full(..., dtype=torch.bfloat16)`），
+    #   而下游 `deep_select.interface.topk` 在 Ascend **只支持 bf16 输入**
+    #   （其 docstring: "Ascend only supports torch.bfloat16"），
+    #   所以这里不能用 fp32，否则 topk 无法走 DeepSelect 内核（会退回 aclnnTopkV2）。
+    x = x.to(torch.bfloat16)
+    T = int(x.shape[0])
+    nblk = (int(x.shape[1]) + block_size - 1) // block_size
+    pad_len = nblk * block_size
+    cols = torch.arange(pad_len, device=x.device)
+    if pad_len > int(x.shape[1]):
+        x = torch.nn.functional.pad(x, (0, pad_len - int(x.shape[1])),
+                                    value=float("-inf"))
+    x = torch.where(cols.unsqueeze(0) < k_lens.unsqueeze(1),
+                    x, torch.full_like(x, float("-inf")))
+    scores = x.reshape(T, nblk, block_size).amax(dim=-1)
+    # +inf 不能进 bf16：先夹到 dtype 上限（DeepInfer 同款）
+    scores.clamp_max_(torch.finfo(scores.dtype).max)
+
+    valid_blocks = ((k_lens + block_size - 1) // block_size).clamp_max(nblk)
+    last_blocks = (valid_blocks - 1).clamp_min(0).unsqueeze(1).long()
     last_scores = scores.gather(1, last_blocks)
     last_scores = torch.where(valid_blocks.unsqueeze(1) > 0,
                               torch.full_like(last_scores, float("inf")),
                               last_scores)
-    scores = scores.scatter(1, last_blocks, last_scores)
+    scores.scatter_(1, last_blocks, last_scores)
     return scores, valid_blocks.to(torch.int32)
-
-
-# 注意：**不要**在 NPU 上用 `nonzero()`（`aclnnNonzeroV2` 会崩 507015）。
-# 旧版这里有一句 `(scores > -inf).any(0).nonzero()`，已删除。
 
 
 def select_candidate_blocks(block_scores, valid_blocks, block_size, topk_blocks,
@@ -83,15 +85,20 @@ def select_candidate_blocks(block_scores, valid_blocks, block_size, topk_blocks,
          重复块由 `sorted_union` 去重，语义安全。
     """
     T, nblk = block_scores.shape
+    # ★ 2026-11-02：用 DeepSelect 的 `topk`（= trace 里的
+    #   `topk_select_ascend::topk_select_kernel`），对齐 DeepInfer
+    #   `index_attn.py:206-215` 的 `topk(..., sorted_index=True, end=valid)`；
+    #   不再用 `torch.topk`（那条会落到 `aclnnTopkV2_TopkV2AiCoreForDavid_TopKV2`）。
+    from deep_select.interface import topk as _ds_topk
     kk = min(topk_blocks, nblk)
-    vals, idxs = torch.topk(block_scores, kk, dim=1, largest=True, sorted=True)
-    valid_cnt = (vals > float("-inf")).sum(dim=1).to(torch.int32)
-    # 无效位（分数 -inf）先标 -1，稍后统一替换成「最后一个有效块」。
-    idxs = torch.where(vals > float("-inf"), idxs, torch.full_like(idxs, -1))
-    if kk < topk_blocks:
-        pad = torch.full((T, topk_blocks - kk), -1, dtype=idxs.dtype, device=idxs.device)
-        idxs = torch.cat([idxs, pad], dim=1)
-    idxs = idxs.to(torch.int32)
+    out_idx = torch.full((T, topk_blocks), -1, dtype=torch.int32,
+                         device=block_scores.device)
+    _ds_topk(block_scores, kk, sorted=False, indices_type=torch.int32,
+             sorted_index=True, output_idx=out_idx,
+             end=valid_blocks.to(torch.int32),
+             idx_oob_fill_value=-1, return_value=False)
+    idxs = out_idx
+    valid_cnt = (idxs >= 0).sum(dim=1).to(torch.int32)
     if block_base is not None:
         bb = block_base.to(torch.int32).unsqueeze(1)
         idxs = torch.where(idxs >= 0, idxs + bb, idxs)

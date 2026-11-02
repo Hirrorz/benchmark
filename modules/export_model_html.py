@@ -146,10 +146,16 @@ def spec_dryrun(cfg, recipes, tbuild) -> dict:
         ctx = runmod.ctx_for(cfg, layer)
         counts = collections.Counter()
         comp = tbuild.templates_raw[row["template"]]
+        _seen_per_layer = set()
         for step in comp.steps:
             spec = opgraph.OPS.get(step.op)
             if spec is None:
                 continue
+            # 与 run.apply_ops 同语义：per_layer 的 count 是整层总量，重复出现只计一次
+            if spec.get("per_layer"):
+                if step.op in _seen_per_layer:
+                    continue
+                _seen_per_layer.add(step.op)
             n = spec["count"](ctx)
             if n:
                 counts[spec["kernel"]] += n

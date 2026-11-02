@@ -50,6 +50,6 @@ def compress_prefill(score, latent, state_cache, out, cu_q, cu_k, cu_c, cbm, sbt
     state_cache: [num_slots, ring, 2, DIM] fp32（与厂商路径同一块缓冲）
     其余为 [num_seqs+1]/[num_seqs]/[num_seqs+1]/[total_c] 的 int32 元数据。
     """
-    k = kernel(int(score.shape[-1]), int(ratio))
+    k = kernel(score.shape[-1], int(ratio))
     k(score, latent, state_cache, sbt, cbm, cu_q, cu_k, cu_c, None, out)
     return out

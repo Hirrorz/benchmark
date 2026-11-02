@@ -107,10 +107,17 @@ def local_positions(ctx, T: int, device):
         return None, None
     cp_pos = (ctx or {}).get("cp_positions")
     if cp_pos is not None:
-        cu_t = torch.tensor(cu, dtype=torch.long, device=device)
-        pos = torch.arange(int(T), device=device)
-        sid = torch.searchsorted(cu_t[1:-1].contiguous(), pos, right=True)
-        return cp_pos, sid
+        # ★★ 2026-11-02 hostbound 修复（方案 B，比 A 更彻底）：
+        #   过去这里每次调用都做 3 件纯浪费的事 ——
+        #     ① `torch.tensor(cu, device=npu)` 同步 H2D（要先排空流 → host 阻塞，
+        #        trace 里就是 DynamicMxQuant 之后的 aclrtSynchronizeStream）；
+        #     ② `torch.arange` → Arange 设备算子；
+        #     ③ `torch.searchsorted` → SearchSorted + 输出 ZerosLike。
+        #   而 `sid` 在全仓**唯一**消费者是 `request_ids()`，它自身没有调用者
+        #   （WORKPLAN 本文档 §3.5 已核对）。所以 CP 分支直接不造 sid：
+        #   稳态零 H2D、零 Arange、零 SearchSorted。`request_ids()` 改为显式报错，
+        #   杜绝"将来有人用却静默拿到 None"（铁律 0：不静默回退）。
+        return cp_pos, None
     off = int((ctx or {}).get("pos_offset", 0) or 0)
     offs = pos_offsets(ctx)
     key = ("pos", tuple(cu), int(T), off, tuple(offs) if offs else None, str(device))
@@ -131,8 +138,19 @@ def _build_positions(cu, T, off, device, offs=None):
 
 
 def request_ids(ctx, T: int, device):
-    """每 token 的请求号 [T]；单序列 → None。"""
-    return local_positions(ctx, T, device)[1]
+    """每 token 的请求号 [T]；单序列 → None。
+
+    ★ 2026-11-02：CP 分支为消除阻塞 H2D 已不再构造 sid（见 local_positions）。
+    本函数在全仓没有调用者；若将来要用，必须在 CP 场景下自行重建 sid——
+    这里显式报错而不是静默返回 None。
+    """
+    _, sid = local_positions(ctx, T, device)
+    if sid is None and (ctx or {}).get("cp_positions") is not None:
+        raise RuntimeError(
+            "request_ids：CP 场景下 sid 已被移除（消除阻塞 H2D 的性能修复）；"
+            "需要请求号请自行由 cu 重建，勿依赖本函数的返回值"
+        )
+    return sid
 
 
 def blocks_per_seq(ctx, BS: int) -> int:
@@ -212,7 +230,7 @@ def win_indices(local_pos, BS: int):
     """
     if not _WIN_IDX_ON:
         return _win_indices_build(local_pos, BS)
-    key = ("winidx", int(local_pos.data_ptr()), int(local_pos.shape[0]),
+    key = ("winidx", int(local_pos.data_ptr()), local_pos.shape[0],
            int(BS), str(local_pos.device))
     ent = _WIN_IDX_CACHE.get(key)
     if ent is not None and ent[0] is local_pos:

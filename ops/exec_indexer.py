@@ -78,7 +78,18 @@ ADDED = "idx_prolog+qli"  # exec_ops 插件加载时打印用（qsli 留下一�
 
 
 # ─────────────────────────── 小工具 ───────────────────────────
-_NZ_CACHE: dict = {}
+# 走 NZ 布局的 indexer 权重：短名 → 权重全名。
+# 调用侧只写 `_nz("wqb")`，不用再抄长路径。
+_NZ_ALIAS = {
+    "wqb": "attn.indexer.wq_b.weight",          # [4096,1280] fp8
+    "wk":  "attn.indexer.wk.weight",
+    "ww":  "attn.indexer.weights_proj.weight",  # [32,5120] bf16
+}
+
+# 权重 NZ 布局缓存：按**权重名**索引（不再绑 data_ptr），只持有转换产物。
+_NZ_BY_NAME: dict = {}
+
+_NZ_WEIGHTS = tuple(_NZ_ALIAS.values())
 _IDXK_LOG: list = []          # 调试（DS41M_QLI_DUMP）：所有 K 写者的记录（模块级，跨 st/hold）
 
 
@@ -118,7 +129,7 @@ def _cand_dbg_check(ctx, ci, cl, topk, cand_size, ratio):
     """
     try:
         # ★ ci 是 [T,1,K]，先压成 [T,K]（否则下面的广播会报 2048 vs 512）
-        _b = ci.detach().reshape(int(ci.shape[0]), -1).to(torch.int64)
+        _b = ci.detach().reshape(ci.shape[0], -1).to(torch.int64)
         _neg = _b < 0
         if _b.shape[0] > 1:
             _mono = (_b[1:] >= _b[:-1]) | _neg[1:] | _neg[:-1]
@@ -127,7 +138,7 @@ def _cand_dbg_check(ctx, ci, cl, topk, cand_size, ratio):
             _srt = True
         _pb = _b.clamp_min(0)
         _offK = int(ctx.get("pos_offset", 0) or 0)
-        _rows = torch.arange(int(_b.shape[0]), device=_b.device, dtype=torch.int64)
+        _rows = torch.arange(_b.shape[0], device=_b.device, dtype=torch.int64)
         _valid = ((_offK + _rows + 1) // max(1, ratio)).clamp_max(int(topk))
         _tok = (_valid.unsqueeze(1) - _pb * int(cand_size)).clamp_(0, int(cand_size))
         _tok = torch.where(_neg, torch.zeros_like(_tok), _tok)
@@ -142,29 +153,28 @@ def _cand_dbg_check(ctx, ci, cl, topk, cand_size, ratio):
         print(f"  [cand-dbg] 失败 {type(_e).__name__}: {_e}", flush=True)
 
 
-def _nz(w, name):
-    """ND → FRACTAL_NZ（官方 to_nz）。**按权重张量缓存**：加载期一次，不是每步。
+def _nz(name: str):
+    """取已预转的 NZ 权重。`name` 可用短名（wqb/wk/ww）或完整权重名。"""
+    name = _NZ_ALIAS.get(name, name)
+    nz = _NZ_BY_NAME.get(name)
+    if nz is None:
+        raise KeyError(f"权重 {name} 尚未预转 NZ（加载期应先调用 preload_nz）")
+    return nz
 
-    真权重/合成权重都是 ND；`npu_format_cast` 会真发一次设备侧转置（进 trace），
-    所以只在首次见到该 tensor 时做（合成模式 share_across_layers 下总共只有 1 次）。
+
+def preload_nz(w) -> int:
+    """加载期把所有走 NZ 的 indexer 权重转一次，返回条数。
+
+    转换是这里唯一的职责；之后 `_nz(name)` 只查缓存，完全不依赖 raw ND 张量，
+    于是 raw 可以被 `_release_packed_raw()` 释放。
     """
-    t = w.get(name)
-    if not torch.is_tensor(t):
-        raise KeyError(f"缺权重 {name}（真/合成权重都应按 weights_manifest 提供）")
-    key = (t.data_ptr(), tuple(t.shape), t.dtype)
-    hit = _NZ_CACHE.get(key)
-    if hit is None:
-        nz = torch_npu.npu_format_cast(t.contiguous(), FRACTAL_NZ)
-        # ★ 2026-10-19：以前上限 8 条，超限就**整表清空**。真权重有 8 个 indexer 层
-        #   （layers 2/8/14/20/24/28/32/36）× 3 个权重（wq_b/wk/weights_proj）= 24 条，
-        #   必然超限 → 每次清空后下个 pass 重新做设备侧 Transpose+FormatCast
-        #   （真权重 trace 里 FormatCast 32 次/2 passes）。合成权重 share_across_layers
-        #   只有 1~3 条，所以一直没暴露。
-        #   缓存持有源 tensor 引用（data_ptr 不会被复用），现改为**进程内常驻、不再清**：
-        #   24 份 NZ 副本 ≈ 46 MB（wq_b 5.24 MB + wk 0.13 MB + weights_proj 0.33 MB 每层），
-        #   可忽略；换掉的是每 pass 重复的格式转换。
-        hit = _NZ_CACHE[key] = (t, nz)
-    return hit[1]
+    n = 0
+    for _name in _NZ_WEIGHTS:
+        t = w.get(_name)
+        if torch.is_tensor(t) and _name not in _NZ_BY_NAME:
+            _NZ_BY_NAME[_name] = torch_npu.npu_format_cast(t.contiguous(), FRACTAL_NZ)
+            n += 1
+    return n
 
 
 _CS_CACHE: dict = {}
@@ -282,8 +292,8 @@ def _idx_prolog(st, ctx, w):
     qr_u8 = qr8.view(torch.uint8)
     descale_qr = _descale_pairs(qr_scale, T, n_pair)
 
-    wqb = _nz(w, "attn.indexer.wq_b.weight")                          # [4096,1280] 1B + NZ
-    ww = _nz(w, "attn.indexer.weights_proj.weight")                   # [32,5120] BF16 + NZ
+    wqb = _nz("wqb")                          # [4096,1280] 1B + NZ
+    ww = _nz("ww")                   # [32,5120] BF16 + NZ
     _pk = w.get("_packed") or {}
     descale_wqb = _pk.get("attn.indexer.wq_b.scale.pairs")
     if descale_wqb is None:                     # 权重侧配对：加载期备好（以前每次现做）
@@ -441,7 +451,7 @@ def _idx_k_cache(st, ctx, w, n_rows, device, who="?"):
     latent = st.get("cmp_latent")
     if latent is None:
         raise RuntimeError("索引 K 需要 st['cmp_latent']（本层要先跑 kv_compress）")
-    _qli_dbg(f"WRITE-cache who={who} idx={ctx.get('idx')} lat={int(latent.shape[0])} "
+    _qli_dbg(f"WRITE-cache who={who} idx={ctx.get('idx')} lat={latent.shape[0]} "
              f"n_rows={int(n_rows)} row0={int(row0)} T={ctx.get('T')}")
     if os.environ.get("DS41M_QLI_DUMP"):
         try:
@@ -451,7 +461,7 @@ def _idx_k_cache(st, ctx, w, n_rows, device, who="?"):
                 n_rows=int(n_rows), ctx_T=int(ctx.get("T", -1) or -1),
                 L_full=int(ctx.get("L_full", -1) or -1),
                 pos=int(ctx.get("pos_offset", 0) or 0),
-                lat_rows=int(latent.shape[0]),
+                lat_rows=latent.shape[0],
                 lat_sha=_hl.sha1(latent.detach().float().cpu().numpy().tobytes()).hexdigest()[:16])
             _IDXK_LOG.append(_rec)
             try:
@@ -493,7 +503,7 @@ def _idx_k_cache(st, ctx, w, n_rows, device, who="?"):
                           lambda: _ci_build(_pos0))
     _ifc.prolog_k((), dict(
         latent=latent.reshape(-1, latent.shape[-1]),
-        wk=_nz(w, "attn.indexer.wk.weight"),
+        wk=_nz("wk"),
         # 同 compressor.norm：官方把它 cast 成 fp32（modeling_deepseek.py:2648-2650）
         norm_weight=(w.get("_packed") or {}).get("attn.indexer.k_norm.weight.f32")
         if (w.get("_packed") or {}).get("attn.indexer.k_norm.weight.f32") is not None
@@ -611,7 +621,7 @@ def _idx_k_cache(st, ctx, w, n_rows, device, who="?"):
             slots = torch.where(_rows < _cut, torch.full_like(slots, -1), slots)
         _ifc.prolog_k((), dict(
             latent=latent.reshape(-1, latent.shape[-1]),
-            wk=_nz(w, "attn.indexer.wk.weight"),
+            wk=_nz("wk"),
             norm_weight=(w.get("_packed") or {}).get("attn.indexer.k_norm.weight.f32")
             if (w.get("_packed") or {}).get("attn.indexer.k_norm.weight.f32") is not None
             else w["attn.indexer.k_norm.weight"].to(torch.float32).contiguous(),
@@ -660,7 +670,7 @@ def _idx_k_write(st, ctx, w):
     lat = st.get("cmp_latent")
     if lat is None:
         raise RuntimeError("idx_k_write 需要 st['cmp_latent']（本层要先跑 kv_compress）")
-    _idx_k_cache(st, ctx, w, int(lat.shape[0]), lat.device, who="op:idx_k_write")
+    _idx_k_cache(st, ctx, w, lat.shape[0], lat.device, who="op:idx_k_write")
 
 
 def _qli(st, ctx, w):
@@ -739,8 +749,8 @@ def _qli(st, ctx, w):
                             "lat": _lat.detach().cpu() if (os.environ.get("DS41M_QLI_LATDUMP")
                                                            and torch.is_tensor(_lat)) else None,
                             "off": int(ctx.get("pos_offset", 0) or 0),
-                            "Tloc": int(_sp.shape[0]),
-                            "q_rows": int(st["idx_q"].shape[0]),
+                            "Tloc": _sp.shape[0],
+                            "q_rows": st["idx_q"].shape[0],
                             "k_sha": _ksha,
                             "k_shape": tuple(_k.shape) if torch.is_tensor(_k) else None,
                             "bt": _bt.detach().cpu().tolist()[:8] if torch.is_tensor(_bt) else None,
@@ -753,25 +763,6 @@ def _qli(st, ctx, w):
     return _r
 
 
-def _cp_full_ctx(ctx, tot, cp=None):
-    """CP → 全长视图（单序列 total_q 行）。`_cp_full` 让 `_cp_of` 返回 None，
-    避免下游再 gather；索引器/K 缓存都按 CP1 的全长几何跑。
-
-    ★ 2026-10-28（命中 + CP）：给了 `cp` 时用它的**绝对起点**（stage B = L-R）与
-      **全局 L**（L_full 决定 K 缓存/组合缓存的池宽，必须与 stage A 一致）；不给则
-      保持旧口径（off=0、L_full=tot，plain prefill 逐位不变）。
-    """
-    _off = int(getattr(cp, "pos_offset", 0) or 0) if cp is not None else 0
-    _L = int((ctx.get("L_full") if cp is not None else 0) or tot)
-    # ★ 2026-10-28（命中 + CP）：seq_lens 是**每序列逻辑长度 L**（索引器用它算
-    #   seqused_k = L//ratio 与 remainder = L%ratio），不是段内行数；命中时 tot=R。
-    c = dict(ctx, pos_offset=_off, L_full=_L, T=int(tot), _cp_full=1,
-             cu_seqlens=[0, int(tot)], seq_lens=[int(_L)], row_lens=[int(tot)], n_seqs=1)
-    c.pop("cp_positions", None)
-    c.pop("cp_total_q", None)
-    return c
-
-
 def _qli_cp(st, ctx, w, cp):
     """CP 的 QLI：**本地 q 直接对 full K 查**（DeepInfer `attn.py:550-580` 同口径）。
 
@@ -779,42 +770,15 @@ def _qli_cp(st, ctx, w, cp):
     块 [gs, gs+nv) 是"长为 gs+nv 的前缀的尾部"，seq_k=(gs+nv)//ratio、
     residual=(gs+nv)%ratio（residual 就是官方 `compressed_seq_remainders`，
     让内核把段的绝对位置摆正）。K 缓存用**全长 latent**在 off=0 几何下写一次。
-    `DS41M_CP_QLI_FULL=1` 退回"gather Q 全长"版做 A/B。
     """
     # ★★ 2026-10-28（命中 + CP）：命中段（pos_offset>0）默认走**全量 packed** 路径——
     #   与 CP1 的 `_qli_pk` 同一实现；分块实现的选择顺序与它不等价（实测层 2 末行
-    #   idx_sparse 不同、末行 max|Δ|=3.4e14）。A/B 可设 DS41M_CP_QLI_FULL=0 退回分块。
     # ★ 2026-10-30 抢修：以前写的是 `env in (1/on) or pos_offset>0` —— **显式 =0 也切不走**
     #   （命中段永远 >0）⇒ 这个 A/B 开关实际不可用，分块版无法被选中。现在显式 0/off 优先。
-    _qfull = os.environ.get("DS41M_CP_QLI_FULL", "").strip().lower()
-    # ★★ 2026-10-31（用户口径，对齐 DeepInfer）：**默认分块**（本地 q 对 full K，
-    #   每个压缩块只算一次 ⇒ 单 rank 计算量 = 1/CP）。全长臂只在显式
-    #   `DS41M_CP_QLI_FULL=1` 时用于 A/B —— 它每 rank 重算全长，实测 8k/hit0.5
-    #   CP2 反而比 CP1 慢 36%（163.8 vs 120.7 ms），与 DeepInfer 的计算流程不一致。
-    _want_full = _qfull in ("1", "on", "true", "yes")
-    if _want_full:
-        # ★★ 2026-10-30（任务 B 裁决）：**全长 A/B 臂在 CP>1 的候选源层有已知缺陷**。
-        #   `_qli_cp_full` 把 Q gather 成全局 `total_q` 行，QSLI（L24/L28/L32 这类
-        #   candidate_source 层）随后把这些全局行喂给只接受 `plan.local_rows` 的
-        #   `cp_state.all_gather_global`（`cp/cp_runtime.py:110-111`）⇒
-        #   `ValueError: x_local 行数 512 != plan.local_rows 70`（CP2/8k 实测
-        #   8 rank × 3 层 = 24 条），算子被吞掉后**静默降级**。
-        #   ⇒ 该臂的数值与耗时**都不能当基准**（全长臂 r2–r7 稳态离散 0.164~0.187s
-        #   就是降级幅度不同造成的）。干净基线请用 CP1，或 QLI_FULL=0 的分块臂。
-        #   计划：C3 阶段删除 `_qli_cp_full`（WORKPLAN 已登记 C0）。
-        if int(getattr(cp, "cp_size", 1) or 1) > 1:
-            _warn = "  [qli-full-warn] DS41M_CP_QLI_FULL 全长 A/B 臂在 CP>1 时"                     " 候选源层（QSLI）会报 x_local != local_rows 并静默降级，"                     " 数字不可作基准（见 NOTES/2026-10-30-cp-official-flow.md C0）"
-            if os.environ.get("DS41M_QLI_WARN_ONCE", "1") != "0":
-                _seen = _CORE._hold(st).setdefault("_qli_full_warned", set())
-                _k = int(ctx.get("idx", -1) or -1)
-                if _k not in _seen:
-                    _seen.add(_k)
-                    print(_warn, flush=True)
-        return _qli_cp_full(st, ctx, w, cp)
     ratio = max(1, int(ctx["ratio"]))
     topk = int(ctx["index_topk"])
     dev = st["idx_q"].device
-    Tloc = int(st["idx_q"].shape[0])
+    Tloc = st["idx_q"].shape[0]
     is_cand = bool(ctx.get("is_candidate"))
     hold = _CORE._hold(st)
     lat = st.get("cmp_latent")
@@ -823,12 +787,10 @@ def _qli_cp(st, ctx, w, cp):
         # ★ 2026-10-28（命中 + CP）：必须用**绝对起点**（stage B = L-R）与**全局 L**，
         #   否则 stage B 会把尾部 latent 写到行 0 起、并重建池几何 ⇒ 覆盖/丢掉 stage A 前缀。
         #   plain prefill（off=0、L_full=total_q）与本改动前逐位相同。
-        # ★ 2026-10-30 修（A/B 实证）：以前这里手搓 ctx_full，**没有把 T 覆盖成全局行数**
-        #   （T 仍是本地 1710），而全长版 `_qli_cp_full` 走 `_cp_full_ctx(ctx, total_q, cp)`
-        #   （T=total_q=3417）⇒ 两条路写进索引 K 池的内容不同（同形状 (130,128,1,64)、
-        #   sha 不同）⇒ QLI 输出整体不同（1707/1710 行、top-512 集合差 ~58%）。
-        #   现在两边共用同一个 helper，K 写入几何逐位一致。
-        _qli_dbg(f"cp-write idx={ctx.get('idx')} ratio={ratio} lat={int(lat.shape[0])}")
+        # ★ 2026-10-30 修（A/B 实证）：以前这里手搓 ctx_full，没有把 T 覆盖成全局行数，
+        #   （同形状 (130,128,1,64)、sha 不同）⇒ QLI 输出整体不同（1707/1710 行、
+        #   top-512 集合差 ~58%）。现在统一用同一个 helper，K 写入几何逐位一致。
+        _qli_dbg(f"cp-write idx={ctx.get('idx')} ratio={ratio} lat={lat.shape[0]}")
         # ★ 2026-10-30 修（A/B + 分支打点实证的根因）：
         #   旧代码把 rank0 的**两段本地 latent 拼成 480 行连续写**到 row0=3616 起。
         #   但 zigzag 两段在压缩空间**不连续**（CP2/L8192：rank0 = 全局 [0,240) ∪ [720,959)
@@ -847,8 +809,12 @@ def _qli_cp(st, ctx, w, cp):
                 print(f"  [cp-k-gather] 失败 {type(_e).__name__}: {_e}（回退拼接写池）", flush=True)
                 _kg_ok = False
         if not _kg_ok:
-            _idx_k_cache(st, _cp_full_ctx(ctx, int(cp.plan.total_q), cp),
-                         w, int(lat.shape[0]), dev, who="qli_cp")
+            # ★ 2026-11-02（用户裁决）：删「gather 全长 → 全长写池」回退。
+            #   真实推理应只按本地 q 算；全长 gather 是白算。铁律 0：不静默降级。
+            raise RuntimeError(
+                "CP K 池写入失败：`_idx_k_rows_cp` 未成功"
+                "（或 DS41M_CP_K_GATHER=0）。全长回退路径已删除（白算）；"
+                "请修 CP 分块 K 池写入。")
     base = dict(ctx)
     base["idx_k_ready"] = f"_idx_k_r{ratio}" in hold
     # ★ 压缩侧用**原序列长**（compact 段 = L）；块起点要加 pos_offset 变绝对位置
@@ -937,7 +903,7 @@ def _idx_k_rows_cp(st, ctx, cp, w):
     kk, sk = f"_idx_k_r{ratio}", f"_idx_ks_r{ratio}"
     k_pool = hold.get(kk)
     s_pool = hold.get(sk)
-    if k_pool is None or int(k_pool.shape[0]) < 1 + nblk:
+    if k_pool is None or k_pool.shape[0] < 1 + nblk:
         if _CORE._KV_MGR is not None:
             k_pool, s_pool = _CORE._KV_MGR.idx_k(hold, ratio, nblk, dev)
         else:
@@ -979,7 +945,7 @@ def _idx_k_rows_cp(st, ctx, cp, w):
     k_s = _CORE._cache_buf(st, f"_idx_k_scratch_r{ratio}", _nb_rows, PACKED_D, dev,
                            torch.uint8)[:_nb_rows].view(1 + nblk, rpb, 1, PACKED_D)
     _s_buf = _CORE._hold(st).get(f"_idx_ks_scratch_r{ratio}")
-    if (_s_buf is None or int(_s_buf.shape[0]) < _nb_rows
+    if (_s_buf is None or _s_buf.shape[0] < _nb_rows
             or _s_buf.dtype != torch.uint8):
         _s_buf = torch.full((_nb_rows, 4), 127, dtype=torch.uint8, device=dev)
         _CORE._hold(st)[f"_idx_ks_scratch_r{ratio}"] = _s_buf
@@ -1006,7 +972,7 @@ def _idx_k_rows_cp(st, ctx, cp, w):
                      + (torch.arange(n, device=dev) + pos0) % rpb))
         _ifc.prolog_k((), dict(
             latent=lat.reshape(-1, lat.shape[-1]),
-            wk=_nz(w, "attn.indexer.wk.weight"),
+            wk=_nz("wk"),
             norm_weight=_nw,
             rope_sin=sin.reshape(-1, ROPE_DIM), rope_cos=cos.reshape(-1, ROPE_DIM),
             k_cache=k_s, k_scale_cache=s_s.view(s_s.shape[0], rpb, 1, 4),
@@ -1084,14 +1050,14 @@ def _idx_k_cp_probe(st, ctx, cp, w):
         if i >= len(lats) or lats[i] is None:
             continue
         lat = lats[i]
-        n = int(lat.shape[0])
+        n = lat.shape[0]
         pos0 = (off0 + int(gs)) // ratio
         print(f"  [cp-k-probe] seg i={i} gs={int(gs)} nv={int(nv)} lat_rows={n} pos0={pos0}", flush=True)
         cos, sin = _CORE._comp_rope_tables(n, ratio, ctx, dev, row_off=pos0)
         ci = torch.arange(n, dtype=torch.int64, device=dev)
         _ifc.prolog_k((), dict(
             latent=lat.reshape(-1, lat.shape[-1]),
-            wk=_nz(w, "attn.indexer.wk.weight"),
+            wk=_nz("wk"),
             norm_weight=_nw,
             rope_sin=sin.reshape(-1, ROPE_DIM), rope_cos=cos.reshape(-1, ROPE_DIM),
             k_cache=k_s, k_scale_cache=s_s.view(s_s.shape[0], rpb, 1, 4),
@@ -1113,87 +1079,6 @@ def _idx_k_cp_probe(st, ctx, cp, w):
     print(f"  [cp-k-probe] 汇总 不同行 {bad}/{tot}", flush=True)
 
 
-def _qli_cp_full(st, ctx, w, cp):
-    """CP 的 QLI：**Q 侧 gather 成全长 → 标准全长路径 → 结果切回本地行**。
-
-    与 CP1 逐位同形（保留作 A/B 基线）；代价是每 rank 复算全长 QLI。
-    通信量：idx_q(uint8, 2KB/token) + idx_w + descale（远小于 hidden）。
-    """
-    ratio = max(1, int(ctx["ratio"]))
-    tot = int(cp.plan.total_q)
-    st2 = dict(st)
-    for _k in ("idx_q", "idx_descale_q", "idx_w"):
-        st2[_k] = cp.merge_global(st[_k].contiguous())
-    # ★★ 2026-10-28（命中 + CP）：CP1 走的是 packed varlen 实现（`_qli_pk`），
-    #   这里以前走 `_qli_chunk`（单序列分块）⇒ 同一份 Q/K 在两套实现下 top-k 选择不同
-    #   （实测层 2 全局末行 idx_sparse 不同）。全量路径直接复用 CP1 的 `_qli_pk`。
-    _cf = _cp_full_ctx(ctx, tot, cp)
-    # ★ 2026-10-28：层 20 截尾后 compact 段的行数（tot）< 截尾前 latent 行数。
-    #   packed 实现会把 latent 当成本段数据整段写 K 池 → 形状校验炸；compact 段
-    #   K 池已由截尾前的 idx_k_write 按全长写好，这里走 `_qli_chunk`（只读池）。
-    _lat0 = st2.get("cmp_latent")
-    # ★★ 2026-10-30 再修（A/B 实证）：以前写成 `latent 行数 != tot` —— ratio=2 时
-    #   压缩行数恒为 T/2 ≠ T ⇒ **每个 c2a 层都被误判成 compact 段**，走只读分支、
-    #   不重写 K（实测 A 臂 L2/L8/L14 的 K sha 完全相同、L14 与 B 臂不同）。
-    #   真 compact 段的判据是 runner 置的 `idx_k_ready`（cut 前 idx_k_write 已按全长写好）；
-    #   或者 latent 比本段 q 行**多**（截尾前 latent 的全长几何）。`>` 不是 `!=`。
-    _compact_seg = (bool(ctx.get("idx_k_ready")) or
-                    (_lat0 is not None and int(_lat0.shape[0]) > int(tot)))
-    _qli_dbg(f"cp_full idx={ctx.get('idx')} ratio={ratio} tot={tot} "
-             f"lat={None if _lat0 is None else int(_lat0.shape[0])} "
-             f"ready={bool(ctx.get('idx_k_ready'))} compact={_compact_seg} "
-             f"pool={f'_idx_k_r{ratio}' in _CORE._hold(st2)}")
-    if _compact_seg:
-        _cf["idx_k_ready"] = f"_idx_k_r{ratio}" in _CORE._hold(st2)
-        _qli_chunk(st2, _cf, w)
-        sp = cp.split_local(st2["cmp_sparse_indices"].contiguous(), pad=-1)
-        tl = cp.split_local(st2["cmp_topk_length"].contiguous(), pad=0)
-        st["idx_sparse"] = sp
-        st["cmp_sparse_indices"] = sp
-        st["cmp_topk_length"] = tl
-        _h = _CORE._hold(st)
-        _h[f"_cmp_sparse_r{ratio}" + _CORE._sfx(ctx, "idx")] = sp
-        _h[f"_cmp_topklen_r{ratio}" + _CORE._sfx(ctx, "idx")] = tl
-        return sp
-    # ★★ 2026-10-30 修（A/B 实证的根因）：以前这里**无条件**把 idx_k_ready 置成"池存在"
-    #   ⇒ 层 2 写完，层 8/14 全部**跳过重写**、一直用层 2 的 K（实测 A 臂 L2/L8/L14 的
-    #   K sha 完全相同）。但 `recipes.yaml` 里 `idx_k_write` 只在层 20（c1a_source_split）；
-    #   层 2/8/14 的 K 必须**在 qli 里逐层重写**（见 `_idx_k_cache` 注释："每个压缩源层都要用
-    #   本层 latent 重写，不能只写一次"）。现在**只有 compact 段**（截尾后 latent 行数 ≠ tot）
-    #   走上面那个只读分支；其余交给 `_qli_pk` 正常逐层写（与 CP1 同路径）。
-    _kg = False
-    # ★ 2026-10-30 转正（决策 A）：默认走官方 K 行 gather（逐段本地算 K、68 B/行）。
-    #   与"全量 latent 写池"只差段边界 carry 组（L8 sp 1 行），属于官方口径本身的近似。
-    #   `DS41M_CP_K_GATHER=0` 可回退到全量写池。
-    _kg_env = os.environ.get("DS41M_CP_K_GATHER", "").strip().lower()
-    if _kg_env not in ("0", "off", "false", "no"):
-        try:
-            _kg = _idx_k_rows_cp(st, ctx, cp, w)
-        except Exception as _e:                   # noqa: BLE001
-            print(f"  [cp-k-gather] 失败 {type(_e).__name__}: {_e}（回退全量写池）", flush=True)
-            _kg = False
-    if _kg:
-        _cf["idx_k_ready"] = True
-    _qli_pk(st2, _cf, w)
-    if os.environ.get("DS41M_CP_K_PROBE", "").strip().lower() in ("1", "on", "true", "yes"):
-        try:
-            _idx_k_cp_probe(st, ctx, cp, w)
-        except Exception as _e:                   # noqa: BLE001
-            print(f"  [cp-k-probe] 失败 {type(_e).__name__}: {_e}", flush=True)
-    sp = cp.split_local(st2["cmp_sparse_indices"].contiguous(), pad=-1)
-    tl = cp.split_local(st2["cmp_topk_length"].contiguous(), pad=0)
-    st["idx_sparse"] = sp
-    st["cmp_sparse_indices"] = sp
-    st["cmp_topk_length"] = tl
-    hold = _CORE._hold(st)
-    hold[f"_cmp_sparse_r{ratio}" + _CORE._sfx(ctx, "idx")] = sp
-    hold[f"_cmp_topklen_r{ratio}" + _CORE._sfx(ctx, "idx")] = tl
-    for _k in ("_li_cand_r1", "_li_candlen_r1"):
-        v = hold.get(_k)
-        if v is not None:
-            hold[_k] = cp.split_local(v.contiguous(), pad=0)
-    return sp
-
 
 def _qli_chunk(st, ctx, w):
     """`quant_lightning_indexer`：q/k/w → 每行 topk=512 个稀疏压缩 KV 位置。官方 indexer.py:331-393。"""
@@ -1206,7 +1091,7 @@ def _qli_chunk(st, ctx, w):
     topk = int(ctx["index_topk"])
     # 压缩后的 K 长度 = **压缩器实际输出行数**（满组 + 余数；官方 compressed_seq_lens(+remainder)）
     lat = st.get("cmp_latent")
-    seq_k = int(lat.shape[0]) if lat is not None else T // ratio
+    seq_k = lat.shape[0] if lat is not None else T // ratio
     if os.environ.get("DS41M_SEQK_OVERRIDE"):
         seq_k = int(os.environ["DS41M_SEQK_OVERRIDE"])
     # ★★ 2026-10-17（**病C 的根因**，据此修）：可见的压缩 K 长度必须是
@@ -1234,7 +1119,7 @@ def _qli_chunk(st, ctx, w):
     #   （实测：官方把 345 挪到末位、mini 挪 403；集合相同、只差这一个位置）。
     if os.environ.get("DS41M_SEQK_EXACT", "1") == "1":
         seq_k = min(seq_k, k_hit if k_hit is not None else T // ratio)
-    n_rows_k = int(lat.shape[0]) if lat is not None else T // ratio   # 写缓存用**latent 行数**
+    n_rows_k = lat.shape[0] if lat is not None else T // ratio   # 写缓存用**latent 行数**
     device = q.device
 
     # ★ 候选源层（assemble 的 is_candidate，官方 candidate_source_layer=20）：
@@ -1329,9 +1214,7 @@ def _qli_chunk(st, ctx, w):
         (q, k, st["idx_w"].contiguous(), st["idx_descale_q"], dk, topk, 1),
         dict(
         cu_seqlens_q=mdi[1], seqused_q=None, seqused_k=mdi[2], cmp_residual_k=mdi[3],
-        # ★ 传**显式块表**（官方同口径）：曾经传 None 走"物理顺序读"退化路径，
-        #   与官方在近似并列的 top-k 取舍上不同（实测 59/262144 个索引元素不一致）
-        # 与写侧同一张旋转块表（见 _qslitab）：内核按块序归并，表不同会改输出顺序
+
         block_table=bt_rows,
         metadata=md, max_seqlen_q=-1, mask_mode=3, cmp_ratio=ratio,
         layout_q="TND", layout_k="PA_BBND", return_value=False,
@@ -1468,14 +1351,11 @@ def _qsli_cp(st, ctx, w, cp):
     """CP 的 QSLI：**本地 q 直接查 full 组合缓存**（DeepInfer 同口径；按 head/tail 块）。
 
     候选块 `_li_cand_r1` 是逐行张量（层 20 的 QLI 产物，本地行序）→ 按块切片即可，
-    不需要任何 gather。`DS41M_CP_QLI_FULL=1` 退回 gather 版做 A/B。
     """
-    if os.environ.get("DS41M_CP_QLI_FULL", "").strip().lower() in ("1", "on", "true", "yes"):
-        return _qsli_cp_full(st, ctx, w, cp)
     ratio = max(1, int(ctx["ratio"]))
     topk = int(ctx["index_topk"])
     dev = st["idx_q"].device
-    Tloc = int(st["idx_q"].shape[0])
+    Tloc = st["idx_q"].shape[0]
     # ★ 2026-10-28（P0-5，已否决）：双块合并（一次厂商调用）在 8k@0.90 CP2 上设备挂死
     #   （rank0 卡死、rc=124；见 NOTES/2026-10-28-tail-bubble-host-opt-plan.md「否定结果」）。
     #   代码已删除，勿再尝试同一姿势（共享块表 repeat + batch=2）。
@@ -1546,35 +1426,6 @@ def _qsli_cp(st, ctx, w, cp):
     return sp
 
 
-def _qsli_cp_full(st, ctx, w, cp):
-    """CP 的 QSLI：Q/候选 gather 全长 → 标准路径 → 切回本地行（A/B 基线）。"""
-    ratio = max(1, int(ctx["ratio"]))
-    tot = int(cp.plan.total_q)
-    hold = _CORE._hold(st)
-    ci = hold.get("_li_cand_r1")
-    cl = hold.get("_li_candlen_r1")
-    st2 = dict(st)
-    for _k in ("idx_q", "idx_descale_q", "idx_w"):
-        st2[_k] = cp.merge_global(st[_k].contiguous())
-    if ci is not None:
-        hold["_li_cand_r1"] = cp.merge_global(ci.contiguous())
-        hold["_li_candlen_r1"] = cp.merge_global(cl.contiguous())
-    try:
-        _qsli_chunk(st2, _cp_full_ctx(ctx, tot, cp), w)
-    finally:
-        if ci is not None:
-            hold["_li_cand_r1"] = ci
-            hold["_li_candlen_r1"] = cl
-    sp = cp.split_local(st2["cmp_sparse_indices"].contiguous(), pad=-1)
-    tl = cp.split_local(st2["cmp_topk_length"].contiguous(), pad=0)
-    st["idx_sparse"] = sp
-    st["cmp_sparse_indices"] = sp
-    st["cmp_topk_length"] = tl
-    hold[f"_cmp_sparse_r{ratio}" + _CORE._sfx(ctx, "idx")] = sp
-    hold[f"_cmp_topklen_r{ratio}" + _CORE._sfx(ctx, "idx")] = tl
-    return sp
-
-
 def _qsli_dg_chunk(st, ctx, w):
     """QSLI 的 DeepInfer 内核版：组合缓存 → dense K，再走官方稀疏打分 + topk。
 
@@ -1599,7 +1450,7 @@ def _qsli_dg_chunk(st, ctx, w):
     q = st.get("idx_q")
     if q is None:
         raise RuntimeError("qsli(dg) 需要 st['idx_q']（本层要先跑 idx_prolog）")
-    T = int(q.shape[0])
+    T = q.shape[0]
     ratio = max(1, int(ctx["ratio"]))
     topk = int(ctx["index_topk"])
     cbs = int(ctx.get("candidate_block_size", CAND_BLOCK))
@@ -1618,12 +1469,13 @@ def _qsli_dg_chunk(st, ctx, w):
 
     cu = batch_layout.cu_of(ctx) or [0, int(T)]
     nseq = len(cu) - 1
-    if nseq > 1:
-        # 多请求打包时 K 池是按序列拼接的，dense 化还没做（槽位只有一条全局索引轴）。
-        # 按铁律 0：**不许静默回退**，显式报错并给出可执行的回退开关。
-        raise RuntimeError(
-            f"qsli(dg) 暂不支持 nseq={nseq}（多请求打包）："
-            f"请显式设 DS41M_QSLI_KERNEL=vendor，或按 batch=1 跑")
+    # ★ 2026-11-01（P1-2，缺陷 G3）：packed 多请求也走 dg 内核。
+    #   口径与 `_qli_dg` 的 b>1 分支逐项一致：
+    #     · dense K 行轴 = 各序列压缩行**拼接**（`_cu_k`），按各自块表映射；
+    #     · `ks/ke` 用**绝对**行号（`_dg_build_ks_ke` 内部 base 累加）；
+    #     · 块号保持**绝对**块号（源层写的就是绝对块号）；
+    #     · topk 还原成绝对压缩行后，按请求减 `_cu_k[s]` 局部化 —— mqsmla 的
+    #       `cmp_sparse_indices` 要的是**请求内局部**行号（同 `_qli_dg`:3005-3018）。
     raw_lens = [int(x) for x in (ctx.get("seq_lens")
                                  or [cu[b + 1] - cu[b] for b in range(nseq)])]
     L_full = int(ctx.get("L_full", 0) or 0)
@@ -1633,15 +1485,24 @@ def _qsli_dg_chunk(st, ctx, w):
         kv_lens = [span_end for _ in raw_lens]
     else:
         kv_lens = [(L_full if L_full > 0 else int(x)) for x in raw_lens]
+    # 每序列可见压缩行数起点（nseq==1 时 _cu_k[-1] 与旧 `seq_k` 表达式等价）
+    _cu_k = [0]
+    for _sk in kv_lens:
+        _cu_k.append(_cu_k[-1] + max(1, int(_sk) // ratio))
+    _nk = int(_cu_k[-1])
 
     # ── 可见压缩行数（与 vendor 同口径：span_end//ratio 优先，不从 L_full 推）──
     lat = st.get("cmp_latent")
-    seq_k = int(lat.shape[0]) if lat is not None else int(T) // ratio
+    seq_k = lat.shape[0] if lat is not None else int(T) // ratio
     _spanK = span_end // ratio
     if _spanK > seq_k:
         seq_k = _spanK
+    if nseq > 1:
+        seq_k = max(int(seq_k), _nk)
     if seq_k <= 0:
         raise RuntimeError(f"qsli(dg): seq_k={seq_k}（off={off} T={T} ratio={ratio}）")
+    # b>1 的 K 轴总量（= 各序列压缩行拼接长度）；b=1 时与 `seq_k` 同值
+    _nk_eff = int(_nk) if nseq > 1 else int(seq_k)
 
     # ── dense K：**优先用共享的 split index-K 池**（DeepInfer `use_shared_index_k` 同口径）──
     #   ★★ 2026-10-31（A/B + 探针实测后改）：组合缓存是 **vendor 融合算子专用的 repack**，
@@ -1666,13 +1527,15 @@ def _qsli_dg_chunk(st, ctx, w):
             raise RuntimeError(
                 f"qsli(dg) 既没有共享 index-K 池（_idx_k_r{ratio}）也没有 cmp_latent ⇒ "
                 f"无法构造 dense K；请显式 DS41M_QSLI_KERNEL=vendor")
-        _k, _dk, _bt = idx_k_cache(st, ctx, w, int(lat.shape[0]), dev)
+        _k, _dk, _bt = idx_k_cache(st, ctx, w, lat.shape[0], dev)
         k_src = (_k, _dk, _bt)
-    _n_full = int(L_full) // ratio or int(seq_k)
+    _n_full = (_nk_eff if nseq > 1
+               else (int(L_full) // ratio or int(seq_k)))
     k_dense, k_sf = _dg_paged_to_dense(k_src[0], k_src[1], k_src[2],
-                                       int(seq_k), ratio, dev, n_full=_n_full)
+                                       int(seq_k), ratio, dev, n_full=_n_full,
+                                       cu_k=(_cu_k if nseq > 1 else None))
     k_dense = k_dense.view(torch.int8)
-    k_sf = k_sf.reshape(int(k_dense.shape[0]), 4).contiguous().view(torch.int16)
+    k_sf = k_sf.reshape(k_dense.shape[0], 4).contiguous().view(torch.int16)
 
     # ── ks/ke（逐行因果，绝对压缩行号；与 `_qli_dg` 同一公式）──
     ks, ke = _dg_build_ks_ke(cu, raw_lens, kv_lens, ratio, dev, row_off=0)
@@ -1686,8 +1549,9 @@ def _qsli_dg_chunk(st, ctx, w):
     #   候选块清洗（where/clamp）在**候选组内**是同一个纯函数结果（源层写、消费层只读），
     #   按 forward 缓存一次即可；以前每个消费层都重算一遍 → 每层多 2~3 个 kernel。
     _cap = int(cand_i.numel()) // max(1, int(T))
-    _nb = max(1, -(-int(seq_k) // cbs))
-    _ckey = ("qsli_cand", int(ratio), int(T), int(cbs), _cap, int(seq_k),
+    # ★ P1-2：块号是**绝对**块号 ⇒ 上界用拼接后的 K 轴总量（b=1 时 _nk_eff==seq_k）
+    _nb = max(1, -(-int(_nk_eff) // cbs))
+    _ckey = ("qsli_cand", int(ratio), int(T), int(cbs), _cap, int(_nk_eff),
              int(cand_i.data_ptr()), int(cand_l.data_ptr()))
 
     def _cand_build():
@@ -1702,7 +1566,7 @@ def _qsli_dg_chunk(st, ctx, w):
     # ★ 官方 `cross_layer_runtime.candidate_mqa_lens`（index_attn.py:238-243）：
     #   候选组内只算一次并挂 runtime；以前每个消费层各自 `compact_lens` 一遍。
     clens = _CORE._meta_fwd(
-        ("qsli_cand_lens", int(ratio), int(T), int(cbs), _cap, int(seq_k),
+        ("qsli_cand_lens", int(ratio), int(T), int(cbs), _cap, int(_nk_eff),
          int(cand_i.data_ptr()), int(cand_l.data_ptr()), int(ke.data_ptr())),
         lambda: _dgc.compact_lens(blocks, ke, int(cbs), vcnt))
 
@@ -1714,13 +1578,13 @@ def _qsli_dg_chunk(st, ctx, w):
     #   所有消费层共用一份）。以前每层都调一次 `get_sparse_mqa_logits_metadata`。
     #   键里额外带输入张量 data_ptr，避免缓冲复用后串味。
     meta = _CORE._meta_fwd(
-        ("qsli_sched", int(ratio), 0, int(T), int(cbs), int(blocks.shape[1]),
-         int(seq_k), str(q_u8.dtype), int(cand_i.data_ptr()),
+        ("qsli_sched", int(ratio), 0, int(T), int(cbs), blocks.shape[1],
+         int(_nk_eff), str(q_u8.dtype), int(cand_i.data_ptr()),
          int(ks.data_ptr()), int(ke.data_ptr())),
         lambda: _dgd.get_sparse_mqa_logits_metadata(
-            ks, ke, int(seq_k), blocks, q_u8.dtype, int(cbs)))
+            ks, ke, int(_nk_eff), blocks, q_u8.dtype, int(cbs)))
     p_sum = _dgd.fp8_fp4_sparse_mqa_logits(
-        (q_u8, q_sf), (k_dense, k_sf), wq, meta, int(blocks.shape[1]), int(cbs))
+        (q_u8, q_sf), (k_dense, k_sf), wq, meta, blocks.shape[1], int(cbs))
     if os.environ.get("DS41M_QSLI_DG_SHA"):
         import hashlib as _hl
         print(f"  [qsli-dg] idx={ctx.get('idx')} T={T} seq_k={seq_k} rate={ratio} "
@@ -1734,28 +1598,34 @@ def _qsli_dg_chunk(st, ctx, w):
     #   只有超长（> compute_chunk_size）才分段。`DS41M_DG_QCHUNK` 可强制小 chunk 做
     #   等价自检（配合下方 `DS41M_DG_QCHUNK_CHK`）。
     _qchunk = int(os.environ.get("DS41M_DG_QCHUNK", "0") or 0) or min(
-        8192, int(10 * (2 ** 30)) // max(1, int(seq_k) * 2) // 8 * 8)
+        8192, int(10 * (2 ** 30)) // max(1, int(_nk_eff) * 2) // 8 * 8)
     _qchunk = max(1, int(_qchunk))
+    # ★ 2026-11-02 诊断（默认关）：确认"同一层 mqa_logits 调几次"的账
+    if os.environ.get("DS41M_QLI_TRACE", "").strip().lower() in ("1", "on", "true", "yes") \
+            and os.environ.get("RANK", "0") == "0" and int(ctx.get("idx", -1)) >= 0:
+        _nseg = -(-int(T) // int(_qchunk))
+        print(f"  [qli-trace] L{ctx.get('idx')} T={int(T)} maxk={int(_nk_eff)} "
+              f"qchunk={int(_qchunk)} segs={_nseg} nseq={int(nseq)}", flush=True)
     out_idx = torch.full((int(T), topk), -1, dtype=torch.int32, device=dev)
     if int(T) <= _qchunk:
         _dsi.topk(p_sum, topk, sorted=False, indices_type=torch.int32, sorted_index=True,
                   output_idx=out_idx, end=clens, idx_oob_fill_value=-1, return_value=False)
         out_idx = _dgc.restore_indices(out_idx, blocks, int(cbs), 0)
     else:
-        _qsf_n = max(1, int(q_sf.shape[0]) // int(T))
+        _qsf_n = max(1, q_sf.shape[0] // int(T))
         for _qs in range(0, int(T), _qchunk):
             _qe = min(_qs + _qchunk, int(T))
             _sl = slice(_qs, _qe)
             _mt = _CORE._meta_fwd(
-                ("qsli_sched", int(ratio), _qs, _qe, int(cbs), int(blocks.shape[1]),
-                 int(seq_k), str(q_u8.dtype), int(cand_i.data_ptr()),
+                ("qsli_sched", int(ratio), _qs, _qe, int(cbs), blocks.shape[1],
+                 int(_nk_eff), str(q_u8.dtype), int(cand_i.data_ptr()),
                  int(ks.data_ptr()), int(ke.data_ptr())),
                 lambda _a=_qs, _b=_qe: _dgd.get_sparse_mqa_logits_metadata(
-                    ks[_a:_b], ke[_a:_b], int(seq_k), blocks[_a:_b],
+                    ks[_a:_b], ke[_a:_b], int(_nk_eff), blocks[_a:_b],
                     q_u8.dtype, int(cbs)))
             _ps = _dgd.fp8_fp4_sparse_mqa_logits(
                 (q_u8[_sl], q_sf[_qs * _qsf_n:_qe * _qsf_n]), (k_dense, k_sf),
-                wq[_sl], _mt, int(blocks.shape[1]), int(cbs))
+                wq[_sl], _mt, blocks.shape[1], int(cbs))
             _oi = torch.full((_qe - _qs, topk), -1, dtype=torch.int32, device=dev)
             _dsi.topk(_ps, topk, sorted=False, indices_type=torch.int32,
                       sorted_index=True, output_idx=_oi, end=clens[_sl],
@@ -1775,6 +1645,19 @@ def _qsli_dg_chunk(st, ctx, w):
             if not _eq:
                 raise RuntimeError(f"[qchunk-chk] 分段与整段不一致 idx={ctx.get('idx')}")
 
+    # ★ P1-2（b>1）：topk 还原出的是**绝对**压缩行号 ⇒ 按请求减本序列起点，得到
+    #   mqsmla 要的**请求内局部**行号（-1 保持 -1）。与 `_qli_dg`:3005-3018 同一口径；
+    #   b=1 时 `_cu_k[0]==0`，整段不动 ⇒ 零回归。
+    if nseq > 1 and os.environ.get("DS41M_BIDX_SPACE", "local").strip().lower() != "abs":
+        for _i in range(nseq):
+            _a, _b = int(cu[_i]), int(cu[_i + 1])
+            _bn = int(_cu_k[_i])
+            if _bn:
+                _s = out_idx[_a:_b]
+                _m = _s >= 0
+                _s.sub_(_bn)
+                _s.masked_fill_(~_m, -1)
+
     sparse = out_idx.view(int(T), 1, topk)
     # ★ 自洽验证（DS41M_QS_SPCHK）：同一进程里再算一遍**全量 dense** top-k，与 sparse 比。
     #   两者应当一致（候选块覆盖全部 K 时）⇒ 证明 dg 稀疏路径本身正确，
@@ -1783,7 +1666,7 @@ def _qsli_dg_chunk(st, ctx, w):
         try:
             _pf = _dgd.fp8_fp4_mqa_logits(
                 (q_u8, q_sf), (k_dense, k_sf), wq, ks, ke,
-                max_seqlen_k=int(seq_k))
+                max_seqlen_k=int(_nk_eff))
             _di = torch.full((int(T), topk), -1, dtype=torch.int32, device=dev)
             _dsi.topk(_pf, topk, sorted=False, indices_type=torch.int32,
                       sorted_index=True, output_idx=_di,
@@ -1877,7 +1760,7 @@ def _qsli_chunk(st, ctx, w):
     if _qcap > 0:
         cand_i = torch.where(cand_i >= 0, cand_i % _qcap, cand_i)
     lat = st.get("cmp_latent")
-    seq_k = int(lat.shape[0]) if lat is not None else T // ratio
+    seq_k = lat.shape[0] if lat is not None else T // ratio
     # ★★ 同 `_qli` 上面那条修（病C 根因）：可见长度 = **(off+T)//ratio**，
     #   不是 L//ratio ✗ —— stage A 时后者会多声明 256 行零行 ⇒ 读零行 ⇒ 0/0 = NaN ✗。
     #   `DS41M_SEQK_LFULL=1` 恢复旧（错）值供复现 ✓。
@@ -1928,7 +1811,7 @@ def _qsli_chunk(st, ctx, w):
             _seqk = _CORE.dg_meta(
                 ("qsli_seqk_step", int(T), int(ratio), str(device)),
                 lambda: torch.tensor([seq_k], dtype=torch.int32, device=device),
-                lambda b, p: b.fill_(max(int(lat.shape[0]) if lat is not None else 0,
+                lambda b, p: b.fill_(max(lat.shape[0] if lat is not None else 0,
                                          (int(p) + int(T)) // max(1, int(ratio)))))
     else:
         cl = _CORE._meta(("qsli_cl", int(T), int(_off), int(ratio), int(cbs),
@@ -2190,17 +2073,21 @@ def idx_k_cache(st, ctx, w, n_rows, device):
     #   ⚠️ 旧版有两个错：①`-1` 是**合法 pad**（ratio>1 时每序列一行甩尾），不能判越界；
     #   ②消息里引用了本函数不存在的 `nblk`（packed 用的是 `Pb`）⇒ 真越界时抛 NameError，
     #   把 OOB 报告变成一条无关错误，还会让 qli 算子**整体失败**（runner 只记一笔 ⚠️ 继续跑）。
-    _ci_ok = ci[ci >= 0]
-    _ci_max = int(_ci_ok.max()) if _ci_ok.numel() else -1
-    if _ci_max >= int(k.shape[0]) * rpb:
-        raise RuntimeError(
-            f"idx_k slot OOB idx={ctx.get('idx')} ci_max={_ci_max} "
-            f"pool={tuple(k.shape)} blocks={int(k.shape[0]) - 1} rpb={rpb} "
-            f"Pb={Pb} nseq={nseq} n_rows={n_rows} n_real={n_real} n_pad={n_pad} "
-            f"off={ctx.get('pos_offset')} L={ctx.get('L_full')}")
+    # ★ 2026-11-01（交接 §6.2④ 清理）：这条守卫的 `int(_ci_ok.max())` 是**每次 qli 一次
+    #   设备 max + 主机同步**（host-bound 热点）。真越界在设备侧本来就是 aicore trap，
+    #   守卫只用于定位，默认关闭；排查时 `DS41M_IDX_OOB_CHECK=1` 打开。
+    if os.environ.get("DS41M_IDX_OOB_CHECK", "").strip().lower() in ("1", "on", "true", "yes"):
+        _ci_ok = ci[ci >= 0]
+        _ci_max = int(_ci_ok.max()) if _ci_ok.numel() else -1
+        if _ci_max >= k.shape[0] * rpb:
+            raise RuntimeError(
+                f"idx_k slot OOB idx={ctx.get('idx')} ci_max={_ci_max} "
+                f"pool={tuple(k.shape)} blocks={k.shape[0] - 1} rpb={rpb} "
+                f"Pb={Pb} nseq={nseq} n_rows={n_rows} n_real={n_real} n_pad={n_pad} "
+                f"off={ctx.get('pos_offset')} L={ctx.get('L_full')}")
     _ifc.prolog_k((), dict(
         latent=latent.reshape(-1, latent.shape[-1]),
-        wk=_IDX._nz(w, "attn.indexer.wk.weight"),
+        wk=_IDX._nz("wk"),
         norm_weight=knw,
         rope_sin=sin.reshape(-1, _IDX.ROPE_DIM),
         rope_cos=cos.reshape(-1, _IDX.ROPE_DIM),
@@ -2240,7 +2127,7 @@ def idx_k_cache(st, ctx, w, n_rows, device):
         hold[f"_idx_qsli_cap_r{ratio}"] = int(_qcap)
         _ifc.prolog_k((), dict(
             latent=latent.reshape(-1, latent.shape[-1]),
-            wk=_IDX._nz(w, "attn.indexer.wk.weight"),
+            wk=_IDX._nz("wk"),
             norm_weight=knw,
             rope_sin=sin.reshape(-1, _IDX.ROPE_DIM),
             rope_cos=cos.reshape(-1, _IDX.ROPE_DIM),
@@ -2279,7 +2166,7 @@ def _idx_k_write_pk(st, ctx, w):
     lat = st.get("cmp_latent")
     if lat is None:
         raise RuntimeError("idx_k_write 需要 st['cmp_latent']")
-    idx_k_cache(st, ctx, w, int(lat.shape[0]), lat.device)
+    idx_k_cache(st, ctx, w, lat.shape[0], lat.device)
 
 
 def _qli_pk(st, ctx, w):
@@ -2329,7 +2216,7 @@ def _qli_pk(st, ctx, w):
         ("qli_pk_md", tuple(cu), tuple(slens), tuple(resids), int(ratio), int(topk),
          int(cand_topk), int(cand_size), str(q.device)), _mk_md)
     lat = st.get("cmp_latent")
-    n_rows_k = int(lat.shape[0]) if lat is not None else T // ratio
+    n_rows_k = lat.shape[0] if lat is not None else T // ratio
     # ★ 边界拆分：K 池已在 cut 前由 `idx_k_write` 全长写好（含块表），
     #   compact qli 只读、不再重写（否则 full latent + 512 行的 cu 会触发行数校验）。
     if (bool(ctx.get("idx_k_ready")) and f"_idx_k_r{ratio}" in hold
@@ -2383,7 +2270,13 @@ def _qli_pk(st, ctx, w):
 # 前半段（q/T/ratio/cu/slens/resids/K 池/块表）逐字复用，保证 A/B 输入一致。
 
 
-def _dg_paged_to_dense(k_pool, dk_pool, bt, n_rows_k, ratio, device, n_full=None):
+# ★ 2026-11-01（P4 归因）：`_DG_SLOT` 命中/未命中诊断开关（只加日志，不改路径）
+_SLOT_STAT = os.environ.get("DS41M_DG_SLOT_STAT", "").strip().lower() in (
+    "1", "on", "true", "yes")
+
+
+def _dg_paged_to_dense(k_pool, dk_pool, bt, n_rows_k, ratio, device, n_full=None,
+                       cu_k=None):
     """分页 K 池（68 B/行）→ dense (k_u8, k_sf)，供 deep_gemm 消费。
 
     池布局与 vendor 完全一致（`_idx_k_cache` / `_idx_k_rows_cp` 写的）：
@@ -2403,25 +2296,60 @@ def _dg_paged_to_dense(k_pool, dk_pool, bt, n_rows_k, ratio, device, n_full=None
     #   有关。旧代码每次调用：Range/FloorDiv/Mul/FloorMod/Add + `int(slot.max())`（设备
     #   reduce + **同步**）。CP4 每 forward 调 16 次（4 源层 ×2 块 + 4 QSLI 层 ×2 块）⇒
     #   每层一次全流水线同步。现在按 bt 对象身份缓存（强引用 bt 防地址复用）。
-    _skey = ("dg_pg_slot", int(_n), int(bt.data_ptr()), int(rpb), str(device))
+    _multiseq = cu_k is not None and len(cu_k) > 2
+    _skey = ("dg_pg_slot", int(_n), int(bt.data_ptr()), int(rpb), str(device),
+             tuple(int(x) for x in cu_k) if _multiseq else ())
     _shit = _DG_SLOT.get(_skey)
+    if _SLOT_STAT:
+        # ★ 2026-11-01（P4 归因）：判定"rank1 的 qli.kpool 比 rank0 慢 4.4 倍"是不是
+        #   `_DG_SLOT` 缓存未命中导致（每层重建 p/slot + 一次 `slot.max()` 同步）。
+        #   只加日志，不改执行路径。
+        _rk = str(os.environ.get("RANK", "?"))
+        _hit = _shit is not None and _shit[0] is bt
+        # 注意：本函数没有 ctx（纯张量工具），所以只打 rank/n/bt 指针与缓存规模
+        print(f"  [dg-slot] rank={_rk} {'HIT' if _hit else 'MISS'} n={int(_n)} "
+              f"bt_ptr={int(bt.data_ptr())} n_cached={len(_DG_SLOT)} "
+              f"multiseq={_multiseq}", flush=True)
     if _shit is not None and _shit[0] is bt:
         p, slot = _shit[1], _shit[2]
     else:
         p = torch.arange(_n, dtype=torch.int64, device=device)
-        _bt = bt[0].long()
-        if int(p[-1] // rpb) >= int(_bt.numel()):
-            raise RuntimeError(
-                f"_dg_paged_to_dense: 行号超块表 p_max={int(p[-1])} p//rpb={int(p[-1]//rpb)} "
-                f"bt_w={int(_bt.numel())} n_full={int(_n)} n_rows_k={int(n_rows_k)}")
-        slot = _bt[p // rpb] * rpb + p % rpb
+        if _multiseq:
+            # ★★ 2026-10-31（b>1 打包）：块表是**逐请求**的 [nseq, Pb]
+            #   （`idx_k_cache` = 官方 `_prepare_indexer_slot_mapping` 口径），
+            #   而 dense 行轴是各序列压缩行**拼接** ⇒ 必须分段用各自块表映射，
+            #   否则第 2 条起读到上一条序列的 K（实测 507035 NaN trap）。
+            parts = []
+            for _i in range(len(cu_k) - 1):
+                _lo, _hi = int(cu_k[_i]), int(cu_k[_i + 1])
+                if _hi <= _lo:
+                    continue
+                _loc = torch.arange(_hi - _lo, dtype=torch.int64, device=device)
+                _bti = bt[_i].long()
+                if int((_hi - _lo - 1) // rpb) >= int(_bti.numel()):
+                    raise RuntimeError(
+                        f"_dg_paged_to_dense: 行号超块表 seq={_i} 行={_hi - _lo} "
+                        f"bt_w={int(_bti.numel())} n_full={int(_n)} n_rows_k={int(n_rows_k)}")
+                parts.append(_bti[_loc // rpb] * rpb + _loc % rpb)
+            slot = torch.cat(parts)
+            if int(slot.numel()) != int(_n):
+                raise RuntimeError(
+                    f"_dg_paged_to_dense: cu_k 行数 {int(slot.numel())} != n_full={int(_n)}"
+                    f"（cu_k={[int(x) for x in cu_k]}）")
+        else:
+            _bt = bt[0].long()
+            if int(p[-1] // rpb) >= int(_bt.numel()):
+                raise RuntimeError(
+                    f"_dg_paged_to_dense: 行号超块表 p_max={int(p[-1])} p//rpb={int(p[-1]//rpb)} "
+                    f"bt_w={int(_bt.numel())} n_full={int(_n)} n_rows_k={int(n_rows_k)}")
+            slot = _bt[p // rpb] * rpb + p % rpb
         if len(_DG_SLOT) >= 32:
             _DG_SLOT.clear()
         _DG_SLOT[_skey] = (bt, p, slot)
     # ★★ 2026-10-31：**槽位越界会在设备侧变成 aicore trap 507015（无栈无行号）**，
     #   这里先在主机侧判一次（CP4+hit 就踩这个：池按局部块开、而 n_full 按全长取行）。
     #   判据结果只跟 (slot, 池行数) 有关 → 同一次判定缓存，热路径零同步。
-    _cap = int(k_pool.shape[0]) * int(k_pool.shape[1])
+    _cap = k_pool.shape[0] * k_pool.shape[1]
     _CORE._meta(("dg_pg_cap", _skey, int(_cap)), lambda: _dg_slot_cap(
         slot, _cap, k_pool, n_full=_n, n_rows_k=n_rows_k, ratio=ratio))
     # ★★ 2026-10-31：dense K 本身也缓存 —— CP 下同一 forward 里 8 次调用读的是**同一个池**
@@ -2518,15 +2446,20 @@ def _dg_build_ks_ke(cu, raw_lens, kv_lens, ratio, device, row_off=0):
 
     def _build():
         ks_list, ke_list = [], []
+        # ★★ 2026-10-31（b>1 打包缺陷；DeepInfer `prepare_cp_mirror_ref:152`）：
+        #   `ks` 是**批内压缩 K 前缀** `cu_k_cn[i] = Σ_{j<i} max(1, sk_j // ratio)`，
+        #   不是常量 0。单序列（b=1）时 base 恒 0 ⇒ 零回归；多序列时第 2 条起的
+        #   行会错落到池头部（读到上一条序列的压缩 K）。
+        base = 0
         for b in range(nseq):
             sq = int(cu[b + 1] - cu[b])
             sk = int(kv_lens[b])          # ★ KV 长度（不是 query 长度）
             # ★ ks/ke 必须是**相对 K 池**的行号（池第 0 行 = 绝对行 off//ratio）
-            base = 0
             for j in range(sq):
                 delta = sk - sq + j + 1
                 ks_list.append(base)
                 ke_list.append(max(0, base + max(0, delta // ratio) - ro))
+            base += max(1, sk // ratio)
         return (torch.tensor(ks_list, dtype=i32, device=device),
                 torch.tensor(ke_list, dtype=i32, device=device))
 
@@ -2602,10 +2535,10 @@ def _dg_psum_nandbg(p_sum, k_dense, k_sf, q_sf, ks, ke, wq, ctx):
         _qfe = int((_qu8 == 0xFE).sum())
         _kzer = int((k_dense.view(torch.uint8) == 0).all(dim=1).sum())
         _khi = int((k_dense.view(torch.uint8) > 0x77).sum())
-        print(f"  [psum-nan] idx={ctx.get('idx')} T={int(p_sum.shape[0])} "
-              f"W={int(p_sum.shape[1])} NaN_valid={_nv} NaN_tail={_nt} "
+        print(f"  [psum-nan] idx={ctx.get('idx')} T={p_sum.shape[0]} "
+              f"W={p_sum.shape[1]} NaN_valid={_nv} NaN_tail={_nt} "
               f"valid行={_rows} 行首列={_c0} 首行列数={_nb_row} "
-              f"ks0={int(ks[0])} ke_max={_kem} k_rows={int(k_dense.shape[0])} "
+              f"ks0={int(ks[0])} ke_max={_kem} k_rows={k_dense.shape[0]} "
               f"k_sf_mean16={float(k_sf.float().mean()):.1f} "
               f"k_sf_FF={_kff} k_sf_FE={_kfe} k_sf_00={_k00} "
               f"q_sf_FF={int(_qff_rows.numel())} q_FF_tok={_qff_tokv} q_sf_FE={_qfe} "
@@ -2629,7 +2562,7 @@ def _dg_dump_inputs(dd, ctx, q_u8, q_sf, k_dense, k_sf, wq, ks, ke, p_sum,
         _rk = _dg_rank()
         _off = int(ctx.get("pos_offset", 0) or 0)
         _p = os.path.join(
-            dd, f"dg_in_L{ctx.get('idx')}_off{_off}_T{int(p_sum.shape[0])}_r{_rk}.pt")
+            dd, f"dg_in_L{ctx.get('idx')}_off{_off}_T{p_sum.shape[0]}_r{_rk}.pt")
         torch.save(dict(
             q=q_u8.detach().cpu(), q_sf=q_sf.detach().cpu(),
             k=k_dense.detach().cpu(), k_sf=k_sf.detach().cpu(),
@@ -2641,7 +2574,7 @@ def _dg_dump_inputs(dd, ctx, q_u8, q_sf, k_dense, k_sf, wq, ks, ke, p_sum,
             k_sf_u8=k_sf.detach().view(torch.uint8).cpu(),
             # ★ 几何（host 复算需要的全部 ctx）
             idx=ctx.get("idx"), rank=_rk, pos_offset=_off,
-            T=int(p_sum.shape[0]),
+            T=p_sum.shape[0],
             L_full=int(ctx.get("L_full", 0) or 0), n_full=int(n_full),
             n_rows_k=int(n_rows_k), is_candidate=bool(ctx.get("is_candidate")),
             kv_lens=list(kv_lens), raw_lens=list(raw_lens), cu=list(cu),
@@ -2680,10 +2613,16 @@ def _qli_dg(st, ctx, w):
                                  [cu[b + 1] - cu[b] for b in range(nseq)])]
     hold = _CORE._hold(st)
     dev = q.device
+    # ★ 2026-10-31：分段 host 计时（DS41M_HOSTTIME=1）——定位 qli 每次 3.8ms 花在哪。
+    _tq = None
+    if os.environ.get("DS41M_HOSTTIME", "").strip().lower() in ("1", "on", "true", "yes"):
+        import time as _tqq
+        _tq = _tqq.perf_counter
+    _ts0 = _tq() if _tq else 0.0
 
     # ── K 池（与 `_qli_pk` 完全相同的获取逻辑）──
     lat = st.get("cmp_latent")
-    n_rows_k = int(lat.shape[0]) if lat is not None else T // ratio
+    n_rows_k = lat.shape[0] if lat is not None else T // ratio
     if (bool(ctx.get("idx_k_ready")) and f"_idx_k_r{ratio}" in hold
             and f"_idx_k_bt_r{ratio}" in hold):
         _qli_dbg(f"dg-readonly idx={ctx.get('idx')} ratio={ratio} T={T}")
@@ -2698,15 +2637,35 @@ def _qli_dg(st, ctx, w):
     if os.environ.get("DS41M_DG_TIMING"):
         torch.npu.synchronize()
         _t0 = time.time()
-    _n_full = int(ctx.get("L_full", 0) or 0) // ratio or int(n_rows_k)
-    k_dense, k_sf = _dg_paged_to_dense(k, dk, bt, n_rows_k, ratio, dev, n_full=_n_full)
+    # ── ks/ke 的可见 K 长度（必须在 dense 之前算：b>1 的 dense 宽度由它决定）──
+    _Lfull = int(ctx.get("L_full", 0) or 0)
+    _offK = int(ctx.get("pos_offset", 0) or 0)
+    _span_end = _offK + int(T)
+    if _Lfull > 0 and _span_end < _Lfull:
+        # 分块 / 命中 stage A：用本块终点
+        kv_lens = [_span_end for _ in raw_lens]
+    else:
+        kv_lens = [(int(_Lfull) if _Lfull > 0 else int(x)) for x in raw_lens]
+    # ★★ 2026-10-31（b>1 打包）：多序列的 dense K 是**各序列压缩行拼接**
+    #   （DeepInfer `prepare_cp_mirror_ref:152` 的 `cu_k_cn[-1]`），不是单条序列的
+    #   `L_full//ratio`。nseq==1 时两条表达式逐位相同 ⇒ 零回归。
+    _cu_k = [0]
+    for _sk in kv_lens:
+        _cu_k.append(_cu_k[-1] + max(1, int(_sk) // ratio))
+    _n_full = (_cu_k[-1] if nseq > 1
+               else (int(_Lfull) // ratio or int(n_rows_k)))
+    k_dense, k_sf = _dg_paged_to_dense(k, dk, bt, n_rows_k, ratio, dev, n_full=_n_full,
+                                       cu_k=(_cu_k if nseq > 1 else None))
     k_dense = k_dense.view(torch.int8)   # 同上：kPackedFP4 == int8
     # K 的 SF 同样要 int16 [n_kv, 2]（我们池里是 [n_kv, 4] uint8）
-    k_sf = k_sf.reshape(int(k_dense.shape[0]), 4).contiguous().view(torch.int16)
+    k_sf = k_sf.reshape(k_dense.shape[0], 4).contiguous().view(torch.int16)
     if _t0 is not None:
         torch.npu.synchronize()
         print(f"  [dg-timing] idx={ctx.get('idx')} paged2dense="
               f"{(time.time() - _t0) * 1000:.3f} ms rows={n_rows_k}", flush=True)
+    if _tq:
+        _CORE._ht_add("qli.kpool", _tq() - _ts0)
+        _ts0 = _tq()
 
     # ── ks / ke（DeepInfer 公式）──
     # ★★ 2026-10-31（CP2 实测根因）：可见 K 长度必须是**本块前缀的终点**
@@ -2716,14 +2675,7 @@ def _qli_dg(st, ctx, w):
     #   jaccard 掉到 0.30。vendor 同口径见 `_qli_chunk` 的
     #   `_spanK = (_offK + T) // ratio`（exec_indexer.py:1117）。
     #   CP1（pos_offset=0 且 T==L_full）时与旧值相同 ⇒ 零回归。
-    _Lfull = int(ctx.get("L_full", 0) or 0)
-    _offK = int(ctx.get("pos_offset", 0) or 0)
-    _span_end = _offK + int(T)
-    if _Lfull > 0 and _span_end < _Lfull:
-        # 分块 / 命中 stage A：用本块终点
-        kv_lens = [_span_end for _ in raw_lens]
-    else:
-        kv_lens = [(int(_Lfull) if _Lfull > 0 else int(x)) for x in raw_lens]
+    #   （`kv_lens` 已在上面 dense 之前算好：b>1 的 dense 宽度也由它决定。）
     # ★ ks/ke 用**绝对**行号（与全长 dense K 对齐）
     ks, ke = _dg_build_ks_ke(cu, raw_lens, kv_lens, ratio, dev, row_off=0)
     if os.environ.get("DS41M_DG_SHA"):
@@ -2732,6 +2684,10 @@ def _qli_dg(st, ctx, w):
               f"ke_first={int(ke[0])} ke_last={int(ke[-1])} ke_max={int(ke.max())}",
               flush=True)
 
+    if _tq:
+        _CORE._ht_add("qli.kske", _tq() - _ts0)
+        _ts0 = _tq()
+
     # ── 输入 sha（要求 1：A/B 归因）──
     if os.environ.get("DS41M_DG_SHA"):
         _s = _dg_input_sha(q, st["idx_w"], k_dense, ks, ke)
@@ -2739,7 +2695,7 @@ def _qli_dg(st, ctx, w):
 
     if os.environ.get("DS41M_DG_SHA"):
         print(f"  [dg-enter] idx={ctx.get('idx')} is_cand={bool(ctx.get('is_candidate'))} "
-              f"T={T} n_full={_n_full} k_rows={int(k_dense.shape[0])} "
+              f"T={T} n_full={_n_full} k_rows={k_dense.shape[0]} "
               f"ks0={int(ks[0])} ke_last={int(ke[-1])}", flush=True)
 
     # ── logits ──
@@ -2780,7 +2736,29 @@ def _qli_dg(st, ctx, w):
     #   `DS41M_DG_QCHUNK` 可覆盖（0 = 整段，复现旧口径）。
     _qchunk = int(os.environ.get("DS41M_DG_QCHUNK", "0") or 0) or min(
         8192, int(10 * (2 ** 30)) // max(1, int(_maxk) * 2) // 8 * 8)
-    if _qchunk <= 0 or int(T) <= _qchunk:
+    if nseq > 1:
+        # ★★ 2026-10-31（b>1 打包）：logits 的 [0, ks) 列**不会被内核写**（`empty_strided`
+        #   + 只写 [ks,ke) 区间，见 `mqa_logits.hpp:590-599`）⇒ 第 2 条序列的行会读到
+        #   未初始化列，topk 直接 NaN/MTE trap（实测 507035/507015）。
+        #   DeepInfer 的 dense 路径每 rank 单请求（DP 分摊 batch），不覆盖这条；
+        #   我们按序列**逐段调用**：段内 ks=0（K 用该序列自己的行段），ke=段内因果长度，
+        #   先把 p_sum 填 -inf，再把每段结果写进自己的列区间 ⇒ 段外列恒 -inf，
+        #   candidate 块最大值与 topk（`end=ke` 绝对列）都只看到本序列的可见域。
+        _nh = int(_IDX.N_HEADS)
+        p_sum = torch.full((int(T), int(_maxk)), float("-inf"),
+                           dtype=torch.bfloat16, device=dev)
+        for _i in range(nseq):
+            _r0, _r1 = int(cu[_i]), int(cu[_i + 1])
+            _k0 = int(_cu_k[_i])
+            _ni = max(1, int(_cu_k[_i + 1]) - _k0)
+            _ke_i = (ke[_r0:_r1] - _k0).to(torch.int32)
+            _ks_i = torch.zeros(_r1 - _r0, dtype=torch.int32, device=dev)
+            p_sum[_r0:_r1, _k0:_k0 + _ni] = _dgd.fp8_fp4_mqa_logits(
+                (q_u8[_r0:_r1], q_sf[_r0 * _nh:_r1 * _nh]),
+                (k_dense[_k0:_k0 + _ni].contiguous(), k_sf[_k0:_k0 + _ni].contiguous()),
+                wq[_r0:_r1], _ks_i, _ke_i,
+                max_seqlen_k=int(_ni))
+    elif _qchunk <= 0 or int(T) <= _qchunk:
         p_sum = _dgd.fp8_fp4_mqa_logits(
             (q_u8, q_sf), (k_dense, k_sf), wq, ks, ke,
             max_seqlen_k=int(_maxk))
@@ -2793,6 +2771,10 @@ def _qli_dg(st, ctx, w):
                 (q_u8[_qs:_qe], q_sf[_qs * _nh:_qe * _nh]),
                 (k_dense, k_sf), wq[_qs:_qe], ks[_qs:_qe], ke[_qs:_qe],
                 max_seqlen_k=int(_maxk))
+
+    if _tq:
+        _CORE._ht_add("qli.logits", _tq() - _ts0)
+        _ts0 = _tq()
 
     # ── candidate 分支（L20 等候选源层）──
     # DeepInfer `index_attn.py:308`：先用块 max 选候选块，再只在候选块内算 logits。
@@ -2812,14 +2794,18 @@ def _qli_dg(st, ctx, w):
             _bs, _valid = _dgc.candidate_block_max(p_sum, ke, _cbs)
             # ★ 官方 `index_attn.py:271`：candidate_base = ks // block_size（向下取整），
             #   把序列局部块号变**绝对块号**；后续 restore 直接 block_id*bs 不再加 base。
-            _base = torch.div(ks, _cbs, rounding_mode="floor").to(torch.int32)
+            # ★★ b>1：这里的 `p_sum` 是**绝对列**（多序列按段写入，段外 -inf），
+            #   `candidate_block_max` 算出的块号本来就是绝对块号 ⇒ base 必须为 0，
+            #   再加 ks//bs 会二次偏移（b=1 时 ks≡0，所以旧式在已验证口径上恒等）。
+            _base = (torch.div(ks, _cbs, rounding_mode="floor").to(torch.int32)
+                     if nseq == 1 else torch.zeros_like(ks))
             _cand_blocks, _vcnt = _dgc.select_candidate_blocks(
                 _bs, _valid, _cbs, _ctopk, block_base=_base)
             _clens = _dgc.compact_lens(_cand_blocks, ke, _cbs, _vcnt)
             # ★ 官方约束（`get_sparse_mqa_logits_metadata` docstring）：
             #   "Each block ID i must satisfy ks <= i*B + ks%B < end"
             #   我们传的是**绝对块号**，需要满足 `i*B < nk`；越界会让 aicore trap。
-            _nblk = int(k_dense.shape[0]) // _cbs
+            _nblk = k_dense.shape[0] // _cbs
             _cb = _cand_blocks.clamp(max=_nblk - 1)
             if os.environ.get("DS41M_DG_SHA"):
                 _bad = int(((_cand_blocks >= 0) & (_cand_blocks >= _nblk)).sum())
@@ -2832,10 +2818,10 @@ def _qli_dg(st, ctx, w):
                 if not _dgd._ensure_jit():
                     raise RuntimeError("JIT 不可用（_C.init 失败）")
                 _meta = _dgd.get_sparse_mqa_logits_metadata(
-                    ks, ke, int(k_dense.shape[0]), _cb, q_u8.dtype, _cbs)
+                    ks, ke, k_dense.shape[0], _cb, q_u8.dtype, _cbs)
                 p_sum = _dgd.fp8_fp4_sparse_mqa_logits(
                     (q_u8, q_sf), (k_dense, k_sf), wq, _meta,
-                    int(_cand_blocks.shape[1]), _cbs)
+                    _cand_blocks.shape[1], _cbs)
             if os.environ.get("DS41M_DG_SHA"):
                 _bl = _cand_blocks[_cand_blocks >= 0]
                 print(f"  [dg-cand] idx={ctx.get('idx')} cbs={_cbs} ctopk={_ctopk} "
@@ -2843,12 +2829,15 @@ def _qli_dg(st, ctx, w):
                       f"p_sum={tuple(p_sum.shape)} "
                       f"blk_min={int(_bl.min()) if _bl.numel() else -1} "
                       f"blk_max={int(_bl.max()) if _bl.numel() else -1} "
-                      f"nk={int(k_dense.shape[0])} ks0={int(ks[0])} ke_last={int(ke[-1])} "
-                      f"ksmax={int(ks.max())} nblk_cap={int(k_dense.shape[0])//_cbs}",
+                      f"nk={k_dense.shape[0]} ks0={int(ks[0])} ke_last={int(ke[-1])} "
+                      f"ksmax={int(ks.max())} nblk_cap={k_dense.shape[0]//_cbs}",
                       flush=True)
         except Exception as _e:                    # noqa: BLE001
             print(f"  [dg-cand] 失败 {type(_e).__name__}: {_e}（回退全量 dense）", flush=True)
             _cand_blocks = None
+    if _tq:
+        _CORE._ht_add("qli.cand", _tq() - _ts0)
+        _ts0 = _tq()
 
     # ── topk（DeepSelect，就地写 output_idx）──
     # ★ 语义归一化（要求 3）：DeepInfer 的 sp 是 `output_idx_offset=ks` 之后的**批内全局位置**；
@@ -2900,13 +2889,35 @@ def _qli_dg(st, ctx, w):
                                        int(ks[0]) if ks.numel() else 0)
     else:
         _topk_lens = ke.contiguous()
+        # ★★ b>1：`p_sum` 的列是**绝对**压缩行号（段外 -inf）⇒ topk 返回的列号
+        #   已经是全局行号，**不能再加 ks**（加了会二次偏移到 2×ks，下游 gather
+        #   MTE 越界，实测 507015 延到下一层才报）。b=1 时 ks≡0，零回归。
+        _off_t = ks if nseq == 1 else torch.zeros_like(ks)
         _dsi.topk(
             p_sum, topk,
             sorted=False, indices_type=torch.int32, sorted_index=True,
             output_idx=out_idx,
-            output_idx_offset=ks,
+            output_idx_offset=_off_t,
             end=_topk_lens,
             idx_oob_fill_value=-1, return_value=False)
+        if nseq > 1 and os.environ.get("DS41M_BIDX_SPACE", "local").strip().lower() != "abs":
+            # ★★ 2026-10-31（b>1）：mqsmla 的 `cmp_sparse_indices` 是**请求内局部**
+            #   压缩行号（`cmp_block_table[b] = b*Pc+1..`，见 exec_ops `cmp_bt_pk`；
+            #   `seqused_cmp_kv` = 该请求的可见压缩长度）⇒ topk 的绝对列号要减掉
+            #   本序列的起始压缩行 `cu_k[i]`。-1（无效位）保持 -1。
+            #   逐序列原地切片做（nseq 很小；避免 repeat_interleave/where 的整表算子）。
+            for _i in range(nseq):
+                _a, _b = int(cu[_i]), int(cu[_i + 1])
+                _bn = int(_cu_k[_i])
+                if _bn:
+                    _s = out_idx[_a:_b]
+                    _m = _s >= 0
+                    _s.sub_(_bn)
+                    _s.masked_fill_(~_m, -1)
+
+    if _tq:
+        _CORE._ht_add("qli.topk", _tq() - _ts0)
+        _ts0 = _tq()
 
     sparse = out_idx.reshape(T, 1, topk).to(torch.int32)
     st["idx_sparse"] = sparse
@@ -2929,13 +2940,13 @@ def _qli_dg(st, ctx, w):
             if _kc is not None and _qi is not None:
                 _rb, _n2 = _qi
                 _cap = int(hold.get(f"_idx_qsli_cap_r{ratio}", 0) or 0)
-                _nb = min(64, int(k_dense.shape[0]))
+                _nb = min(64, k_dense.shape[0])
                 # ★ 坐标修正：`k_dense` 是**本层 K 池**（L20 边界截断后重基过）⇒
                 #   第 0 行 = 全局压缩行 `pos_offset//ratio`。不加这个偏移就是拿两段
                 #   不相干的行比对（第一版因此得出「全 0 命中」的假结论）。
                 _ro = int(ctx.get("pos_offset", 0) or 0) // max(1, int(ratio))
                 _sl = _qsli_slots(_nb, int(_rb), int(_n2), dev, row_off=_ro, ratio=1, ring=_cap)
-                _fl = _kc.reshape(-1, int(_kc.shape[-1]))
+                _fl = _kc.reshape(-1, _kc.shape[-1])
                 _win = _fl.index_select(0, _sl).reshape(_nb, _cbs, PACKED_D + 4)
                 _truth = k_dense[:_nb].view(torch.uint8).reshape(_nb, PACKED_D)
                 _hits = []
@@ -2951,6 +2962,8 @@ def _qli_dg(st, ctx, w):
         # 形状契约（exec_ops.py:3241）：indices 必须 (T,1,cand_topk)，length (T,1)。
         hold["_li_cand_r1"] = _cand_blocks.contiguous().view(T, 1, -1)
         hold["_li_candlen_r1"] = _vcnt.to(torch.int32).view(-1, 1)
+    if _tq:
+        _CORE._ht_add("qli.wb", _tq() - _ts0)
     return sparse
 
 
@@ -2969,7 +2982,7 @@ def _qli_dg_cp(st, ctx, w, cp):
     ratio = max(1, int(ctx["ratio"]))
     topk = int(ctx["index_topk"])
     dev = st["idx_q"].device
-    Tloc = int(st["idx_q"].shape[0])
+    Tloc = st["idx_q"].shape[0]
     is_cand = bool(ctx.get("is_candidate"))
     hold = _CORE._hold(st)
 
@@ -2988,8 +3001,11 @@ def _qli_dg_cp(st, ctx, w, cp):
                       flush=True)
                 _kg_ok = False
         if not _kg_ok:
-            _idx_k_cache(st, _cp_full_ctx(ctx, int(cp.plan.total_q), cp),
-                         w, int(lat.shape[0]), dev, who="qli_dg_cp")
+            # ★ 2026-11-02（用户裁决）：删「gather 全长 → 全长写池」回退。
+            #   真实推理应只按本地 q 算；全长 gather 是白算。铁律 0：不静默降级。
+            raise RuntimeError(
+                "CP K 池写入失败：`_idx_k_rows_cp` 未成功"
+                "（或 DS41M_CP_K_GATHER=0）。全长回退路径已删除（白算）。")
 
     if os.environ.get("DS41M_OP_TB"):
         _hkeys = [k for k in hold if "_idx_k" in str(k)]
@@ -3012,7 +3028,7 @@ def _qli_dg_cp(st, ctx, w, cp):
         if torch.is_tensor(lat):
             import hashlib as _hl3
             print("  [dg-lat] idx=%s lat_rows=%s lat_sha=%s"
-                  % (ctx.get("idx"), int(lat.shape[0]),
+                  % (ctx.get("idx"), lat.shape[0],
                      _hl3.sha1(lat.detach().float().cpu().numpy().tobytes()).hexdigest()[:16]),
                   flush=True)
         else:
@@ -3160,7 +3176,7 @@ def _qsli_pk(st, ctx, w):
         return ((loc + ratio * cbs) // (ratio * cbs)).clamp_min(1).clamp_max(cand_topk) \
             .to(i32).view(-1, 1)
 
-    _clk = (int(loc.data_ptr()), int(loc.shape[0]), int(ratio * cbs), int(cand_topk),
+    _clk = (int(loc.data_ptr()), loc.shape[0], int(ratio * cbs), int(cand_topk),
             str(q.device))
     _cl_ent = _QS_CL_CACHE.get(_clk)
     if _cl_ent is not None and _cl_ent[0] is loc:
@@ -3241,7 +3257,7 @@ def _qsli_pk(st, ctx, w):
     return sparse
 
 # ── 点位边界（core/memlife.py）：几何相关的元数据/rope 表缓存 ──────────────
-# `_NZ_CACHE`（权重 NZ 布局）与 `_QSLI_TB` 的模板表**不登记**：与点位几何无关。
+# `_NZ_BY_NAME`（权重 NZ 布局）与 `_QSLI_TB` 的模板表**不登记**：与点位几何无关。
 POINT_CACHES = (
     _MD_CACHE,        # (md, cu_q, seq_k, residual)：按 T/off/ratio
     _QS_CL_CACHE,     # QSLI 候选长度（按 T/off/ratio）

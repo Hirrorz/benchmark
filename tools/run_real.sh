@@ -392,7 +392,13 @@ cfg = yaml.safe_load(open('configs/mini_real.yaml'))
 cfg['run']['seq_len'] = int(L); cfg['run']['iters'] = int(iters)
 cfg['hit']['ratio'] = float(h); cfg['hit']['source'] = src
 # DeepInfer 口径：non_cached 直接写进配置（不做 128 对齐）
-cfg['hit']['non_cached_tokens'] = int(round((1 - float(h)) * int(L)))
+# ★ 2026-11-01（P0 几何收口后的口径对齐 —— P5 首跑 rc=1 的真因）：
+#   **只有命中开启（h>0）才写 non_cached_tokens**。原来无条件写 `round((1-h)*L)`，
+#   prefill（h=0）时 = L ⇒ `hit_is_on()` 为真、M=L、R=L+KEEP>L ⇒
+#   `assemble.check_hit_geometry` 按铁律 0 **显式拒绝**（没有可测的 prefill 语义）。
+#   正确写法：prefill 用 ratio=0 + nc=0（命中关闭），几何即全长 L。
+cfg['hit']['non_cached_tokens'] = (
+    int(round((1 - float(h)) * int(L))) if float(h) > 0 else 0)
 cfg['weights']['mode'] = 'real'; cfg['weights']['path'] = wpath
 cfg['weights']['resident'] = (resident == 'true'); cfg['weights']['host_cache'] = (host_cache == 'true')
 cfg['model']['engram_offload'] = True; cfg['model']['engram_tp_size'] = 8       # ★ P0：不设=1 会吃 1.6 TB

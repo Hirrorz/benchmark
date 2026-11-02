@@ -78,7 +78,6 @@ _PASS_KEYS = {
     "cp.positions": "runner.py:1562-1580（CP_STATE）",
     "cp.abs_positions": "runner.py:1562-1580（CP_STATE）",
     "cp.total_q": "runner.py:1562-1580（CP_STATE）",
-    "cp.full": "exec_ops._cp_full_ctx（索引器全长视图）",
     "cp.chunk": "exec_ops._cp_of（CP 分块标志）",
     "hc.pad_ref": "runner.py:1572-1580（CP/boundary M 参考）",
     "hc.pad_cap": "runner.py:1572-1580",

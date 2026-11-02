@@ -69,7 +69,7 @@ RESIDENT = {
     "_CP_GROUPS", "_VENDOR_BUFS", "_VENDOR_GROUPS", "_VENDOR_FAILED", "_BUFS",
     "_SB", "_MC2", "_BACKEND_LAST", "_MGR", "_FAILED",
     # 事件环（只放 Event，不放张量）与统计表
-    "_RUNAHEAD_RING", "_RUNAHEAD_POS", "_RUNAHEAD_K_ACTIVE", "_DF_RING", "_DF_POS",
+    "_DF_RING", "_DF_POS",
     "_DF_ARMED", "_AG_STATS", "_SUB", "_STATS", "_N", "_QD_N", "_BOUNDS_SEEN",
     # 注册表
     "OPS", "SKIP", "OP_IFACE", "CONTAINERS", "PATHS", "_IMPL", "_PKT", "_ST",

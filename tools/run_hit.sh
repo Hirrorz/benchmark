@@ -622,7 +622,7 @@ for i, p in enumerate(pts):
         continue
     # 旧格式
     if "L" not in p:
-        sys.exit(f"✗ {where0} 缺 L（或改用 v2：batches:[{L,hit}]）：{p}")
+        sys.exit(f"✗ {where0} 缺 L（或改用 v2：batches:[{{L,hit}}]）：{p}")
     p["L"] = _norm_L(p["L"], where0)
     if p.get("hit") is not None:
         p["hit"] = _norm_hit(p["hit"], where0)

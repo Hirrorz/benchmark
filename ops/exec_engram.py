@@ -116,7 +116,7 @@ def _check_ids_range(ids, n_rows, layer, synthetic=False):
     """越界检查（见上方说明）。返回 max（仅作日志用；不查时返回 -1，不触碰设备）。"""
     if synthetic or not n_rows or _bounds_mode() == "off":
         return -1
-    key = (int(layer), int(ids.shape[0]) if hasattr(ids, "shape") else -1, int(n_rows))
+    key = (int(layer), ids.shape[0] if hasattr(ids, "shape") else -1, int(n_rows))
     if _bounds_mode() == "once":
         if key in _BOUNDS_SEEN:
             return -1
@@ -243,11 +243,11 @@ def precompute_kv(ctx, w, input_ids, T, device):
     li = el.layer_index(int(c.get("idx", 1)))
     eids = h[-int(T):, li, :].to(torch.long)
     tbl = w["engram.embed.weight"]
-    _check_ids_range(eids, int(tbl.shape[0]), c.get("idx", -1))
+    _check_ids_range(eids, tbl.shape[0], c.get("idx", -1))
     if tbl.device.type == "npu":
         # 表常驻设备：与 `_engram_wait` 的设备分支同口径（分片 + owned 掩码 + all_reduce）
         import torch.distributed as _d
-        per = int(tbl.shape[0])
+        per = tbl.shape[0]
         rank = int(c.get("engram_tp_rank", 0))
         tp = max(1, int(c.get("engram_tp_size", 1) or 1))
         loc = eids.to(torch.int64).to(device) - rank * per
@@ -317,8 +317,8 @@ def _engram_prepare(ctx, w, input_ids, T):
         h = _hash_ids(ctx, ids, device=torch.device("cpu"))   # 纯 host；packed 逐序列
         li = el.layer_index(int(ctx.get("idx", 1)))
         idx = h[:, li, :].to(torch.long)
-    if int(idx.max()) >= int(tbl.shape[0]):
-        raise RuntimeError(f"engram id 越界：max={int(idx.max())} 表行数={int(tbl.shape[0])}")
+    if int(idx.max()) >= tbl.shape[0]:
+        raise RuntimeError(f"engram id 越界：max={int(idx.max())} 表行数={tbl.shape[0]}")
     return _engram_host_gather(idx.to(torch.int32), tbl, w.get("engram.embed.scale"))
 
 
@@ -423,7 +423,7 @@ def _vendor_buffer(w, dev, ctx, force=False):
             print("  [engram] 厂商 ElasticBuffer 拿不到进程组 → 退回主机取表", flush=True)
             return None
         from cann_ops_transformer.ops import ElasticBuffer
-        rows, dim = int(tbl.shape[0]), int(tbl.shape[1])
+        rows, dim = tbl.shape[0], tbl.shape[1]
         # ★★ per 必须 **ceil**（= 官方 input_size_per_partition）：真权重两层的行数不是 tp 的整数倍
         #    （384006168 / 384016682），用 floor 时 per*tp < rows —— 而 id 域是 [0, rows)，
         #    厂商内部按 `rank = id // per` 映射，最后那几行的 id 会算出 **rank=tp（不存在）**。
@@ -433,8 +433,8 @@ def _vendor_buffer(w, dev, ctx, force=False):
         row0 = rk * per
         end = min(row0 + per, rows)
         slab = tbl[row0:end]                           # safetensors mmap 视图：只拷本片，不读全表
-        if int(slab.shape[0]) < per:
-            slab = torch.cat([slab, torch.zeros((per - int(slab.shape[0]), dim),
+        if slab.shape[0] < per:
+            slab = torch.cat([slab, torch.zeros((per - slab.shape[0], dim),
                                                 dtype=tbl.dtype, device=slab.device)], 0)
         # ★★ 池按**所有 engram 层的最大行数**申请：厂商窗口是进程级共享池、"重建不得超首建"，
         #    而 layer14 的表比 layer1 多 6514 行（per 差 815 行 ≈ 228 KB / 2 MiB 对齐后整差 2 MiB）
@@ -466,8 +466,8 @@ def _vendor_buffer(w, dev, ctx, force=False):
             #    fp8 存储 + E8M0 scale，dtype 必须是 fp8_e8m0fnu（厂商硬校验）。
             _u8 = sf if sf.dtype == torch.uint8 else sf.view(torch.uint8)
             rows_pad = per * tp                       # 官方口径：整表按 per×tp 补齐（补位用 127 = 2^0）
-            if int(_u8.shape[0]) < rows_pad:          # ★ per 已是 ceil → 这里不再截掉尾部行
-                _u8 = torch.cat([_u8, torch.full((rows_pad - int(_u8.shape[0]), int(_u8.shape[1])),
+            if _u8.shape[0] < rows_pad:          # ★ per 已是 ceil → 这里不再截掉尾部行
+                _u8 = torch.cat([_u8, torch.full((rows_pad - _u8.shape[0], _u8.shape[1]),
                                                  127, dtype=torch.uint8)], 0)
             _sf = _u8[:rows_pad].contiguous().view(torch.float8_e8m0fnu).to(dev)
         buf.engram_write(slab.contiguous(), sf=_sf)
@@ -489,7 +489,7 @@ def _start_host_gather(st, w):
     """fetch 阶段发起：后台线程做 host 取字节（纯 CPU，不碰 NPU；id 越界先查）。"""
     ids = st["_engram_ids"]
     tbl = w["engram.embed.weight"]                    # fp8，host-resident（mmap 零拷贝）
-    _check_ids_range(ids, int(tbl.shape[0]), -1,
+    _check_ids_range(ids, tbl.shape[0], -1,
                      synthetic=bool(st.get("_engram_synth")))
     st["_engram_fut"] = _ENG_POOL.submit(_engram_host_gather, ids, tbl, w.get("engram.embed.scale"))
 
@@ -537,13 +537,13 @@ def _deepep_try(ctx, w, tbl, ids):
             return None
         tp = max(1, int(ctx.get("engram_tp_size", 1) or 1))
         rk = int(ctx.get("engram_tp_rank", 0) or 0)
-        T = int(ids.shape[0])
+        T = ids.shape[0]
         mt = int(os.environ.get("DS41M_ENGRAM_MAX_TOKENS", "0") or 0) or T
         if T > mt:
             print(f"  [engram] deep_ep 的 max_tokens={mt} < 本 pass T={T} → 本次回落", flush=True)
             return None
         bm = _td.make_buffer(int(ctx.get("idx", -1)), tbl, w.get("engram.embed.scale"),
-                             tp, rk, mt, int(ids.shape[-1]))
+                             tp, rk, mt, ids.shape[-1])
         if bm is None:
             return None
         return _td.fetch(bm, ids)
@@ -572,7 +572,7 @@ def _engram_fetch(st, ctx, w):
     if ids is None:                                    # 合成模式：形状/分布对即可（数值无意义）
         n = (el.L["max_ngram_size"] - 1) * el.L["n_heads"]
         rows = int(ctx.get("engram_rows", 0) or 0) or (
-            int(_tbl.shape[0]) if _tbl is not None else 1)
+            _tbl.shape[0] if _tbl is not None else 1)
         st["_engram_ids"] = _synth_ids(T, n, rows, dev, ctx)
         st["_engram_synth"] = True
     else:
@@ -583,7 +583,7 @@ def _engram_fetch(st, ctx, w):
         st["_engram_synth"] = False
     if _tbl is not None and _tbl.device.type == "npu":
         return                                         # ★ 表常驻设备：取行在 wait 里用设备 gather 做
-    _n = int(_tbl.shape[0]) if _tbl is not None else 0
+    _n = _tbl.shape[0] if _tbl is not None else 0
     _td_wait = _deepep_try(ctx, w, _tbl, st["_engram_ids"])   # ②a DeepInfer 式（HBM + 对称内存）
     if _td_wait is not None:
         _check_ids_range(st["_engram_ids"], _n, ctx.get("idx", -1),
@@ -618,7 +618,7 @@ def _engram_wait(st, ctx, w):
         # ★ 官方同款（modules/engram.py:551-563）：本卡只认领自己那片（engram_tp 分片），
         #   越界位置填 0 并置 mask，取行/解量化都在**设备**上做，最后 all_reduce 合并。
         import torch.distributed as _d
-        per = int(_tbl.shape[0])
+        per = _tbl.shape[0]
         rank = int(ctx.get("engram_tp_rank", 0))
         tp = max(1, int(ctx.get("engram_tp_size", 1) or 1))
         ids = st["_engram_ids"].reshape(-1).to(torch.int64)

@@ -138,7 +138,7 @@ def _trim_shared(shared, index, T_full, packed: bool, W: int) -> int:
     for k in [k for k in shared
               if isinstance(k, str) and k.startswith(ROW_ACCOUNT_PREFIXES)]:
         t = shared.get(k)
-        if hasattr(t, "dim") and getattr(t, "dim")() >= 1 and int(t.shape[0]) == T_full:
+        if hasattr(t, "dim") and getattr(t, "dim")() >= 1 and t.shape[0] == T_full:
             shared[k] = _trim_rows(t, index) if packed else t[-W:].contiguous()
             n += 1
     return n
@@ -166,11 +166,11 @@ def apply(policy: ReplayPolicy, *, x, input_ids, shared, layer_idx: int, pos_off
     rows = ([int(_cu[i + 1]) - int(_cu[i]) for i in range(len(_cu) - 1)]
             if _cu and len(_cu) >= pn + 1 else [])
     packed_tail = pn > 1 and rows and policy.w < min(rows)
-    single_tail = pn <= 1 and policy.w < int(x.shape[0])
+    single_tail = pn <= 1 and policy.w < x.shape[0]
     if not (packed_tail or single_tail):
         return TrimResult(x=x, input_ids=input_ids, pos_off=pos_off, pos_offs=pos_offs)
 
-    T_full = int(x.shape[0])
+    T_full = x.shape[0]
     pm = shared.get("_ffn_pre") if isinstance(shared, dict) else None
 
     if packed_tail:
@@ -194,7 +194,7 @@ def apply(policy: ReplayPolicy, *, x, input_ids, shared, layer_idx: int, pos_off
         x = _trim_rows(x, idx)
         if input_ids is not None and len(input_ids) >= T_full:
             input_ids = [input_ids[i] for i in idx_host]
-        if pm is not None and int(pm.shape[0]) == T_full:
+        if pm is not None and pm.shape[0] == T_full:
             shared["_ffn_pre"] = _trim_rows(pm, idx)
         n_cut = _trim_shared(shared, idx, T_full, True, policy.w)
         if packed_ctx is not None:
@@ -222,7 +222,7 @@ def apply(policy: ReplayPolicy, *, x, input_ids, shared, layer_idx: int, pos_off
     x = x[-policy.w:].contiguous()
     if input_ids is not None and len(input_ids) > policy.w:
         input_ids = input_ids[-policy.w:]
-    if pm is not None and int(pm.shape[0]) > policy.w:
+    if pm is not None and pm.shape[0] > policy.w:
         shared["_ffn_pre"] = pm[-policy.w:].contiguous()
     n_cut = _trim_shared(shared, None, T_full, False, policy.w)
     # ★ 2026-10-21（packed b=1 根因）：b=1 的 packed 也走本分支 —— cu 必须同步登记成
@@ -230,7 +230,7 @@ def apply(policy: ReplayPolicy, *, x, input_ids, shared, layer_idx: int, pos_off
     #   → QSLI 的 metadata AICPU 按 L 行调度、实际只有 W 行 → AICPU exception 507018
     #   （实测 cu=[0,2048] vs T=128）。单请求的行边界就是 [0, W]。
     if isinstance(packed_ctx, dict) and packed_ctx.get("cu"):
-        packed_ctx["cu"] = [0, int(x.shape[0])]
+        packed_ctx["cu"] = [0, x.shape[0]]
     pos_off += drop
     msg = (f"  [replay] 层 {layer_idx} 起裁剪：T {T_full} → {x.shape[0]}，"
            f"逻辑位置 {pos_off}..{pos_off + x.shape[0] - 1}"

@@ -35,6 +35,7 @@ import torch_npu                               # noqa: E402
 import assemble                                # noqa: E402
 import ds41_log                                # noqa: E402
 import exec_ops                                # noqa: E402
+import exec_indexer                            # noqa: E402  (preload_nz)
 import ds41_memlog as _memlog_mod              # noqa: E402
 import model_spec                              # noqa: E402
 import opgraph as ops_mod                          # noqa: E402
@@ -67,6 +68,9 @@ _ENV_NAN_TRACE = bool(os.environ.get("DS41M_NAN_TRACE"))
 #   值全在进程启动时定死 → 提升后热循环里只剩布尔/整数比较，且默认路径全是 False。
 _ENV_STATS = bool(os.environ.get("DS41M_STATS"))
 _ENV_MOE_ONLY = bool(os.environ.get("DS41M_MOE_ONLY"))
+# ★ 2026-11-01（A5 空 origin）：T==0 的 rank 只发这些算子（必须参与集合通信）。
+#   MegaMoE 的 all2all 缺一 rank 就整轮挂死（实测 HcclChannelAcquire timeout 9）。
+_COLLECTIVE_OPS = ("mega_moe",)
 _ENV_DUMP_LAYERS_CAP = int(os.environ.get("DS41M_DUMP_LAYERS", "2") or 2)
 _ENV_DUMP_FROM = int(os.environ.get("DS41M_DUMP_FROM", "0") or 0)
 _ENV_DUMP_SLICE = os.environ.get("DS41M_DUMP_SLICE")
@@ -97,55 +101,11 @@ def _ranks_spec(name):
     return False, frozenset(out)
 
 
-_ENV_DUMP_OPS_ALL, _ENV_DUMP_OPS_RANKS = _ranks_spec("DS41M_DUMP_RANKS")
-_ENV_DUMP_SLICE_ALL, _ENV_DUMP_SLICE_RANKS = _ranks_spec("DS41M_DUMP_RANKS")
-_ENV_SYNC_LAYERS = os.environ.get("DS41M_SYNC_LAYERS", "").strip().lower() in (
-    "1", "on", "true", "yes")
-# ★ host 抢跑上限（2026-10-25，CP）：去掉逐层阻塞 H2D 后 host 可以整层整层抢跑，
-#   而 MegaMoE 的对称缓冲 barrier 是**跨 rank 同步**的（exec_moe.py:1004 注释：
-#   "某 rank 先到下一步、别的 rank 还在用旧缓冲 → 设备侧错乱"）。实测 CP2 64K
-#   无限抢跑：稳态 2.60→3.11s（每层 MoE 等最慢 rank），且 8 个 forward 内可能
-#   触发 "MegaMoE rank barrier timeout epoch=960 signal=6 target=8" → HCCL watchdog。
-#   事件环把"设备落后 host"限制在 K 层以内：K 层前的事件没完成就等它。
-#   K=0 关闭（=旧行为，不限；A/B 用）；只对 CP>1 生效，其余路径零变化。
-_RUNAHEAD_K = int(os.environ.get("DS41M_RUNAHEAD_LAYERS", "2") or 0)
-# ★ 2026-10-26：非 CP 深度单独一个旋钮，**默认也是 2（实测安全上界）**。
-#   128K@70（T=39462，崩溃点位）扫深度：K=2 稳定；**K=4 / K=8 / K=16 都复现
-#   MegaMoE barrier timeout**（K=16 在 epoch=485 signal=7，K=4 同样 7 次）。
-#   深度代价（64K@95）：关 158.0 / K=2 194.6（+23%）/ K=8 173.8 / K=16 159.7
-#   ——K 越大越便宜，但只有 2 是安全的；多出来的 ~36ms 是**正确性代价**，
-#   不能靠加深 K 省掉（要做只能从 host 每层耗时下手，T-020 P1）。
-_RUNAHEAD_K_NONCP = int(os.environ.get("DS41M_RUNAHEAD_LAYERS_NONCP", "2") or 0)
-# 非 CP 的**所有**前向都套同一道有界流水（DeepInfer 式：请求内不无限抢跑）。
-# ★ 2026-10-26 实测：阈值 40000 留了个洞——128K@70% 的 T_pass=39462 刚好在阈值下，
-#   noprof 连排 6 个 forward（240 层 barrier）→ "MegaMoE rank barrier timeout
-#   epoch=1365 signal=3 target=8"（r2/r4/r7），随后 allocator 里 segfault。
-#   阈值本质是"host 抢跑上限"，与 T 大小无关 → 默认 0 = 一律生效。
-#   DS41M_RUNAHEAD_MIN_T 仍可显式设阈值（A/B 用）；0=对所有前向生效。
-#
-# ★★ 2026-10-26（T-046，邻机 099 交错 A/B，每臂 0-error、两次重复差 ≤0.23ms）：
-#   **小 T 上关环比有环快**：64k@0.97（T_pass=2106）
-#     K=0 **122.9** / K=1 137.4 / K=2 133.5 / K=3 130.0
-#   ⇒ 环在这个形状上净亏 10.6 ms；K=1 最差（浅到 1 层时 host 完全无法覆盖设备抖动）。
-#   规则声明进 `configs/policy.yaml: runahead.min_t_pass`（默认 8192）：
-#   T_pass <  min_t_pass ⇒ 不建环（= K=0 行为，事件记录 1158→998）；T_pass >= min_t_pass
-#   ⇒ 仍按 K 建环（大 T 的 MegaMoE barrier 保险不撤）。env 覆盖优先。
-#   依据/风险：NOTES/2026-10-26-runahead-k0-and-host-serial.md
-try:
-    import policy as _policy_mod                       # meta/ 在 sys.path（bootstrap 已加）
-    _RU_MIN_T_DEFAULT = int(_policy_mod.rule("runahead.min_t_pass", 8192) or 0)
-except Exception:                                      # noqa: BLE001
-    _RU_MIN_T_DEFAULT = 8192
-_RUNAHEAD_MIN_T = int(os.environ.get("DS41M_RUNAHEAD_MIN_T", _RU_MIN_T_DEFAULT) or 0)
-_RUNAHEAD_RING: list = []
-_RUNAHEAD_POS = [0]          # 环形槽位（事件对象复用；见层循环里的注释）
-_RUNAHEAD_K_ACTIVE = [0]     # 当前环容量；CP/非 CP 深度不同，切换时排空重建
 # ★★ 2026-10-27（B6 / DeepInfer 口径，默认开）：**层内不做任何 host 同步，每 forward 末尾排空一次**。
 #   DeepInfer 在**同一份** mega_moe kernel 上层内一次 host 同步都没有（逐层路径 0 个
 #   synchronize/.item()/.cpu()；整个 forward 被 forbid_cuda_sync() 包住，强制抛错），
 #   缓冲不被写坏靠设备侧三层协议（入口 rank_barrier / 收尾 combine_ready_prefix==~0 /
 #   环内 per-block credit）——三段在我们的树里与 DeepInfer **diff = 0 行**（B6 笔记 §2/§3）。
-#   所以 `_RUNAHEAD_RING` 的每层 `Event.synchronize()` 是纯冗余（64k@0.60 实测
 #   aclrtSynchronizeEvent 160 次 / 4 forward = 810 ms/forward 的 host 阻塞）。
 #   =2：**一个 forward 在飞**（DeepInfer 真口径）：层内零同步；forward 末尾 record 事件，
 #       只等**上一个** forward 的事件（2 槽轮换）⇒ host/设备仍重叠，抢跑上界 = 1 个 forward
@@ -207,7 +167,7 @@ def _cp_maybe_prefetch_cmp(st, ctx):
     if not isinstance(x, torch.Tensor) or x.dim() != 2:
         return
     H = int(ctx.get("H") or 0)
-    if H <= 0 or int(x.shape[1]) != H:
+    if H <= 0 or x.shape[1] != H:
         return
     nbytes = int(cp.plan.total_q) * H * int(x.element_size())
     if nbytes > _CP_PREFETCH_MAX_GB * 2 ** 30:
@@ -366,6 +326,8 @@ _PACK_CACHE: dict = {}      # 跨层共用权重（share_across_layers）时的�
 #   `(W[h,d,r] 原始 ND view, SF 按 k-major 配对的 int16)`，运行期由 `_wo_a` 选用。
 #   打包失败（后端/布局不支持）只打印一次并回退，不影响原路径。
 _ENV_WOA_EINSUM = os.environ.get("DS41M_WOA_EINSUM", "1").strip().lower() in (   # 2026-10-26 T-054 默认开
+    "1", "on", "true", "yes")
+_ENV_SYNC_LAYERS = os.environ.get("DS41M_SYNC_LAYERS", "").strip().lower() in (
     "1", "on", "true", "yes")
 
 
@@ -537,10 +499,13 @@ def _release_packed_raw(source, w, layer_idx):
         return 0
     if source is None or not hasattr(source, "drop_names"):
         return 0                                   # 合成权重（share）不释放：base tensor 是跨层共享的
-    # ★ 必须是**白名单**：indexer 的 wq_b 虽然也被 pack_qmm 打了一份（其实没人用），
-    #   但 `_nz()` 每次仍要 `w.get(name)` 拿原始 ND 张量 —— 释放它会让下一个 pass KeyError。
+    # 白名单：这些权重在打包/预转之后 raw 就没人用了。
+    # indexer 的三项也在内 —— 前提是调用方已经跑过 `exec_indexer.preload_nz(w)`
+    # 把它们转成 NZ 常驻，否则 `_nz()` 会因缺 raw 报 KeyError。
     _releasable = ("attn.wq_a.weight", "attn.wq_b.weight", "attn.wkv.weight",
-                   "attn.wo_a.weight", "attn.wo_b.weight", "engram.wkv.weight")
+                   "attn.wo_a.weight", "attn.wo_b.weight", "engram.wkv.weight",
+                   "attn.indexer.wq_b.weight", "attn.indexer.wk.weight",
+                   "attn.indexer.weights_proj.weight")
     _pk = w.get("_packed") or {}
     names = []
     for k in _releasable:
@@ -712,6 +677,33 @@ def decode_greedy(cfg, source, ids, n_new, tok, stop_ids=()):
     return out_ids
 
 
+# L20 边界截断的两个索引张量（cidx / bidx）：**纯几何**，算一次即可反复用。
+# DeepInfer 把它们存进 `input_metadata.yoco_cp_{contrib,boundary}_index`
+# （input_metadata/yoco.py:169-172），构造一次、跨层复用；这里用模块级缓存，
+# 等价且能跨 forward 复用。省掉每 forward 两次同步 H2D（`torch.tensor(list, npu)`）。
+_BC_IDX_CACHE: dict = {}
+
+
+def _bc_indices(lens, keep, cp, cplan):
+    """返回 (cidx, bidx, has_pad, padn)。键只由几何决定（lens/keep/CP 位置/设备）。"""
+    import cp_layout as _cpl      # 原调用点是局部 import，模块级函数需自带
+    key = (tuple(int(v) for v in lens), tuple(int(v) for v in keep),
+           int(cp.cp_size), int(cp.cp_rank), str(cp.device))
+    hit = _BC_IDX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    contribs, gathered, padn = _cpl.boundary_indices(
+        list(lens), list(keep), cp.cp_size, cp.cp_rank)
+    mine = list(contribs[cp.cp_rank])
+    cidx = torch.tensor(mine + [-1] * (padn - len(mine)),
+                        dtype=torch.long, device=cp.device)
+    bvals = list(_cpl.compact_boundary_index(cplan.plan, gathered))
+    bidx = torch.tensor(bvals, dtype=torch.long, device=cp.device)
+    has_pad = any(v < 0 for v in bvals)
+    hit = _BC_IDX_CACHE[key] = (cidx, bidx, has_pad, padn)
+    return hit
+
+
 def _cp_redistribute_rows(t, contrib_idx, boundary_idx, group, has_pad):
     """DP-free CP 行重分布：本地行 → 截尾保留行 → all-gather → 本 rank compact-mirror 行。
 
@@ -722,19 +714,47 @@ def _cp_redistribute_rows(t, contrib_idx, boundary_idx, group, has_pad):
     pad 行（boundary_idx=-1）填 0。
     """
     import torch.distributed as _d
+    import cp_runtime as _cpr
     sel = t.index_select(0, contrib_idx.clamp_min(0)).contiguous()
     world = _d.get_world_size(group) if _d.is_initialized() else 1
     if world <= 1:
         buf = sel
     else:
-        parts = [torch.empty_like(sel) for _ in range(world)]
-        _d.all_gather(parts, sel, group=group)
-        buf = torch.cat(parts, 0)
+        # ★ 2026-11-02：与 `all_gather_global` 共用同一条通信后端（DeepEP URMA /
+        #   必要时 HCCL），不再在这里单独用 `dist.all_gather`（list API，world 次
+        #   collective）。L20 边界截断要搬 11 个键 ⇒ 原来 11 次 list all_gather。
+        g = torch.empty((world * sel.shape[0],) + tuple(sel.shape[1:]),
+                        dtype=sel.dtype, device=sel.device)
+        buf = _cpr._gather_into(g, sel, group, buf_key="cp_redistribute")
     out = buf.index_select(0, boundary_idx.clamp_min(0))
     if has_pad:
         shape = (-1,) + (1,) * (out.dim() - 1)
         out = torch.where((boundary_idx >= 0).view(shape), out, torch.zeros_like(out))
     return out
+
+
+def _per_seq_rows(ctx, T: int):
+    """本段**每请求的行数**（cu 差分）；无 cu 或 cu 与 T 不一致时退化成单序列 [T]。"""
+    cu = ctx.get("cu_seqlens")
+    if not cu or len(cu) < 2:
+        return [int(T)]
+    rows = [int(cu[i + 1]) - int(cu[i]) for i in range(len(cu) - 1)]
+    if sum(rows) != int(T):
+        return [int(T)]
+    return rows
+
+
+def _eq_lens_guard(lens, what: str):
+    """packed 层 20 截尾的前置条件：各请求**等长**。
+
+    `pos_offset` 在 `CpState` / mqsmla / 压缩器里都是**标量**，逐请求不同就无法用一个
+    值表达绝对位置 ⇒ 显式拒绝（铁律 0：不许静默按第一条序列处理）。
+    """
+    if len(set(lens)) > 1:
+        raise RuntimeError(
+            f"{what}：packed 层 20 截尾要求各请求等长（当前 {list(lens)}）；"
+            f"不等长的多请求请用 DS41M_BOUNDARY_SPLIT=0")
+    return int(lens[0])
 
 
 def _boundary_cut_state_cp(st, ctx, W, pos_off, cfg=None):
@@ -743,6 +763,9 @@ def _boundary_cut_state_cp(st, ctx, W, pos_off, cfg=None):
     前置：本层 KV/压缩/索引 K 已按**全长**写完（CP 分支内部 gather）。
     之后：本地行 = 各 rank 的 mirror 行 → 保留最后 W 行 → 按 **compact-mirror**
     重新切分（DeepInfer `prepare_cp_mirror(compact)`），继续算 21..39。
+
+    ★ 2026-11-01（P1-1，缺陷 G2）：支持 packed 多请求。**要求各请求等长**
+      （`pos_offset` 是标量）；`cp_layout.boundary_indices` 本身就接受 lens/keep 列表。
     """
     import cp_layout as _cpl
     import cp_state as _cps_mod
@@ -750,43 +773,42 @@ def _boundary_cut_state_cp(st, ctx, W, pos_off, cfg=None):
     if cp is None:
         raise RuntimeError("_boundary_cut_state_cp 需要 CP_STATE")
     lens = [int(x) for x in cp.plan.seq_lens]
-    if len(lens) != 1:
-        raise RuntimeError("CP 边界拆分目前只支持单序列（packed 多请求待接）")
+    if not lens:
+        raise RuntimeError("CP 边界拆分：plan.seq_lens 为空")
+    nseq = len(lens)
+    _L1 = _eq_lens_guard(lens, "CP 边界拆分")
     tot = int(cp.plan.total_q)
-    keep = [max(1, min(int(W), lens[0]))]
-    if keep[0] >= lens[0]:
+    keep = [max(1, min(int(W), _L1))] * nseq
+    if keep[0] >= _L1:
         return ctx, int(pos_off), 0
     # ★ 2026-10-28（命中 + CP）：plan 的行数是**本段**行数（命中 stage B 只有 R 行），
     #   绝对起点 = 段起点 + 段内偏移（= CP1 的 pos_off + drop）；seq_len 用**绝对终点**
     #   （= 原序列长 cb.seq_len），否则 compact 段的 rope/seqused/索引器宽度全错。
     _seq_abs = int(getattr(cp, "seq_len", 0) or tot)
-    pos_off2 = int(pos_off) + int(lens[0] - keep[0])
+    pos_off2 = int(pos_off) + int(_L1 - keep[0])
 
-    contribs, gathered, padn = _cpl.boundary_indices(lens, keep, cp.cp_size, cp.cp_rank)
-    mine = list(contribs[cp.cp_rank])
-    cidx = torch.tensor(mine + [-1] * (padn - len(mine)), dtype=torch.long,
-                        device=cp.device)
-    cplan = cp.with_compact(keep, pos_offset=pos_off2, seq_len=_seq_abs)
-    bvals = list(_cpl.compact_boundary_index(cplan.plan, gathered))
-    bidx = torch.tensor(bvals, dtype=torch.long, device=cp.device)
-    has_pad = any(v < 0 for v in bvals)
+    cplan = cp.with_compact(keep, pos_offset=pos_off2, seq_len=_seq_abs,
+                            pos_offsets=([int(pos_off2)] * len(keep) if len(keep) > 1 else None))
+    # ★ 2026-11-02：cidx/bidx 只由几何决定，走模块级缓存（DeepInfer 的 metadata 同款），
+    #   不再每 forward 做两次同步 H2D。
+    cidx, bidx, has_pad, padn = _bc_indices(lens, keep, cp, cplan)
 
-    n_rows = int(st["x"].shape[0])
+    n_rows = st["x"].shape[0]
     _keys = ("x", "residual", "hc_pre_t", "q", "qr", "idx_q", "idx_descale_q",
              "idx_w", "idx_sparse", "cmp_sparse_indices", "cmp_topk_length")
     for k in _keys:
         v = st.get(k)
-        if torch.is_tensor(v) and v.dim() >= 1 and int(v.shape[0]) == n_rows:
+        if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == n_rows:
             st[k] = _cp_redistribute_rows(v, cidx, bidx, cp.group, has_pad)
     hct = st.get("hc_post_t")
     if isinstance(hct, tuple):
         st["hc_post_t"] = tuple(
             (_cp_redistribute_rows(t, cidx, bidx, cp.group, has_pad)
-             if torch.is_tensor(t) and t.dim() >= 1 and int(t.shape[0]) == n_rows else t)
+             if torch.is_tensor(t) and t.dim() >= 1 and t.shape[0] == n_rows else t)
             for t in hct)
     for k in ("kv", "k"):
         v = st.get(k)
-        if torch.is_tensor(v) and v.dim() >= 1 and int(v.shape[0]) == n_rows:
+        if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == n_rows:
             st[k] = None
     # 窗口 scratch：全序列池的最后 W 行搬到 0..W-1（与 CP1 的 rebase 同口径）
     moved = exec_ops.rebase_window_pool(st, ctx, tot, keep[0])
@@ -794,14 +816,25 @@ def _boundary_cut_state_cp(st, ctx, W, pos_off, cfg=None):
     # 后续层的 ctx 用 `_packed.cu` 作行边界；compact 段本地行数变了要同步
     # （_packed 恒存在：varlen 唯一口径，2026-10-26）
     import metadata as _md
-    _md.set_layout(cfg, cu=[0, int(cplan.local_rows)], row_lens=[int(cplan.local_rows)])
+    if nseq == 1:
+        _cu2, _rows2, _T2 = [0, keep[0]], [keep[0]], keep[0]
+    else:
+        # ★ P1-1：多请求时本地行是**各请求各自的 mirror 行**，cu 必须逐请求累加
+        _rows2 = [int(v) for v in cplan.plan.local_lens]
+        _cu2 = [0]
+        for _v in _rows2:
+            _cu2.append(_cu2[-1] + _v)
+        _T2 = _cu2[-1]
+    _md.push_layout(cfg, cu=_cu2, row_lens=_rows2)  # C5：栈式，出口统一 pop
     _hc_cap = int(os.environ.get("DS41M_HC_PAD", "8192") or 0)
     cu = ctx.get("cu_seqlens")
-    ctx2 = dict(ctx, T=keep[0], pos_offset=pos_off2,
-                cu_seqlens=([0, keep[0]] if cu is not None else None),
-                seq_lens=([_seq_abs] if ctx.get("seq_lens") else None),
-                row_lens=([keep[0]] if ctx.get("row_lens") else None),
-                n_seqs=1, moe_nspan=0, pos_offsets=None,
+    ctx2 = dict(ctx, T=_T2, pos_offset=pos_off2,
+                cu_seqlens=(_cu2 if cu is not None else None),
+                seq_lens=([_seq_abs] * nseq if ctx.get("seq_lens") else None),
+                row_lens=(list(_rows2) if ctx.get("row_lens") else None),
+                n_seqs=nseq, moe_nspan=0,
+                # 各请求等长（`_eq_lens_guard`）⇒ 绝对位置 = 标量 pos_offset，无需逐序列表
+                pos_offsets=None,
                 # K 池已由 cut 前的 idx_k_write 按全长写好：compact 段只读不重写
                 idx_k_ready=True,
                 hc_pad_ref=(tot if _hc_cap > 0 else 0), hc_pad_cap=_hc_cap,
@@ -810,7 +843,7 @@ def _boundary_cut_state_cp(st, ctx, W, pos_off, cfg=None):
                 # seqused_ori_kv / rope 表宽都用**绝对终点**（CP1 的 pos_offset+T = L）
                 cp_total_q=_seq_abs, cp_seq_len=_seq_abs)
     if _RANK == 0:
-        print(f"  [cp-boundary] 层截尾：全序列 {tot} → 保留 {keep[0]}（每请求），"
+        print(f"  [cp-boundary] 层截尾：全序列 {tot} → 保留 {keep[0]}（每请求 ×{nseq}），"
               f"compact-mirror 本地 {cplan.local_rows} 行（pad={int(has_pad)}），"
               f"pos_offset={pos_off2}", flush=True)
     if _PROBE_ON:
@@ -818,7 +851,7 @@ def _boundary_cut_state_cp(st, ctx, W, pos_off, cfg=None):
     return ctx2, pos_off2, moved
 
 
-def _cp_replay_trim(x, input_ids, shared, cfg, cp, W):
+def _cp_replay_trim(x, input_ids, shared, cfg, cp, W, global_ids=None):
     """层 21 入口：compact 段从 `_split_pad`(512) 再裁到 replay W(140)，**跨 rank 重分布**。
 
     与 DeepInfer `yoco_boundary_compact` 同一套 contrib/boundary 索引，只不过这次的
@@ -829,23 +862,33 @@ def _cp_replay_trim(x, input_ids, shared, cfg, cp, W):
     keep = [max(1, min(int(W), v)) for v in cur]
     if all(k >= c for k, c in zip(keep, cur)):
         return None
-    if len(cur) != 1:
-        raise RuntimeError("CP replay 裁剪目前只支持单序列")
-    contribs, gathered, padn = _cpl.boundary_indices(cur, keep, cp.cp_size, cp.cp_rank)
-    mine = list(contribs[cp.cp_rank])
-    cidx = torch.tensor(mine + [-1] * (padn - len(mine)), dtype=torch.long,
-                        device=cp.device)
+    # ★ 2026-11-01（P1-1）：packed 多请求也支持；同样要求各请求等长（`pos_offset` 标量）
+    nseq = len(cur)
+    _c1 = _eq_lens_guard(cur, "CP replay 裁剪")
+    if keep[0] != _c1:
+        keep = [keep[0]] * nseq
     new_ofs = int(cp.pos_offset) + (cur[0] - keep[0])
-    cplan = cp.with_compact(keep, pos_offset=new_ofs, seq_len=cp.seq_len)
-    bvals = list(_cpl.compact_boundary_index(cplan.plan, gathered))
-    bidx = torch.tensor(bvals, dtype=torch.long, device=cp.device)
-    has_pad = any(v < 0 for v in bvals)
-    T_full = int(x.shape[0])
+    cplan = cp.with_compact(keep, pos_offset=new_ofs, seq_len=cp.seq_len,
+                            pos_offsets=([int(new_ofs)] * len(keep) if len(keep) > 1 else None))
+    # ★ 2026-11-02：与 `_boundary_cut_state_cp` 共用同一份**几何缓存**
+    #   （DeepInfer 把索引存进 metadata 的做法），replay 裁剪不再重复两次同步 H2D。
+    cidx, bidx, has_pad, padn = _bc_indices(cur, keep, cp, cplan)
+    T_full = x.shape[0]
     x = _cp_redistribute_rows(x, cidx, bidx, cp.group, has_pad)
     if input_ids is not None and len(input_ids) >= T_full:
-        ids_t = torch.as_tensor(input_ids, dtype=torch.long, device=cp.device)
-        ids_t = _cp_redistribute_rows(ids_t, cidx, bidx, cp.group, has_pad)
-        input_ids = ids_t.tolist()
+        # ★ 2026-11-02（用户口径：区分「几何派生量」与「数据相关量」）：
+        #   compact 行的 ids 是**几何派生**的 —— 由 `cplan.plan.local_index`
+        #   （本地行 → 全局 token 号）在原全量 list 上直接索引即可，
+        #   **不需要任何设备往返**。engram 侧本来也在 host 用（exec_engram.py:311），
+        #   所以这里产出 Python list 是正确形态。
+        _li2 = cplan.plan.local_index
+        if global_ids is not None and len(global_ids) > 0:
+            input_ids = [global_ids[i] if i >= 0 else 0 for i in _li2]
+        else:
+            # 回退：只有本地 ids 时仍走设备重分布（跨 rank 交换无法在 host 完成）
+            ids_t = torch.as_tensor(input_ids, dtype=torch.long, device=cp.device)
+            input_ids = _cp_redistribute_rows(
+                ids_t, cidx, bidx, cp.group, has_pad).tolist()
     if isinstance(shared, dict) and _RANK == 0 and os.environ.get("DS41M_CP_TRIM_DBG"):
         for _k in list(shared):
             if isinstance(_k, str) and _k.startswith(replay.ROW_ACCOUNT_PREFIXES):
@@ -858,55 +901,68 @@ def _cp_replay_trim(x, input_ids, shared, cfg, cp, W):
               f"bidx={bidx.tolist()[:20]} padn={padn}", flush=True)
     if isinstance(shared, dict):
         pm = shared.get("_ffn_pre")
-        if torch.is_tensor(pm) and int(pm.shape[0]) == T_full:
+        if torch.is_tensor(pm) and pm.shape[0] == T_full:
             shared["_ffn_pre"] = _cp_redistribute_rows(pm, cidx, bidx, cp.group, has_pad)
         n_cut = 0
         for k in list(shared):
             if not (isinstance(k, str) and k.startswith(replay.ROW_ACCOUNT_PREFIXES)):
                 continue
             t = shared.get(k)
-            if torch.is_tensor(t) and t.dim() >= 1 and int(t.shape[0]) == T_full:
+            if torch.is_tensor(t) and t.dim() >= 1 and t.shape[0] == T_full:
                 shared[k] = _cp_redistribute_rows(t, cidx, bidx, cp.group, has_pad)
                 n_cut += 1
     else:
         n_cut = 0
     exec_ops.set_cp_state(cplan)
     import metadata as _md
-    _md.set_layout(cfg, cu=[0, int(cplan.local_rows)], row_lens=[int(cplan.local_rows)])
+    if nseq == 1:
+        _cu2, _rows2 = [0, int(cplan.local_rows)], [int(cplan.local_rows)]
+    else:
+        _rows2 = [int(v) for v in cplan.plan.local_lens]
+        _cu2 = [0]
+        for _v in _rows2:
+            _cu2.append(_cu2[-1] + _v)
+    _md.push_layout(cfg, cu=_cu2, row_lens=_rows2)  # C5：栈式，出口统一 pop
     pos_off = int(new_ofs)
-    msg = (f"  [replay:cp] 层入口裁剪：compact {cur[0]} → {keep[0]}（每请求），"
+    msg = (f"  [replay:cp] 层入口裁剪：compact {cur[0]} → {keep[0]}（每请求 ×{nseq}），"
            f"本地 {T_full} → {cplan.local_rows} 行，逻辑位置 "
            f"{pos_off}..{pos_off + keep[0] - 1}"
            + (f"（行账 ×{n_cut} 同步重分布 ✓）" if n_cut else ""))
     return {"x": x, "input_ids": input_ids, "pos_off": pos_off, "message": msg}
 
 
-def _boundary_cut_state(st, ctx, W, pos_off):
+def _boundary_cut_state(st, ctx, W, pos_off, cfg=None):
     """DeepInfer 层 20 边界：KV 已按全长写完 → 把行状态截到 W 行。
 
     - `st["x"]` / `residual` / `hc_pre_t` / `hc_post_t` 同步裁尾；
     - `st["kv"]` 已写池，丢弃；
     - 窗口 scratch 的每条序列最后 W 行搬到序列起始槽（rebase），后续仍用局部 0..W-1；
     - `ctx` 换成 compact 视图（pos_offset 前移 T-W，cu/row_lens 同步）。
+
+    ★ 2026-11-01（P1-1，缺陷 G2）：packed 多请求走 `_boundary_cut_state_ms`
+      （**每请求各自**保留尾部 W 行）；单序列仍走下面这条**逐字不变**的老路径。
     """
-    T = int(st["x"].shape[0])
+    T = st["x"].shape[0]
+    _rows = _per_seq_rows(ctx, T)
+    if len(_rows) > 1:
+        return _boundary_cut_state_ms(st, ctx, W, int(pos_off), _rows, cfg)
     if W >= T:
         return ctx, int(pos_off), 0
     st["x"] = st["x"][-W:].contiguous()
     for k in ("residual", "hc_pre_t", "q", "qr", "idx_q", "idx_descale_q", "idx_w",
               "idx_sparse", "cmp_sparse_indices", "cmp_topk_length"):
         v = st.get(k)
-        if torch.is_tensor(v) and v.dim() >= 1 and int(v.shape[0]) == T:
+        if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == T:
             st[k] = v[-W:].contiguous()
     hct = st.get("hc_post_t")
     if isinstance(hct, tuple):
         st["hc_post_t"] = tuple(
             (t[-W:].contiguous()
-             if torch.is_tensor(t) and t.dim() >= 1 and int(t.shape[0]) == T else t)
+             if torch.is_tensor(t) and t.dim() >= 1 and t.shape[0] == T else t)
             for t in hct)
     for k in ("kv", "k"):
         v = st.get(k)
-        if torch.is_tensor(v) and v.dim() >= 1 and int(v.shape[0]) == T:
+        if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == T:
             st[k] = None
     # 随行/行账（若有）同步裁尾
     replay._trim_shared(st.get("_shared"), None, T, False, W)
@@ -936,11 +992,110 @@ def _boundary_cut_state(st, ctx, W, pos_off):
     return ctx2, pos_off2, moved
 
 
+def _boundary_cut_state_ms(st, ctx, W, pos_off, rows, cfg=None):
+    """packed 多请求版层 20 截尾：**每请求各自**保留尾部 W 行。
+
+    与单序列版逐项同口径（KV 已写池 → 只裁行状态 → rebase 窗口池 → ctx 换 compact 视图），
+    差别只有两处：
+      ① 行号用"每请求尾部 W 行"拼接（与 `batch_layout.tail_slice` 同口径），
+         而不是全局尾 W 行；
+      ② cu/row_lens 逐请求重登记，`_packed` 也同步 —— 否则层 21 的 replay 会拿**全长** cu
+         再裁一次（多请求时每请求行数变短会让 idx 越界）。
+    前置：各请求行数相同（`pos_offset` 是标量，见 `_eq_lens_guard`）。
+    """
+    T = st["x"].shape[0]
+    W = int(W)
+    _r1 = _eq_lens_guard(rows, "packed 层 20 截尾")
+    nseq = len(rows)
+    if W >= _r1:
+        return ctx, int(pos_off), 0
+    cu0 = [int(v) for v in ctx.get("cu_seqlens")]
+    dev = st["x"].device
+    idx = torch.cat([torch.arange(int(cu0[b + 1]) - W, int(cu0[b + 1]), device=dev)
+                     for b in range(nseq)])
+
+    def _cut(v):
+        return v.index_select(0, idx).contiguous()
+
+    st["x"] = _cut(st["x"])
+    for k in ("residual", "hc_pre_t", "q", "qr", "idx_q", "idx_descale_q", "idx_w",
+              "idx_sparse", "cmp_sparse_indices", "cmp_topk_length"):
+        v = st.get(k)
+        if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == T:
+            st[k] = _cut(v)
+    hct = st.get("hc_post_t")
+    if isinstance(hct, tuple):
+        st["hc_post_t"] = tuple(
+            (_cut(t) if torch.is_tensor(t) and t.dim() >= 1 and t.shape[0] == T else t)
+            for t in hct)
+    for k in ("kv", "k"):
+        v = st.get(k)
+        if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == T:
+            st[k] = None
+    # 随行/行账（若有）同步裁尾（packed=True → 按 idx 取，不是全局尾 W 行）
+    replay._trim_shared(st.get("_shared"), idx, T, True, W)
+    moved = exec_ops.rebase_window_pool(st, ctx, T, W)
+    pos_off2 = int(pos_off) + (_r1 - W)
+    _hc_cap = int(os.environ.get("DS41M_HC_PAD", "8192") or 0)
+    _cu2 = [W * i for i in range(nseq + 1)]
+    _rows2 = [W] * nseq
+    # ★ 2026-11-01：**必须**同步改布局（`_md.set_layout(cfg, ...)`）：多请求时下游走
+    #   packed 分支，按 `_packed.cu/row_lens` 索引行；不改就仍用全长 cu 去索引
+    #   （x 只剩 W/请求 行）⇒ 实测 507015 / `index 4235 out of bounds`。
+    #   还原由 `_run_forward_impl` 出口的 `_lay_orig` 负责（见那里的注释）——
+    #   单序列老路径不改布局，是因为下游对 `n_seqs==1` 走 T 口径，不读 cu。
+    if cfg is not None:
+        _md.push_layout(cfg, cu=_cu2, row_lens=_rows2)  # C5：栈式，出口统一 pop
+    # ★ 2026-11-01（G10 诊断）：cut 出口直接对**保留行**做摘要 —— 区分
+    #   「cut 选错了行」 vs 「cut 之后的算子算错」。与全长臂层 21 入口的逐序列末行摘要对比：
+    #   这里的 last 若与全长臂一致 ⇒ cut 干净。
+    if os.environ.get("DS41M_CUT_DIGEST", "").strip().lower() in ("1", "on", "true", "yes"):
+        try:
+            import hashlib as _hc
+            _xr = st["x"]
+            _ds = []
+            for _i in range(nseq):
+                _a, _b = int(_cu2[_i]), int(_cu2[_i + 1])
+                _f = _xr[_a].detach().float().cpu().numpy().tobytes()
+                _l = _xr[_b - 1].detach().float().cpu()
+                _ds.append(f"seq{_i}[{_a}:{_b}] first={_hc.sha1(_f).hexdigest()[:16]} "
+                           f"last={_hc.sha1(_l.numpy().tobytes()).hexdigest()[:16]} "
+                           f"sum_last={float(_l.sum()):+.6e}")
+            print("  [cut-digest] " + " | ".join(_ds), flush=True)
+        except Exception as _ce:                       # noqa: BLE001
+            print(f"  [cut-digest] 跳过（{type(_ce).__name__}: {_ce}）", flush=True)
+    ctx2 = dict(ctx, T=_cu2[-1], pos_offset=pos_off2,
+                cu_seqlens=list(_cu2),
+                seq_lens=([int(ctx.get("L_full", T))] * nseq
+                          if ctx.get("seq_lens") else None),
+                row_lens=(list(_rows2) if ctx.get("row_lens") else None),
+                n_seqs=nseq, moe_nspan=0,
+                # 各请求等长 ⇒ 绝对位置 = 标量 pos_offset，无需逐序列表
+                pos_offsets=None,
+                # 索引 K 池已按全长写好：compact 段只读不重写（同单序列版）
+                idx_k_ready=True,
+                hc_pad_ref=(T if _hc_cap > 0 else 0), hc_pad_cap=_hc_cap)
+    if _PROBE_ON:
+        ctx2 = _probe.wrap_ctx(ctx2)
+    return ctx2, pos_off2, moved
+
+
+def _prebuild_cp_bucket(cfg, T):
+    """profiler 启动**前**把 CP 的 DeepEP BucketBuffer 建好（见 cp_runtime.prebuild_bucket）。"""
+    import cp_runtime as _cpr
+    cp = exec_ops.CP_STATE
+    if cp is None or not getattr(_cpr, "_CP_BUCKET", False):
+        return
+    H = int(cfg["model"]["hidden"])
+    _cpr.prebuild_bucket(cp.group, cap_bytes_hint=int(T) * H * 2)
+
+
 def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True,
                       allow_placeholder=False, prog=None, inputs=None, collect_dir="",
                       input_ids=None, stop_profiler=True, shared=None, hit_stage=None,
                       no_sync=False, pos_offset=None, l_full=None, engram_ctx=0,
-                      stage_prefix="", post_layer_cb=None, split_tail=False):
+                      stage_prefix="", post_layer_cb=None, split_tail=False,
+                      global_ids=None):
     """`hit_stage`（只在 hit.ratio>0 时有意义）：
 
       · None  → 单段跑。`hit.source=fake`（合成权重默认）走这里：前缀 = 池子初值（零），
@@ -950,9 +1105,27 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                 全部落进 `shared` 池（调用方传入同一个 dict，跨段存活）。
       · "B"   → stage B（被测量的那一段）：只算尾部 R 个 token，读 stage A 留下的前缀缓存。
     """
+    # ★ 2026-11-01（P1-1c）：本 pass 开始时把**布局**存档，出口处还原。
+    #   为什么必须还原：多请求 packed 的层 20 compact / CP replay 会改 cfg 里持久的
+    #   `InputMetadata.layout`（`_md.set_layout`），否则下游 packed 分支仍按**全长** cu
+    #   索引 512/请求 的行（实测 507015 / `index 4235 out of bounds`）。但改完不回滚，
+    #   这份缩短后的布局会漏到**下一个 pass**（实测第 2 轮在 L0 就按 512/请求 摆行 ⇒
+    #   moe gate 吃 nan）。单请求不受影响：那条路径下游走 `n_seqs==1` 的 T 口径，不改布局。
+    _lay_orig = None
+    try:
+        # ★ 2026-11-01（C5）：走 `metadata.snapshot_layout` 这个**唯一入口**（不再手写
+        #   cu/row_lens 两字段的私有格式；出口用 `restore_layout` 还原四个字段）。
+        _lay_orig = _md.snapshot_layout(cfg)
+    except Exception:                                  # noqa: BLE001 —— 诊断性存档，不许带崩
+        _lay_orig = None
     # ★ 2026-10-21 诊断：pass 计数，供 `DS41M_META_TRACE=1` 标记 `_meta` 未命中发生在哪一轮
     #   （预热轮 vs 采集轮）。纯计数，无额外 host 开销。
     exec_ops.PASS_NO = getattr(exec_ops, "PASS_NO", 0) + 1
+    # ★ 2026-11-01（P3-2）：本 pass 的 metadata 复用/重建计数从零起算（见出口打印）
+    try:
+        exec_ops.meta_reset()
+    except Exception:                                  # noqa: BLE001
+        pass
     if _ENV_MEMLOG:
         try:
             torch.npu.reset_peak_memory_stats()
@@ -970,19 +1143,6 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
     if (_EMPTY_CACHE_AUTO and exec_ops.CP_STATE is None
             and _EMPTY_CACHE_AUTO_T > 0 and int(T) >= _EMPTY_CACHE_AUTO_T):
         _ec_every = 1
-    # 有界抢跑：CP 用 K_CP（默认 2，恒开）；非 CP 用 K_NONCP（默认 16），默认也恒开
-    # （MIN_T=0），只有显式设阈值时才按 T 过滤——DeepInfer 式有界流水，
-    # 用来代替逐层 empty_cache 压住在途缓冲代数。
-    if exec_ops.CP_STATE is not None:
-        _k_here = _RUNAHEAD_K
-        _ru_here = _k_here > 0
-    else:
-        _k_here = _RUNAHEAD_K_NONCP
-        _ru_here = _k_here > 0 and (
-            _RUNAHEAD_MIN_T <= 0 or int(T) >= _RUNAHEAD_MIN_T)
-    if _DRAIN_PER_FORWARD:
-        # B6：每 forward 只在末尾排空一次 → 层内不建环（事件记录省掉，host 直接抢跑整段）。
-        _ru_here = False
     # ★ 2026-10-18 用户口径：对性能/显存有利的开关一律默认打开。
     #   MoE 分块（DS41M_MOE_CHUNK=auto → config 的 moe_chunk_max_len，通常 8192）默认开启：
     #   对称缓冲按块容量建，不再按整 T 建（T=16384 单次 ~20 GiB workspace；1M 会顶穿 HBM）。
@@ -1086,6 +1246,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
         _META_GEO[0] = _geo
     if _ENV_HOSTTIME:
         exec_ops.HOSTTIME.clear()          # 每轮一张表（首轮含预热/编译，看后面几轮才准）
+        exec_ops.HOSTTIME_N.clear()
         exec_ops.PHASE.clear()
     # PA cache 跨层复用（否则每层都要 ZerosLike/Fill，污染 trace）；
     # 命中两段跑时由调用方传入同一个 dict → 前缀缓存跨 stage 存活
@@ -1112,7 +1273,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
     #   两段（`winfix/cmpreset` 30 份、`winfix/noprefetch/run1` 48 处）全中 ✗。
     _stale_pm = shared.pop("_ffn_pre", None)
     if _stale_pm is not None and verbose:
-        print(f"  [stage] 清掉上一段/上一轮残留的 _ffn_pre（{int(_stale_pm.shape[0])} 行）", flush=True)
+        print(f"  [stage] 清掉上一段/上一轮残留的 _ffn_pre（{_stale_pm.shape[0]} 行）", flush=True)
     # ★★ 2026-10-16 深夜（病C 的候选修，**env 开关默认关**）：
     #   定位证据：rank7 的首个 NaN 快照 = L14_kv_compress 写出的 `cmp_kv`/`cmp_latent`
     #   （恰好一行 512 维压缩 KV 全 NaN ✗，而 rank0 全程有限 ⇒ 按 rank/数据出现）。
@@ -1145,6 +1306,14 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                   flush=True)
     elif meta.get("hit"):
         L = int(meta["L"])
+        # ★ 2026-11-01（铁律 0）：命中几何在这里**兑现**——`M>0` 且 `R<=L`（`t_main` 同一收口）。
+        #   校验对象是 `meta["L"]`（序列逻辑长）：CP 命中段由 `_meta_override` 放成**全局 L**，
+        #   本段的 `run.seq_len` 只是局部行数，拿它校验会误报。stage A 是前缀段（只算 [0,H)），
+        #   不套 R 公式。
+        if hit_stage != "A":
+            assemble.check_hit_geometry(
+                cfg, L, where=f"命中段（hit_stage={hit_stage or 'single'}, "
+                              f"packed.n={int(meta.get('n', 1) or 1)}）")
         if hit_stage == "A":
             H = min(int(T), L)
             if x.shape[0] > H:
@@ -1174,7 +1343,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                 src = ("前缀 = stage A 的真缓存（共享池）" if hit_stage == "B"
                        else "前缀 = fake 零值池（逐请求块表隔离）")
                 _nseq_h = int(_md.packed_view(cfg).get("n", 1) or 1)
-                _shape = (f"{_nseq_h} 段 × 各自 R 行（packed，Σ={int(x.shape[0])}）"
+                _shape = (f"{_nseq_h} 段 × 各自 R 行（packed，Σ={x.shape[0]}）"
                           if _packed_run else f"最后 {x.shape[0]} 个 token")
                 if _packed_run and _pos_offs:
                     _rng = ", ".join(f"{o}..{o + int(r) - 1}"
@@ -1217,7 +1386,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
         # 导致 aux 只有最后 W 行 → 草稿上下文 KV 不完整。v1 直接关 replay。
         _rep_on, _rep_W = False, 0
     if _rep_on:
-        _line = _rep.describe(len(stack), int(x.shape[0]))
+        _line = _rep.describe(len(stack), x.shape[0])
         if _line and not _pure_mode:          # ★ 采集窗口内零日志（2026-10-27 用户规则）
             print(_line, flush=True)
     _rep_done = False
@@ -1225,7 +1394,40 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
     # 每条序列末行 hidden 的 sha1。层 0 若有差异 = 真泄漏；只在末层差异 = 数值混沌/求和顺序。
     _pl_dig = {int(v) for v in os.environ.get("DS41M_PACKED_DIGEST_LAYERS", "")
                .replace(",", " ").split() if v.strip()}
+    # ★ 2026-11-01（A5 空 origin）：本 pass 是否有 token（决定是否走"只发集合通信"短路）
+    _empty_T = (int(T) == 0)
+    _empty_warned = False
+    _rowdig_at = int(os.environ.get("DS41M_ROWDIG_AT", "0") or 0)
+    _halo_chk = os.environ.get("DS41M_CP_HALO_CHK", "0").strip().lower() in (
+        "1", "on", "true", "yes")
     for n, layer in enumerate(stack):
+        # ★ 2026-11-01（B5 守卫）：CP 下用 `cp_plan.halo_manifest` 断言"尾部窗口所需的 KV
+        #   块"是**可计算且被覆盖**的，并打印"选择性 gather 能省多少"。只读诊断，不改路径。
+        if _halo_chk and _RANK == 0 and int(layer["idx"]) in (20, 21, 39):
+            try:
+                import cp_plan as _cpp
+                _cpz = int(os.environ.get("DS41M_CP_SIZE", "1") or 1)
+                _pk = _md.packed_view(cfg)
+                _seqs = [int(v) for v in ((_pk.get("lens") or []) or [int(T)])]
+                if _cpz > 1 and _seqs:
+                    _win = int((cfg.get("model") or {}).get("sliding_window", 128))
+                    _keep = int(assemble.replay_keep_tokens(cfg))
+                    _v = _cpp.build_plan(_seqs, _cpz, 0)
+                    _man = _cpp.halo_manifest(_v, 0, window=_win, keep=_keep)
+                    _lo = max(0, _seqs[0] - _keep - (_win - 1))
+                    _cov = _cpp.halo_covered(_man, _lo, _seqs[0])
+                    _s = _cpp.gather_stats(_v, window=_win, keep=_keep, mode="replay")
+                    print(f"  [halo-chk] L{int(layer['idx'])} cp{_cpz} len={_seqs[0]} "
+                          f"覆盖[{_lo},{_seqs[0]}): {'OK' if _cov else 'GAP'} "
+                          f"块 {_s['blocks_needed']}/{_s['blocks_total']} "
+                          f"行 {_s['rows_needed']}/{_s['rows_total']} "
+                          f"(选择性可省 {_s['saved_pct']}%)", flush=True)
+                    if not _cov:
+                        raise RuntimeError(
+                            f"[halo-chk] L{int(layer['idx'])}：尾部窗口 [{_lo},{_seqs[0]}) "
+                            f"没有被清单覆盖（cp={_cpz}）—— 这正是 B5 要防的静默漏算")
+            except Exception as _he:                   # noqa: BLE001
+                print(f"  [halo-chk] 失败 {type(_he).__name__}: {_he}", flush=True)
         if _pl_dig and int(layer["idx"]) in _pl_dig and _RANK == 0:
             try:
                 _pkd_l = _md.packed_view(cfg)
@@ -1249,7 +1451,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                                    f"sum={float(_rr.sum()):+.6e} absmax={float(_rr.abs().max()):.4g}")
                 else:
                     _rr = x[_clr[0] if _clr is not None else -1].detach().float().cpu()
-                    _ds.append(f"single[{int(x.shape[0])}] "
+                    _ds.append(f"single[{x.shape[0]}] "
                                f"sha1={_hl.sha1(_rr.numpy().tobytes()).hexdigest()[:16]} "
                                f"sum={float(_rr.sum()):+.6e} absmax={float(_rr.abs().max()):.4g}")
                 print(f"  [packed-digest] L{int(layer['idx'])} " + " | ".join(_ds), flush=True)
@@ -1270,7 +1472,8 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
             _cp_rep = exec_ops.CP_STATE
             if _cp_rep is not None:
                 # ★ CP：按**全局 compact 长度**裁（本地只有 mirror 行），跨 rank 重分布
-                _trc = _cp_replay_trim(x, input_ids, shared, cfg, _cp_rep, int(_rep_W))
+                _trc = _cp_replay_trim(x, input_ids, shared, cfg, _cp_rep, int(_rep_W),
+                                       global_ids=global_ids)
                 if _trc is not None:
                     x, input_ids = _trc["x"], _trc["input_ids"]
                     pos_off = _trc["pos_off"]
@@ -1416,7 +1619,12 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
             if _ENV_HOSTTIME:                   # 细分：取权重 vs strip+布局打包
                 exec_ops.PHASE["pack"] = exec_ops.PHASE.get("pack", 0.0) + (
                     time.perf_counter() - _phB)
-            if not _share_w:                    # ★ 打包完 → raw 释放（见 _release_packed_raw）
+            # 预转 NZ **无条件**执行：`share_across_layers: true` 时 raw 不释放，
+            # 但 `_nz()` 只查缓存，没预转就会 KeyError（实测踩过：所有 config
+            # 都是 share_across_layers=true，放在 `if not _share_w` 里永远不跑）。
+            exec_indexer.preload_nz(w)
+            if not _share_w:
+                # 非共享权重：预转完成 → raw 可以释放（顺序不能反）
                 _release_packed_raw(source, w, _li)
             if _share_w:
                 _PACKED_LAYER_CACHE[_li] = w
@@ -1476,7 +1684,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                 import hashlib as _hh
                 _xv = x.reshape(-1, x.shape[-1])
                 _hs = _hh.sha1(_xv.detach().float().cpu().numpy().tobytes()).hexdigest()[:16]
-                print(f"  [hid-sha] L{int(layer['idx'])} rows={int(_xv.shape[0])} sha={_hs}",
+                print(f"  [hid-sha] L{int(layer['idx'])} rows={_xv.shape[0]} sha={_hs}",
                       flush=True)
             except Exception as _he:                  # noqa: BLE001
                 print(f"  [hid-sha] 失败 {type(_he).__name__}: {_he}", flush=True)
@@ -1486,14 +1694,27 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
         #   ★ CP：本地只有 mirror 行，"还有多少可裁"要按**全局序列长**判断。
         _cp_split = exec_ops.CP_STATE
         _t_glob = (int(_cp_split.plan.total_q) if _cp_split is not None
-                   else int(x.shape[0]))
+                   else x.shape[0])
+        # ★ 2026-11-01（P1-1，缺陷 G2/G10）：packed 多请求的 compact 是**opt-in**。
+        #   判据用**每请求长度**（不是总行数：b=2 时总行数恒 >W，会把不该裁的判成可裁）。
+        #   ★ 默认关的原因（实测，见 NOTES_2026-11-01-p1-packed-compact.md）：
+        #     L20 入口两臂逐位相同；从 L21 起 **seq1** 先分叉（sum/absmax 前 7 位一致、
+        #     sha1 不同），L24 起 seq0 也分叉，L39 相对差 1.7e-2（seq0）/ 8.8e-1（seq1）。
+        #     即 compact 段的**逐序列基线**（窗口池/压缩池按 `rows_blocks_per_seq` 寻址，
+        #     `sid≥1` 的块基随行数变化）还有残差 —— 已登记 G10，未验收前不许当默认。
+        #   开 `DS41M_PACKED_BOUNDARY=1` 才走多请求 compact（开发/复现用）。
+        _cut_lens = ([int(v) for v in _cp_split.plan.seq_lens] if _cp_split is not None
+                     else _per_seq_rows(ctx, _t_glob))
+        _pkb_on = os.environ.get("DS41M_PACKED_BOUNDARY", "0").strip().lower() in (
+            "1", "on", "true", "yes")
         _split_here = (bool(os.environ.get("DS41M_BOUNDARY_SPLIT", "1").strip().lower()
                             in ("1", "on", "true", "yes"))
                        and _rep_on and not _rep_done
                        and int(layer["idx"]) == _rep_cut - 1
                        and str(layer.get("attn")) == "c1a_source"
-                       and int(ctx.get("n_seqs", 1) or 1) == 1
-                       and _rep_W < _t_glob)
+                       and bool(_cut_lens) and len(set(_cut_lens)) == 1
+                       and _rep_W < int(_cut_lens[0])
+                       and (len(_cut_lens) == 1 or _pkb_on))
         if _split_here:
             _seq_key = (int(layer["idx"]), "split")
             _legacy_seq = _SEQ_CACHE.get(_seq_key) or expand_layer(
@@ -1597,7 +1818,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                         if t.numel() <= 40_000_000:
                             snap[k] = t.cpu()
                     snap["_stage"] = st.get("_norm_stage")      # hc 段（attn/ffn）——口径自证
-                    snap["_rows"] = int(x.shape[0])             # 本段实际行数（stage A/B 自证）
+                    snap["_rows"] = x.shape[0]             # 本段实际行数（stage A/B 自证）
                     if snap:
                         d = _ENV_DUMP_OPS
                         os.makedirs(d, exist_ok=True)
@@ -1612,10 +1833,12 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                 # CP：本地是 mirror 行，"裁到多少"按**全局序列长**算（compact 宽度是
                 # 每条请求保留的 token 数），再按 compact-mirror 重新切到各 rank。
                 _t_before = int(_cp_split.plan.total_q) if _cp_split is not None \
-                    else int(st["x"].shape[0])
+                    else st["x"].shape[0]
                 # compact 段宽度：补到 _split_pad（默认 512）以避开 QMM 小 M 分块；
                 # 本段行数不足时保持原样（等于不裁）。
-                _w_cut = min(max(int(_rep_W), int(_split_pad)), _t_before)
+                # ★ P1-1：宽度是**每条请求**保留的行数，不能用总行数（b>1 会裁出 T_总×W）。
+                _per = int(_cut_lens[0]) if _cut_lens else _t_before
+                _w_cut = min(max(int(_rep_W), int(_split_pad)), _per)
                 # 诊断（DS41M_QMM_AB=1）：同一份 x/权重，全 T vs 尾部 M 的 QMM 是否逐位一致。
                 if os.environ.get("DS41M_QMM_AB", "").strip().lower() in (
                         "1", "on", "true", "yes"):
@@ -1646,8 +1869,9 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                     ctx, pos_off, _mvd = _boundary_cut_state_cp(
                         st, ctx, _w_cut, pos_off, cfg)
                 else:
-                    ctx, pos_off, _mvd = _boundary_cut_state(st, ctx, _w_cut, pos_off)
-                _pos_offs = [pos_off]
+                    ctx, pos_off, _mvd = _boundary_cut_state(st, ctx, _w_cut, pos_off, cfg)
+                # ★ P1-1：多请求时逐序列起点列表要有 nseq 项（全部相同 → 仍是一个标量语义）
+                _pos_offs = [pos_off] * max(1, len(_cut_lens or ()))
                 # ★ 不设 `_rep_done`：层 21 入口的 replay 还要把本段裁到 `_rep_W`=140
                 #   （pos_offset 已前移 T-_w_cut，replay 会用 512→140 的 drop 再前移）。
                 if os.environ.get("DS41M_SPLIT_DUMP", "").strip().lower() in (
@@ -1677,6 +1901,17 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
             if key in exec_ops.IMPLICIT:          # 由别的算子内部产生，不单独发
                 implicit_cnt[key] += 1
                 continue
+            # ★ 2026-11-01（A5 空 origin）：本 pass 无 token（T==0）时**只发必须参与集合通信**
+            #   的算子（MegaMoE）。其余算子在 0 行张量上没有定义 —— 实测 hc_pre/rope/kv_epilog/
+            #   mqsmla/gate/... 共 206 处失败（507057/507015）。逐算子补 0 行分支风险高、
+            #   语义上也没有收益；跳过它们，输出仍是 0 行，不污染 y / gate / cache。
+            if _empty_T and key not in _COLLECTIVE_OPS:
+                skip_cnt[key] = skip_cnt.get(key, 0) + 1
+                if _RANK == 0 and not _empty_warned:
+                    _empty_warned = True
+                    print("  [空 origin] T==0：已跳过非集合通信算子（A5 兜底路径；"
+                          "正常做法是空 DP 用 1 行虚拟请求，见 points_runner）", flush=True)
+                continue
             try:
                 if _ENV_DEBUG:
                     print(f"      → {key}", flush=True)
@@ -1702,9 +1937,24 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                     _cp_maybe_prefetch_cmp(st, ctx)
                 if _ENV_MEMLOG_OPS and _mem_here:
                     _memlog_mod.mem(f"L{_li} op={key} post", rank=_RANK)
+                # ★ 2026-11-01（G10 诊断）：逐算子打印**末尾行**（= 最后一个请求的最后一个
+                #   token）的 sha1。compact 段与全长段的末行是同一个逻辑 token，所以两臂
+                #   的 `[rowdig]` 行可以直接逐条对齐，找出第一个分叉的算子。
+                if (_rowdig_at and int(layer["idx"]) == _rowdig_at and _RANK == 0):
+                    try:
+                        import hashlib as _hr
+                        _tx = st.get("x")
+                        if torch.is_tensor(_tx) and _tx.numel():
+                            _r = _tx[-1].detach().float().cpu()
+                            print(f"  [rowdig] L{int(layer['idx'])} {key:<14}"
+                                  f" T={_tx.shape[0]} last={_hr.sha1(_r.numpy().tobytes()).hexdigest()[:16]}"
+                                  f" sum={float(_r.sum()):+.6e}", flush=True)
+                    except Exception:                   # noqa: BLE001
+                        pass
                 if _ht0:
                     exec_ops.HOSTTIME[key] = exec_ops.HOSTTIME.get(key, 0.0) + (
                         time.perf_counter() - _ht0)
+                    exec_ops.HOSTTIME_N[key] = exec_ops.HOSTTIME_N.get(key, 0) + 1
                 if _ENV_SYNC:
                     torch.npu.synchronize()      # 逐算子同步：异步错误当场定位到算子
                 # 诊断（DS41M_OP_DIGEST=1）：层 0 rank0 每个算子后打印关键张量 sha1，
@@ -1751,7 +2001,7 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                             _bad = int(torch.isnan(_v).sum())
                             if _bad:
                                 # ★ 2026-10-31（主控）：给出**哪些行**是 NaN（定位"整行坏"还是"散点"）
-                                _r = torch.isnan(_v).reshape(int(_v.shape[0]), -1).any(1)
+                                _r = torch.isnan(_v).reshape(_v.shape[0], -1).any(1)
                                 _ridx = torch.nonzero(_r).flatten()[:8].cpu().tolist()
                                 _bad_keys.append(f"{_k}={_bad}/{int(_v.numel())}"
                                                  f" rows={_ridx}")
@@ -1830,13 +2080,13 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
                             _nn = n
                             if k.startswith("_cmp_pool_"):
                                 off = 0                    # 整池（数据在末尾块）
-                                _nn = int(v.shape[0])
+                                _nn = v.shape[0]
                             elif _blk_pool:
                                 off = 128            # BS：跳过恒空的块 0
                             elif _zero_off:
                                 off = 0
                             elif _ENV_DUMP_SLICE_TAIL:
-                                off = max(0, int(v.shape[0]) - n)
+                                off = max(0, v.shape[0] - n)
                             else:
                                 off = _ENV_DUMP_SLICE_OFF
                             snap[k] = (v[off:off + _nn] if off else v[:_nn]).detach().float().cpu()
@@ -1864,22 +2114,8 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
             exec_ops.PHASE["ops"] = exec_ops.PHASE.get("ops", 0.0) + (_ph2 - _ph1)
         if profiler is not None:
             profiler.step()
-        # ★ 有界抢跑（见 _RUNAHEAD_K 注释）：默认对所有前向生效（MIN_T=0）。
         #   ★ 2026-10-26：事件对象**复用**（环形槽位），每层只剩 record + 对 K 层前
         #   事件的 synchronize（已完成时就是一次 query）；CP/非 CP 深度切换时排空重建。
-        if _ru_here:
-            if _RUNAHEAD_K_ACTIVE[0] != _k_here:
-                for _e in _RUNAHEAD_RING:
-                    _e.synchronize()
-                _RUNAHEAD_RING.clear()
-                _RUNAHEAD_POS[0] = 0
-                _RUNAHEAD_K_ACTIVE[0] = _k_here
-            if len(_RUNAHEAD_RING) < _k_here:
-                _RUNAHEAD_RING.append(torch.npu.Event())
-            else:
-                _RUNAHEAD_RING[_RUNAHEAD_POS[0]].synchronize()
-            _RUNAHEAD_RING[_RUNAHEAD_POS[0]].record()
-            _RUNAHEAD_POS[0] = (_RUNAHEAD_POS[0] + 1) % _k_here
         # 常驻 ep8 的 W1：本层 AC 已建、raw 还在 → 立刻建本层 decode NZ 并释放 raw。
         if post_layer_cb is not None:
             post_layer_cb(layer, w, ctx, st)
@@ -1963,6 +2199,29 @@ def _run_forward_impl(cfg, source, T, n_layers=None, profiler=None, verbose=True
             print(f"  [packed-digest] 跳过（{type(_de).__name__}: {_de}）", flush=True)
     if _ENV_MEMLOG:
         _memlog_mod.mem(f"forward end T={T}", rank=_RANK)
+    # ★ 2026-11-01（P3-2 吸收）：两级 metadata 的复用/重建分列（geo=进程级几何缓存，
+    #   fwd=forward 级整表重建）。与耗时同 pass 打印，便于把"ms 差异"归因到 metadata。
+    if _RANK == 0 and not _pure_mode:
+        try:
+            _ms = exec_ops.meta_snapshot()
+            print(f"  [meta-reuse] pass={exec_ops.PASS_NO} T={int(T)}"
+                  f" geo={_ms['geo_hit']}/{_ms['geo_miss']}(hit/miss)"
+                  f" fwd={_ms['fwd_hit']}/{_ms['fwd_miss']}(hit/miss)"
+                  f" rebuild={_ms['geo_miss'] + _ms['fwd_miss']}", flush=True)
+        except Exception as _me:                        # noqa: BLE001
+            print(f"  [meta-reuse] 跳过（{type(_me).__name__}: {_me}）", flush=True)
+    # ★ 2026-11-01（P1-1c/C5）：还原 pass 入口的布局 —— 走 `metadata.restore_layout`
+    #   这个唯一入口（四个字段 cu/row_lens/seq_lens/n 一并还原，返回是否真的改过）。
+    if _lay_orig is not None:
+        try:
+            _popped = _md.pop_all_layouts(cfg)   # C5：本 pass 压的栈全部还原
+            _changed = _md.restore_layout(cfg, _lay_orig)   # 兜底：回到入口快照
+            if _changed and os.environ.get("DS41M_META_TRACE", "").strip().lower() in (
+                    "1", "on", "true", "yes"):
+                import sys as _s2
+                _s2.stderr.write(f"  [layout-restore] pass={exec_ops.PASS_NO} 已还原\n")
+        except Exception as _le:                       # noqa: BLE001
+            print(f"  [layout-restore] 跳过（{type(_le).__name__}: {_le}）", flush=True)
     return dict(exec=exec_cnt, skip=skip_cnt, errors=errs, seconds=time.time() - t0,
                 x=x, meta=meta, placeholder=sorted(ph_used), weights_sec=w_sec,
                 implicit=implicit_cnt, pre_mix=last_pre, collected=collected,
@@ -2006,7 +2265,8 @@ def run_forward(cfg, source, T, n_layers=None, profiler=None, verbose=True,
                 allow_placeholder=False, prog=None, inputs=None, collect_dir="",
                 input_ids=None, stop_profiler=True, shared=None, hit_stage=None,
                 no_sync=False, pos_offset=None, l_full=None, engram_ctx=0,
-                stage_prefix="", post_layer_cb=None, split_tail=False):
+                stage_prefix="", post_layer_cb=None, split_tail=False,
+                global_ids=None):
     """CP 入口包装（Step 2）：`DS41M_CP_SIZE>1` 且 plain prefill 时走 CP。
 
     - CP=1 / decode / （CP>1 时）`DS41M_CP_HIT=0` 的 hit：原样调用
@@ -2019,6 +2279,7 @@ def run_forward(cfg, source, T, n_layers=None, profiler=None, verbose=True,
     - Step 2 只接 SWA：`exec_ops` 里 `_kv_epilog` all-gather full KV、`_mqsmla`
       用 full pool + 本地 q 全局窗口；压缩/indexer 的 CP 在 Step 3。
     """
+    global_ids = None
     _cp_size = int(os.environ.get("DS41M_CP_SIZE", "1") or 1)
     # ★ 2026-10-27：命中路径接 CP（实验开关 DS41M_CP_HIT=1）。默认关 = 旧行为零变化。
     _cp_hit = os.environ.get("DS41M_CP_HIT", "0").strip().lower() in ("1", "on", "true", "yes")
@@ -2029,7 +2290,8 @@ def run_forward(cfg, source, T, n_layers=None, profiler=None, verbose=True,
             collect_dir=collect_dir, input_ids=input_ids, stop_profiler=stop_profiler,
             shared=shared, hit_stage=hit_stage, no_sync=no_sync, pos_offset=pos_offset,
             l_full=l_full, engram_ctx=engram_ctx, stage_prefix=stage_prefix,
-            post_layer_cb=post_layer_cb, split_tail=split_tail)
+            post_layer_cb=post_layer_cb, split_tail=split_tail,
+            global_ids=global_ids)
         # ★ 2026-10-27：CP=1 也落同一份"全局末行"，才能做 CP1/2/4 三方对拍
         _fr0 = os.environ.get("DS41M_DUMP_FINAL_ROW", "").strip()
         if _fr0 and _RANK == 0 and torch.is_tensor(_r_plain.get("x")):
@@ -2085,32 +2347,46 @@ def run_forward(cfg, source, T, n_layers=None, profiler=None, verbose=True,
             "要么设 DS41M_CP_HIT=1，要么用 DS41M_CP_SIZE=1。"
             "（2026-10-30：原逃生开关 DS41M_ALLOW_CP_HIT_OFF 已删除——它只会让人跑出错数。）")
     _hit_new = bool(_cp_hit and _hit_on0)
+    # ★ 2026-11-01（P1-1，缺陷 G7）：packed 多请求命中。每请求几何相同（等长），
+    #   所以全局 L/R 各一份，行数按"每请求 × n"。要求各请求等长（pos_offset 是标量）。
+    _nseq_hit = max(1, len(lens))
+    _rows_ps = int(T) // _nseq_hit
     _L_glob, _off_glob, _rows_glob = int(T), 0, int(T)
     _R_glob = int(T)
     if _hit_new:
         # ── 命中几何（全局量）：L=原序列长、R=本段要重算的行数、off=段起点 ──
         _L_run = int((cfg.get("run") or {}).get("seq_len") or 0)
-        _L_glob = max(int(lens[0]) if lens else 0, _L_run, int(T))
-        _R_glob = int(assemble.hit_m(cfg, _L_glob) + assemble.replay_tail_of(cfg))
-        if len(lens) != 1:
-            raise RuntimeError(
-                f"命中 + CP 只支持单序列（_packed.n={len(lens)}）；packed 多序列命中未接"
-                "（见 2026-10-28-cp-hit-stage-plan.md「不做」）")
-        if hit_stage == "A":
-            _rows_glob, _off_glob = int(T), 0                  # 前缀 [0, H)
-        else:                                                  # stage B / 单段 fake
-            if int(T) < _R_glob:
+        _L_glob = max(int(lens[0]) if lens else 0, _L_run, _rows_ps)
+        # ★ 2026-11-01：全局命中几何的同一个收口（M>0 且 R<=L），出错点名前缀"命中+CP"。
+        _R_glob = int(assemble.check_hit_geometry(cfg, _L_glob, where="命中+CP（全局几何）"))
+        if _nseq_hit > 1:
+            _eq_lens_guard(lens, "命中 + CP")
+            # ★ P1-1（缺陷 G7/G10）：多请求命中的 CP 也是 **opt-in**。默认仍按老规矩拒绝
+            #   （这条路径本轮只跑到「结构正确 + kv_compress 修好」，数值上还没验收）。
+            if os.environ.get("DS41M_PACKED_BOUNDARY", "0").strip().lower() not in (
+                    "1", "on", "true", "yes"):
                 raise RuntimeError(
-                    f"命中 + CP：输入 {int(T)} 行 < 全局 R={_R_glob}（L={_L_glob}）")
+                    f"命中 + CP 只支持单序列（_packed.n={_nseq_hit}）；packed 多序列命中的"
+                    "CP 路径尚未验收。回退：用 DS41M_CP_SIZE=1，或 --batches 1；"
+                    "要复现实验请显式设 DS41M_PACKED_BOUNDARY=1（已知残差见 G10）。")
+        if hit_stage == "A":
+            _rows_glob, _off_glob = _rows_ps, 0                  # 前缀 [0, H)
+            _keep_tot = int(T)                                   # 输入已是本段全部行
+        else:                                                    # stage B / 单段 fake
+            _keep_tot = _R_glob * _nseq_hit
+            if int(T) < _keep_tot:
+                raise RuntimeError(
+                    f"命中 + CP：输入 {int(T)} 行 < 全局 R×n={_keep_tot}"
+                    f"（R={_R_glob}、n={_nseq_hit}、L={_L_glob}）")
             _rows_glob = _R_glob
             _off_glob = max(0, _L_glob - _R_glob)
-        if int(full_inputs.shape[0]) > _rows_glob:              # 真实前缀：按全局行数切
-            full_inputs = (full_inputs[:_rows_glob] if _off_glob == 0
-                           else full_inputs[-_rows_glob:]).contiguous()
-            if input_ids is not None and len(input_ids) > _rows_glob:
-                input_ids = (input_ids[:_rows_glob] if _off_glob == 0
-                             else input_ids[-_rows_glob:])
-        lens = [_rows_glob]
+        if full_inputs.shape[0] > _keep_tot:                # 真实前缀：按全局行数切
+            full_inputs = (full_inputs[:_keep_tot] if _off_glob == 0
+                           else full_inputs[-_keep_tot:]).contiguous()
+            if input_ids is not None and len(input_ids) > _keep_tot:
+                input_ids = (input_ids[:_keep_tot] if _off_glob == 0
+                             else input_ids[-_keep_tot:])
+        lens = [_rows_glob] * _nseq_hit
     else:
         # ★ 非命中（含 DS41M_CP_HIT=0 回滚）：几何不一致时按单序列处理 = **旧行为逐位不变**
         #   （命中口径的几何校验都在上面 `_hit_new` 分支里；这里不许新增报错/退化）。
@@ -2122,9 +2398,24 @@ def run_forward(cfg, source, T, n_layers=None, profiler=None, verbose=True,
         #   （= CP1 的 L_full 口径，见 `_boundary_cut_state` 的 seq_lens=[L_full]；
         #    stage A 的有效行只到 H，但 CP1 也声明 L，逐位对拍以 CP1 为准）。
         from cp.cp_state import CpState as _CpState
+        # ★ 2026-11-01（C6 #7 接线）：把**逐请求**起点喂给 CpState。
+        #   现在 shot 口径下各请求起点相同（= _off_glob），所以结果与标量路径**逐位相同**；
+        #   但接口已经是逐请求的 ⇒ 下一步支持"不等长 packed"时不用再改状态层。
+        #   来源：`_meta_override.pos_offs`（CP 分支自己写的）或 padding 成请求数。
+        _pk_l = _md.packed_view(cfg)
+        _nreq = max(1, len(_pk_l.get("lens") or [int(T)]))
+        _offs = None
+        try:
+            _mo = cfg.get("_meta_override") or {}
+            _po = _mo.get("pos_offs") or _mo.get("pos_offsets")
+            if _po and len(_po) == _nreq:
+                _offs = [int(v) for v in _po]
+        except Exception:                          # noqa: BLE001
+            _offs = None
         cp = _CpState.from_plan(cp.plan, group=cp.group, device=cp.device,
                                 pos_offset=int(_off_glob),
-                                seq_len=int(_L_glob))
+                                seq_len=int(_L_glob),
+                                pos_offsets=_offs)
     if cp is None:
         return _run_forward_impl(
             cfg, source, T, n_layers=n_layers, profiler=profiler, verbose=verbose,
@@ -2132,13 +2423,21 @@ def run_forward(cfg, source, T, n_layers=None, profiler=None, verbose=True,
             collect_dir=collect_dir, input_ids=input_ids, stop_profiler=stop_profiler,
             shared=shared, hit_stage=hit_stage, no_sync=no_sync, pos_offset=pos_offset,
             l_full=l_full, engram_ctx=engram_ctx, stage_prefix=stage_prefix,
-            post_layer_cb=post_layer_cb, split_tail=split_tail)
+            post_layer_cb=post_layer_cb, split_tail=split_tail,
+            global_ids=global_ids)
 
     local_inputs = cp.split_local(full_inputs, pad=0)
     local_ids = None
     if input_ids is not None:
-        ids_t = torch.as_tensor(input_ids, dtype=torch.long, device=dev)
-        local_ids = cp.split_local(ids_t, pad=0).tolist()
+        # ★ 2026-11-02：`split_local` 的语义就是 `ids[plan.local_index]`
+        #   （cp_layout.py:34 "local_index[row] = 该行的全局 token 号"）——
+        #   **纯 host 切片即可**，不必 `as_tensor → split_local → tolist` 一趟
+        #   H2D+D2H（list→device 是同步拷贝，正是 CP 入口那次 host 阻塞）。
+        #   同时留一份全量 ids 给 L21 replay 裁剪做纯 host 映射。
+        _li0 = cp.plan.local_index
+        _gid = list(input_ids)
+        local_ids = [_gid[i] if i >= 0 else 0 for i in _li0]
+        global_ids = _gid
 
     cfg2 = dict(cfg)
     pk2 = dict(pk)
@@ -2173,7 +2472,8 @@ def run_forward(cfg, source, T, n_layers=None, profiler=None, verbose=True,
             l_full=(int(_L_glob) if _hit_new else
                     (int(l_full) if l_full is not None else sum(lens))),
             engram_ctx=engram_ctx, stage_prefix=stage_prefix,
-            post_layer_cb=post_layer_cb, split_tail=split_tail)
+            post_layer_cb=post_layer_cb, split_tail=split_tail,
+            global_ids=global_ids)
         # ★ 层 20/21 截尾会把 CP 状态换成 compact 布局（行数变少）→ 合并要用**最终**状态
         _cp_final = exec_ops.CP_STATE or cp
     finally:
@@ -3947,10 +4247,8 @@ def main():
         if _hr > 0 and str(_hitc.get("source", "fake")).lower() == "real":
             raise SystemExit("packed hit 暂不支持 real prefix（只支持 fake 零值前缀）")
         _L = int(a.seq)
-        if _hr > 0:
-            _R = assemble.hit_m(cfg, _L) + assemble.replay_tail_of(cfg)
-        else:
-            _R = _L
+        # 命中几何同一个收口（M>0 且 R<=L）；命中关闭时返回 L。
+        _R = assemble.check_hit_geometry(cfg, _L, where="packed 命中几何")
         # run.seq_len = **每序列逻辑长度 L**（t_main 按它算每序列 R）；
         # 本 pass 实际行数 = R×N（build_stack 的 T_pass）；
         # cu = 输入行边界（每请求 R 行）；lens = 每请求**逻辑**长度 L（池/索引器可见长度）。
@@ -4236,6 +4534,22 @@ def main():
         print("  [起跑线] 跨 rank barrier ×1 完成 → 现在开 profiler 开采", flush=True)
     else:
         print("  [起跑线] 未做跨 rank barrier（单卡 / DS41M_START_NOBARRIER=1）", flush=True)
+    # ★ 2026-11-02：**profiler 启动前**把 CP 的 DeepEP BucketBuffer 预建好。
+    #   实测：BucketBuffer 懒加载时首次 alGather 要建 URMA jetty，若此刻 ALOP 已在采，
+    #   `halAsyncDmaJettyCreate` 返回 drvRetCode=7 → primary stream setup failed
+    #   → 后续 copy 全 507015。预热轮之后 CP_STATE 已就绪，正好在这里预建。
+    try:
+        _cpst = exec_ops.CP_STATE
+        if _cpst is not None:
+            import cp_runtime as _cpr
+            if _cpr._bucket_ready():
+                _hint = int(_T_run) * int(cfg["model"]["hidden"]) * 2
+                if _cpr.prebuild_bucket(_cpst.group, cap_bytes_hint=_hint):
+                    print("  [prebuild-bucket] DeepEP BucketBuffer 已预建（profiler 之前）",
+                          flush=True)
+    except Exception as _pb_e:                       # noqa: BLE001
+        print(f"  [prebuild-bucket] 跳过 {type(_pb_e).__name__}: {_pb_e}", flush=True)
+
     if profiler is not None:
         # ALOP start() 需要 device ID（int）
         _dev_id = 0
