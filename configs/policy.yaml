@@ -27,10 +27,3 @@ decoder:
   graph: false        # DS41M_DECODE_GRAPH
 hit:
   stages: [A, B]      # 命中分段命名（stage A=前缀命中，B=尾巴）
-runahead:
-  # 有界抢跑环（core/runner.py:_RUNAHEAD_MIN_T）：T_pass >= min_t_pass 才建环。
-  # 依据（2026-10-26 T-046，邻机 099 交错 A/B，0-error）：
-  #   64k@0.97（T_pass=2106）K=0 122.9 / K=1 137.4 / K=2 133.5 / K=3 130.0
-  #   ⇒ 小 T 上环净亏 10.6ms；大 T（≥min_t_pass）保留环，防 MegaMoE barrier timeout。
-  # 详见 NOTES/2026-10-26-runahead-k0-and-host-serial.md
-  min_t_pass: 8192

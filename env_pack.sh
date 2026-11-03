@@ -23,6 +23,19 @@
 case $- in *u*) _ep_u_on=1; set +u;; *) _ep_u_on=0;; esac
 
 _pack_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── bisheng（CANN 自带 clang15）的 C++ 头搜索路径（2026-11-03）────────────
+# 症状：deep_jit 编 fp8_* kernel 时 `bits/c++config.h` / `bits/os_defines.h` 找不到
+# → `command.hpp:35 exit_code == 0` → `fp8_fp4_mqa_logits` 整层失败 → qli 报
+# 「CP K 池写入失败」→ 点位 rc=1。根因是 bisheng 只搜 /usr/include/c++/12、
+# 没把 gcc 的 multiarch 目录（aarch64-openEuler-linux，含 bits/*）放进搜索路径。
+_ma=$(gcc -print-multiarch 2>/dev/null || true)
+[ -n "${_ma:-}" ] || _ma=aarch64-openEuler-linux
+[ -d "/usr/include/c++/12/$_ma" ] || _ma=""
+if [ -n "${_ma:-}" ] && [ -d "/usr/include/c++/12/$_ma" ]; then
+    export CPLUS_INCLUDE_PATH="/usr/include/c++/12/$_ma${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+    export C_INCLUDE_PATH="/usr/include/c++/12/$_ma${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+fi
 SHARE=${DS41_SHARE:-/mnt/xds/sfs/l00972766}
 
 # ★ Ninja 必须在 PATH 上：tilelang / MegaMoE **ascendc** 走 torch C++ 扩展加载，检测不到
@@ -114,8 +127,11 @@ if [ -n "$DS41_DEPS" ]; then DEPS=$DS41_DEPS
 elif [ -d "$RT/deps/yaml" ]; then DEPS=$RT/deps                    # 包内实体拷贝
 elif [ -d "/root/py311deps/yaml" ]; then DEPS=/root/py311deps      # 本机老路径
 elif [ -d "$_pack_root/deps/yaml" ]; then DEPS=$_pack_root/deps
+# ★ 2026-11-01：**共享盘**上的公共依赖（099 已装、208 缺；拷贝自 099 的站点包）。
+#   位置与三台共享的 `/mnt/xds/sfs` 同盘，只走 PYTHONPATH 前置，不动系统 site-packages。
+elif [ -d "/mnt/xds/sfs/l00972766/deps_py/yaml" ]; then DEPS=/mnt/xds/sfs/l00972766/deps_py
 else DEPS=""; fi
-[ -n "$DEPS" ] && say "deps: $DEPS" || say "⚠️  没有 yaml 等纯 py 依赖 → 请 pip install pyyaml sympy requests"
+[ -n "$DEPS" ] && say "deps: $DEPS" || say "⚠️  没有 yaml 等纯 py 依赖 → 请 pip install pyyaml sympy requests（或拷到 /mnt/xds/sfs/l00972766/deps_py）"
 
 # ── ⑦ torch/torch_npu 站点包：镜像自带优先，其次覆盖层（轻量包不打这 2 GB）──────
 _py_sp=/usr/local/python3.11.16/lib/python3.11/site-packages     # 950-DT 镜像自带位置

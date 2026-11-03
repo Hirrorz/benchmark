@@ -41,7 +41,13 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+# 2026-11-01 fix: the repo root contains an ops/ package (this repo own op
+# implementations). Inserting ROOT at sys.path[0] shadows the vendor top-level
+# ops package (site-packages/ops = cannbotdsl provider impls). With vendor ops
+# shadowed, cann_ops_transformer re-registers ds41 schemas -> Tier0 reports
+# "import vendor ops FAIL" and op entry 15/23. Append instead (the 7 package
+# dirs inserted above still come first).
+sys.path.append(ROOT)
 
 # Tier 0 期望存在的算子（mini 真调用点用到的**全部** vendor 入口）
 EXPECT = [

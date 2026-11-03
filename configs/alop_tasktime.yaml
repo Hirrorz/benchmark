@@ -1,0 +1,35 @@
+# ALOP 采集配置 —— **轻量版：只采 task_time + acl_api（不采 aicore_metrics）**
+#
+# 用途：多点位网格采集时降低 rank0 的 msprof 拖慢（实测 aicore_metrics 下
+#       rank0 每 forward ~3.1s vs 未采集 rank ~0.30s，整组等 rank0）。
+#       trace 仍有：算子名/每次调用的 start-stop（task_time）、host ACL API（acl_api）；
+#       少的是 op_summary 里的 AIC/AIV pipe 指标列（aic_mac/vec/mte 等）。
+#
+# 用法：
+#   bash tools/run_hit.sh ... --alop-config configs/alop_tasktime.yaml
+#
+profiling_config:
+  aicore_metric: "PipeUtilization"
+  data_types:
+    acl_api: true
+    task_time: true
+    aicore_metrics: false
+    aicpu: false
+    l2cache: false
+    hccl_trace: false
+    training_trace: false
+    msproftx: false
+    runtime_api: false
+    task_time_l0: false
+    task_memory: false
+    task_time_l2: false
+    op_attr: false
+    task_time_l3: false
+
+python_profiling_config:
+  enabled: false
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_flops: false
+  with_modules: false

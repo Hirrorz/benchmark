@@ -69,7 +69,7 @@ RESIDENT = {
     "_CP_GROUPS", "_VENDOR_BUFS", "_VENDOR_GROUPS", "_VENDOR_FAILED", "_BUFS",
     "_SB", "_MC2", "_BACKEND_LAST", "_MGR", "_FAILED",
     # 事件环（只放 Event，不放张量）与统计表
-    "_RUNAHEAD_RING", "_RUNAHEAD_POS", "_RUNAHEAD_K_ACTIVE", "_DF_RING", "_DF_POS",
+    "_DF_RING", "_DF_POS",
     "_DF_ARMED", "_AG_STATS", "_SUB", "_STATS", "_N", "_QD_N", "_BOUNDS_SEEN",
     # 注册表
     "OPS", "SKIP", "OP_IFACE", "CONTAINERS", "PATHS", "_IMPL", "_PKT", "_ST",
@@ -212,10 +212,13 @@ def _all_tensors():
 
 
 # ───────────────────────── 释放 ─────────────────────────
-def sweep(verbose: bool = False, measure: bool = False):
+def sweep(verbose: bool = False, measure: bool = False, skip_release=()):
     """清掉**所有登记过的**几何相关容器 + 调 `POINT_RELEASE()`。返回 [(bytes, name)]。
 
     `measure=False`（默认）不做字节统计 —— 热点路径上省一次容器遍历。
+    `skip_release`：**不调用**这些模块的 `POINT_RELEASE()`（点名跳过）。
+      用途：多点位保留按 L 分配的池（`points_runner._reset_between_points(keep_pools=True)`
+      要跳 `runner.POINT_RELEASE`），但几何元数据容器照清。
     """
     freed = []
     for name, m in _our_modules():
@@ -231,7 +234,7 @@ def sweep(verbose: bool = False, measure: bool = False):
                     print(f"  [memlife] ⚠️ 清 {name} 失败：{type(exc).__name__}: {exc}",
                           flush=True)
         rel = getattr(m, "POINT_RELEASE", None)
-        if callable(rel):
+        if callable(rel) and name not in skip_release:
             try:
                 rel()
             except Exception as exc:                     # noqa: BLE001

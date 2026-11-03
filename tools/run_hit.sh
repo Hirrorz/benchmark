@@ -622,7 +622,7 @@ for i, p in enumerate(pts):
         continue
     # 旧格式
     if "L" not in p:
-        sys.exit(f"✗ {where0} 缺 L（或改用 v2：batches:[{L,hit}]）：{p}")
+        sys.exit(f"✗ {where0} 缺 L（或改用 v2：batches:[{{L,hit}}]）：{p}")
     p["L"] = _norm_L(p["L"], where0)
     if p.get("hit") is not None:
         p["hit"] = _norm_hit(p["hit"], where0)
@@ -752,6 +752,7 @@ PY
   echo "点位 $NPOINTS 个（一次进程）：$P_SUM"
   echo "轮次：prof=$DO_PROF  预热=$PROF_WARMUP 采集=$ITERS  卡=$CARDS  回显=$CONSOLE"
   df -h "$OUT" | tail -1 | sed 's/^/磁盘 /'
+  rm -f "$OUT/.group_fatal" "$OUT/.current_point"   # 清掉上一次被杀留下的标记
   T0=$(date +%s)
   python3.11 core/launch_mini.py --config "$CFG" --world "$WORLD" --cards "$CARDS" \
       --logdir "$(_logdir_or_none "$OUT/logs")" --timeout "$TIMEOUT" --console "$(_console_or_summary "$CONSOLE")" \
@@ -760,6 +761,56 @@ PY
       --points "$POINTS_FILE" ${PROF_ARGS[@]+"${PROF_ARGS[@]}"} \
       --alop-config "$ALOP_CFG" 2>&1 | tee "$OUT/launch_points.log"
   RC=${PIPESTATUS[0]}
+  # ★ 2026-11-03：设备级 fatal / 硬崩时进程组常常走不到 _note_fail（C++ terminate /
+  #   HCCL watchdog）。由驱动按 `.current_point` 给该点补记一次失败，避免坏点永远
+  #   堵在前面；成功点（results.tsv 里 errors==0）不重复记。
+  if [ -f "$OUT/.current_point" ]; then
+    python3.11 - "$OUT" "$RC" <<'PY'
+import os
+import sys
+
+root, rc = sys.argv[1], int(sys.argv[2])
+cur = os.path.join(root, ".current_point")
+try:
+    tag = open(cur, encoding="utf-8").read().strip().split("\t")[0]
+except OSError:
+    tag = ""
+if rc != 0 and tag:
+    ok = False
+    try:
+        with open(os.path.join(root, "results.tsv"), encoding="utf-8") as fh:
+            next(fh, None)
+            for ln in fh:
+                q = ln.rstrip("\n").split("\t")
+                if q and q[0] == tag and len(q) > 3:
+                    try:
+                        ok = int(q[3]) == 0
+                    except ValueError:
+                        ok = False
+                    break
+    except OSError:
+        pass
+    if not ok:
+        pf = os.path.join(root, "points_failed.tsv")
+        rows = {}
+        try:
+            with open(pf, encoding="utf-8") as fh:
+                for ln in fh:
+                    q = ln.rstrip("\n").split("\t")
+                    if len(q) >= 2 and q[0]:
+                        rows[q[0]] = int(q[1] or 0)
+        except (OSError, ValueError):
+            pass
+        rows[tag] = rows.get(tag, 0) + 1
+        tmp = pf + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for t, c in sorted(rows.items()):
+                fh.write(f"{t}\t{c}\n")
+        os.replace(tmp, pf)
+        print(f"  [driver] 硬崩补记失败：{tag} → {rows[tag]} 次", flush=True)
+PY
+  fi
+  rm -f "$OUT/.current_point" "$OUT/.group_fatal"
   SEC=$(( $(date +%s) - T0 ))
   echo
   echo "──── 多点位稳态（rank${REPORT_RANK}，未采 prof 的 rank）"

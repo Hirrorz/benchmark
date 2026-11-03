@@ -2,9 +2,19 @@
 
 用法：
   python3 tools/align_ops.py --ours /tmp/dry.json \
-      --ref  <...>/ASCEND_PROFILER_OUTPUT/kernel_details.csv --ref-passes 4 [--top 30]
+      --ref  <...>/mindstudio_profiler_output/op_statistic_*.csv --ref-passes 4 [--top 30]
+  python3 tools/align_ops.py --ours /tmp/dry.json \
+      --ref  <...>/ASCEND_PROFILER_OUTPUT/kernel_details.csv --ref-passes 4   # 旧版导出
 说明：--ref-passes = 参考 trace 里包含几个完整前向（bench 的 --hit-inner-reps/loops）；
 工具会把参考侧除以它，得到"单 pass 计数"再与我们的比对。
+
+两种参考格式（2026-11-01）：
+  · 新版 msprof 导出（现行口径，`msprof --export=on`）只有
+    `mindstudio_profiler_output/op_statistic_*.csv`，列是 `OP Type` + `Count`
+    （每行已按算子聚合，`Count` 是该算子的次数）——**没有** `kernel_details.csv`。
+  · 旧版导出是 `ASCEND_PROFILER_OUTPUT/kernel_details.csv`，列是 `Type`，一行一次调用。
+  以前只认 `Type` 列 ⇒ 喂新版导出时**每行都取到空串**，静默得出"参考全 0"，
+  看起来像"我们的算子比官方多 250 倍"。现在两种都认，且认不出列名时**报错**而不是静默。
 """
 import argparse
 import collections
@@ -20,12 +30,33 @@ def our_hist(path):
 
 
 def ref_hist(csv_path, passes):
+    """→ {算子名: 单 pass 次数}。兼容 op_statistic（OP Type+Count）与 kernel_details（Type）。"""
     c = collections.Counter()
-    for r in csv.DictReader(open(csv_path, errors="ignore")):
-        t = r.get("Type", "")
-        if not t or t in ("-",):
-            continue
-        c[t] += 1
+    with open(csv_path, errors="ignore") as fh:
+        rd = csv.DictReader(fh)
+        cols = set(rd.fieldnames or [])
+        # 新版：op_statistic_*.csv（每行一个算子，Count 是次数）
+        name_col = next((x for x in ("OP Type", "Op Type", "Type") if x in cols), None)
+        if name_col is None:
+            raise SystemExit(
+                f"✗ 认不出参考 CSV 的算子名列（{csv_path}）：列 = {sorted(cols)[:12]}\n"
+                f"  期望 op_statistic_*.csv（OP Type/Count）或 kernel_details.csv（Type）")
+        cnt_col = "Count" if "Count" in cols else None
+        n_rows = 0
+        for r in rd:
+            t = (r.get(name_col) or "").strip()
+            if not t or t == "-":
+                continue
+            n = 1
+            if cnt_col:
+                try:
+                    n = int(float(r.get(cnt_col) or 1))
+                except (TypeError, ValueError):
+                    n = 1
+            c[t] += n
+            n_rows += 1
+    if n_rows == 0:
+        raise SystemExit(f"✗ 参考 CSV 里没有有效算子行（{csv_path}）：列 = {sorted(cols)[:12]}")
     # 归一到单 pass；类型名做模糊化（trace 里是 mangled 名，我们用的是短名）
     return {k: v / max(1, passes) for k, v in c.items()}
 
@@ -36,7 +67,9 @@ ALIAS = [  # (我们的短名, trace 名匹配正则)
     ("QuantSparseLightningIndexer", r"QuantSparseLightningIndexer"),
     ("QuantLightningIndexer", r"QuantLightningIndexer"),
     ("indexer_prologue_qw_kernel", r"indexer_prolog"),
-    ("mhc_post_fwd_asc_kernel", r"mhc_post"),
+    # 2026-11-01：厂商 trace 里的名字是 `MhcPost`（大写、无下划线），旧正则 r"mhc_post"
+    # 匹配不到 ⇒ 对齐表把 80 次报成 "参考 0 / 比值 inf"（假差异）。两种写法都认。
+    ("mhc_post_fwd_asc_kernel", r"mhc_post|MhcPost"),
     ("HcPre", r"^HcPre$"),
     ("RmsNorm", r"^RmsNorm$"),
     ("QuantBatchMatmulV3", r"^QuantBatchMatmulV3$"),

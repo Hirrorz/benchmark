@@ -26,6 +26,28 @@ from cp_runtime import (all_gather_global, all_gather_global_async,
                         cp_rank_in_group, init_cp_group)
 
 
+# `plan.local_index` / `plan.reverse_index` 的**设备张量**缓存：纯几何，建一次复用。
+# 这两张表每建一次 CpState 就要两次同步 H2D（list→npu），而 L20 截断 + L21 replay
+# 裁剪各自都会 `with_compact` 造一个新 CpState ⇒ 每 forward 多出好几次阻塞。
+# DeepInfer 把同类索引放在 input_metadata 里一次构造（yoco.py:169-172），
+# 这里用「plan 几何 → 张量」的缓存达到同样效果。
+_LRI_CACHE: dict = {}
+
+
+def _plan_index_tensors(plan, dev):
+    """→ (local_index, reverse_index) 的设备张量；按几何缓存。"""
+    key = (id(plan), tuple(plan.local_index), tuple(plan.reverse_index), str(dev))
+    hit = _LRI_CACHE.get(key)
+    if hit is not None:
+        return hit
+    li = torch.tensor(plan.local_index, dtype=torch.long, device=dev)
+    ri = torch.tensor(plan.reverse_index, dtype=torch.long, device=dev)
+    if len(_LRI_CACHE) > 64:            # 防跨点位累积
+        _LRI_CACHE.clear()
+    hit = _LRI_CACHE[key] = (li, ri)
+    return hit
+
+
 @dataclass
 class CpState:
     plan: CpPlan
@@ -44,6 +66,12 @@ class CpState:
     pos_offset: int = 0
     #   序列总长（compact 段 = 原 L）：ref-M/rope 表宽/seqused_ori_kv 沿用原序列口径。
     seq_len: int = 0
+    # ★ 2026-11-01（C6 #7 / GPT §14 `cp_state`）：**逐请求**起始位置。
+    #   为空 ⇒ 走标量 `pos_offset`（旧行为，逐位不变）；非空 ⇒ 每个请求各自一个起点
+    #   （长度必须 = 请求数），用于 packed 多请求且**各请求段起点不同**的场景。
+    #   为什么必须加：`CpState.pos_offset` 是标量 ⇒ 多请求只能等长同起点（G10 的根因之一）。
+    pos_offsets: tuple | None = None
+    _off_rows: torch.Tensor | None = field(default=None, compare=False, repr=False)
     # ★ 2026-10-28（P0-4）：`local_positions + pos_offset` 在本状态生命周期内是常量。
     #   以前每次访问都新发一个 int64 Add（runner/mqsmla/idx_prolog 各一次），且
     #   `cmp_cl_cp` / `win_cp` 的 `_meta` key 带 data_ptr → 每层变 ⇒ 压缩有效长度/窗口
@@ -52,10 +80,12 @@ class CpState:
 
     @classmethod
     def from_plan(cls, plan: CpPlan, *, group=None, device="cpu",
-                  pos_offset: int = 0, seq_len: int = 0) -> "CpState":
+                  pos_offset: int = 0, seq_len: int = 0,
+                  pos_offsets=None) -> "CpState":
         dev = torch.device(device)
-        li = torch.tensor(plan.local_index, dtype=torch.long, device=dev)
-        ri = torch.tensor(plan.reverse_index, dtype=torch.long, device=dev)
+        # ★ 2026-11-02：li/ri 走几何缓存（等价 DeepInfer 存 metadata 的做法），
+        #   避免 L20 截断 / L21 replay 裁剪每次新建 CpState 都做两次同步 H2D。
+        li, ri = _plan_index_tensors(plan, dev)
         # 每序列末 token 的本地行号：非整除 L 时最后一个块带 pad，`x[-1]` 是 pad 行，
         # 不能拿来做对拍摘要（会被误判成数值不一致）。末 token 的全局号要加 cu_q；
         # head-tail 下它恒在块 2*CP-1（= rank0 的尾块）⇒ rank0 总能找到，其余 rank 记 -1。
@@ -65,6 +95,18 @@ class CpState:
             gi = cu_q + int(sq) - 1
             last.append(plan.local_index.index(gi) if gi in plan.local_index else -1)
             cu_q += int(sq)
+        # ★ 2026-11-01（C7/逐请求坐标）：把"每行属于哪个请求"的起点展开成逐行张量。
+        #   `plan.local_cu` 是本 rank 每请求的行边界（含 pad 行），行数 = sum(local_lens)。
+        _po = None if pos_offsets is None else [int(v) for v in pos_offsets]
+        _off_rows = None
+        if _po is not None:
+            if len(_po) != len(plan.seq_lens):
+                raise ValueError(
+                    f"pos_offsets 长度 {len(_po)} != 请求数 {len(plan.seq_lens)}")
+            _rows = []
+            for _i, _n in enumerate(plan.local_lens):
+                _rows.extend([_po[_i]] * int(_n))
+            _off_rows = torch.tensor(_rows, dtype=torch.long, device=dev)
         return cls(
             plan=plan,
             group=group,
@@ -79,12 +121,25 @@ class CpState:
             has_pads=any(int(v) < 0 for v in plan.local_index),
             pos_offset=int(pos_offset),
             seq_len=int(seq_len or plan.total_q),
+            pos_offsets=(None if _po is None else tuple(_po)),
+            _off_rows=_off_rows,
         )
 
     # ── compact 段的两种位置口径 ────────────────────────────────────────
     @property
     def abs_positions(self) -> torch.Tensor:
-        """绝对位置（rope / 压缩长度 / 压缩池行号用）。全量段 pos_offset=0 → 恒等。"""
+        """绝对位置（rope / 压缩长度 / 压缩池行号用）。全量段 pos_offset=0 → 恒等。
+
+        ★ 2026-11-01：逐请求 `pos_offsets` 优先（每行加**自己请求**的起点）；
+        为空时走标量 `pos_offset`（旧行为，逐位不变）。
+        """
+        if self.pos_offsets is not None and self._off_rows is not None:
+            c = self._abs_cache
+            key = ("per", tuple(self.pos_offsets))
+            if c is None or c[0] != key:
+                c = (key, self.local_positions + self._off_rows)
+                self._abs_cache = c
+            return c[1]
         if self.pos_offset == 0:
             return self.local_positions
         if not _POS_CACHE_ON:
@@ -95,11 +150,16 @@ class CpState:
             self._abs_cache = c
         return c[1]
 
-    def with_compact(self, keep_lens, *, pos_offset: int, seq_len: int) -> "CpState":
-        """同一 rank/组上，为"截尾后的 compact 序列"建一个新的 CpState。"""
+    def with_compact(self, keep_lens, *, pos_offset: int, seq_len: int,
+                     pos_offsets=None) -> "CpState":
+        """同一 rank/组上，为"截尾后的 compact 序列"建一个新的 CpState。
+
+        ★ 2026-11-01：支持逐请求起点 `pos_offsets`（为空则沿用标量 `pos_offset`）。
+        """
         plan = build_cp_plan([int(x) for x in keep_lens], self.cp_size, self.cp_rank)
         return CpState.from_plan(plan, group=self.group, device=self.device,
-                                 pos_offset=pos_offset, seq_len=seq_len)
+                                 pos_offset=pos_offset, seq_len=seq_len,
+                                 pos_offsets=pos_offsets)
 
     @classmethod
     def from_env(cls, seq_lens, world_size: int, device, *, backend: str = "hccl",
@@ -124,9 +184,18 @@ class CpState:
     def local_rows(self) -> int:
         return int(self.local_index.numel())
 
+    def merge_global_rows(self, x_local: torch.Tensor, pos_lo: int, pos_hi: int,
+                          buf_key: str | None = None) -> torch.Tensor:
+        """**只取**全局位置 `[pos_lo, pos_hi)` 的行（B5）。语义见
+        `cp_runtime.merge_global_rows`；单序列限定，多序列显式拒绝。
+        """
+        import cp_runtime as _cpr
+        return _cpr.merge_global_rows(x_local, self.plan, int(pos_lo), int(pos_hi),
+                                     group=self.group, buf_key=buf_key)
+
     def split_local(self, x: torch.Tensor, pad: int | float = 0) -> torch.Tensor:
         """全量 [total_q, ...] → 本地 [local_rows, ...]；pad 行填 pad。"""
-        if int(x.shape[0]) != self.plan.total_q:
+        if x.shape[0] != self.plan.total_q:
             raise ValueError(f"x 行数 {x.shape[0]} != total_q {self.plan.total_q}")
         out = x.index_select(0, self.local_index.clamp_min(0))
         # ★ 2026-10-25：`bool(self.valid.all())` 是**设备归约 + host 同步**，每 forward
@@ -147,7 +216,7 @@ class CpState:
         `buf_key`：DeepInfer userbuffer 式固定缓冲的键；只给**结果寿命在单算子内**
         的调用用（kv_compress/kv_epilog）。同一 key 复用同一块显存，逐位不变。
         """
-        if int(x_local.shape[0]) != self.local_rows:
+        if x_local.shape[0] != self.local_rows:
             raise ValueError(f"x_local 行数 {x_local.shape[0]} != local_rows {self.local_rows}")
         if self.cp_size == 1:
             return x_local.index_select(0, self.reverse_index)
@@ -159,11 +228,7 @@ class CpState:
                                  chunk=chunk, buf_key=buf_key)
 
     def merge_global_async(self, x_local: torch.Tensor, buf_key: str | None = None):
-        """`merge_global` 的**侧流发起版**：立刻返回 `(out, event)`，消费方 wait_event。
-
-        DeepInfer `cp.all_gather()` 的 wait-句柄同款。单块 + 固定缓冲；数值逐位不变。
-        """
-        if int(x_local.shape[0]) != self.local_rows:
+        if x_local.shape[0] != self.local_rows:
             raise ValueError(f"x_local 行数 {x_local.shape[0]} != local_rows {self.local_rows}")
         if self.cp_size == 1:
             return x_local.index_select(0, self.reverse_index), None

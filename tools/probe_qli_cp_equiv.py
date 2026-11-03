@@ -3,7 +3,7 @@
 
 问题：命中 + CP 时索引器该不该按 CP 切？分块版（`_qli_cp`：每块当"某前缀的尾部"，
 `seq_k=(gs+nv)//ratio`、`residual=(gs+nv)%ratio`、块表按块重建）与全长版
-（`_qli_cp_full`：`seq_k=L//ratio`、`residual=L%ratio`、块表按全局）**参数不同**，
+（全长版：`seq_k=L//ratio`、`residual=L%ratio`、块表按全局）**参数不同**，
 2026-10-28 实测输出不等价。本探针把四个可变参数拆开做对照，定位到底是哪一个导致差异：
 
     A  packed   : seq_k=L//ratio,   residual=L%ratio,   table=ring(N_full)

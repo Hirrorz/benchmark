@@ -341,6 +341,17 @@ def main():
                 codes[r] = pr["p"].returncode
                 if _BAR is not None:
                     _BAR.note_rank_exit(r, pr["p"].returncode)   # 条上标"rank0 已退出"（rank0 才有意义）
+                # ★ 2026-11-03：任一等 rank 非零退出 = 整组已失败。设备 fatal（507015/
+                #   aicore trap）常常是 C++ terminate，走不到 Python 的组内标记；这里
+                #   直接把其余 rank 杀掉，避免干等 HCCL watchdog（实测 ~60s）。
+                if codes[r] != 0:
+                    _rest = [q for q in procs if q["r"] not in codes]
+                    if _rest:
+                        say(f"  ✗ rank{r} 非零退出({codes[r]}) → 立即终止其余 rank "
+                            f"（不等 HCCL watchdog）")
+                    for q in _rest:
+                        q["p"].kill()
+                        codes[q["r"]] = -9
                 continue
             seen = _LAST_SEEN.get(r, t0)
             if (args.silent_warn > 0 and now - seen > args.silent_warn

@@ -193,10 +193,10 @@ def _l2(q, kw):
     addr_ws = None
     addr_bytes = 0
     if V._addr_vec_eligible(ori_kv, bt, idx, cmp_kv, cbt, ci):
-        cols = V._addr_tab_w(int(idx.shape[2]))
+        cols = V._addr_tab_w(idx.shape[2])
         if cmp_kv is not None:
-            cols += V._addr_tab_w(int(ci.shape[2]))
-        addr_bytes = int(q.shape[0]) * cols * 4
+            cols += V._addr_tab_w(ci.shape[2])
+        addr_bytes = q.shape[0] * cols * 4
     ws_full = V.construct_workspace(kw["metadata"], addr_bytes)
     if addr_bytes:
         workspace = ws_full[:-addr_bytes]
@@ -207,7 +207,7 @@ def _l2(q, kw):
     tensors = (q, ori_kv, idx, bt, ln, out, kw["sinks"], kw["cu_seqlens_q"],
                kw["metadata"], workspace, cmp_kv, ci, cbt, cl)
     s = kw.get("softmax_scale")
-    scale = float(s) if s is not None else 1.0 / math.sqrt(int(q.shape[-1]))
+    scale = float(s) if s is not None else 1.0 / math.sqrt(q.shape[-1])
     bc = 1 if V._batch_consistency_enabled() else 0
     compiled(*(t for t in tensors if t is not None), scale, bc,
              *([addr_ws] if addr_ws is not None else []))

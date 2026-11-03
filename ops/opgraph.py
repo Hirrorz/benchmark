@@ -58,8 +58,15 @@ OPS = {
                          trace="2048,8192;160,512,16,32;128,5120,2;2048,128,2", note="wo_b [5120,8192]（输出投影）"),
     "engram_proj":  dict(kernel="QuantBatchMatmulV3",       shapes=[["T", "6144"], ["25600", "6144"]], count=lambda c: 1,
                          trace="2048,6144;800,384,16,32;96,25600,2;2048,96,2", note="仅 engram 层（1,14），2/pass ✓"),
-    "rope":         dict(kernel="InplacePartialRotaryMul",  shapes=[["T", "64", "1", "512"]],       count=lambda c: 3 + c["is_kv_src"]),
-                    # 3 = 2×[T,64,1,512] + 1×[T,1,1,512]；kv_src 层多 1 个大块 [1025,1,1,512]（124 = 3×40 + 4 ✓）
+    # ★★ 2026-11-01（真缺陷修复）：`per_layer=True` = 本 key 的 `count` 是**整层总量**，
+    #   不是"每出现一次算几次"。`rope` 在 recipes 的 `attn_core` 里出现**两次**
+    #   （2026-10-28 为 CP 通信掩盖拆成"kv 先、q 后"），若按出现次数累加会直接翻倍：
+    #   实测 40 层 T=1024 直方图 248 vs 真 trace 124。`apply_ops` 据此只计一次。
+    #   对照：`hc_pre`/`hc_post`/`rmsnorm` 也各出现 2 次，但它们的 count 是**每次出现**
+    #   的次数（1），所以两处 ×1 = 2/层 = 80 恰好对上 trace，**不能**加这个标记。
+    "rope":         dict(kernel="InplacePartialRotaryMul",  shapes=[["T", "64", "1", "512"]],       count=lambda c: 3 + c["is_kv_src"], per_layer=True),
+                    # 3 = 2×[T,64,1,512]（q rope + wo_a 逆 rope）+ 1×[T,1,1,512]（kv rope）；
+                    # kv_src 层多 1 个压缩 rope（124 = 3×40 + 4 ✓）
     "kv_epilog":    dict(kernel="KvCompressEpilogV2",       shapes=[["384", "544"], ["2176", "544"]], count=lambda c: 2, affects=["megamoe"],
                          trace="384,544;2048,512;2048 / 2176,544;2048,512;2048", note="每层 A/B 两块各 1 次（时序 ABABAB…）；38 层无 compressor 权重 → 这是共享 cache 的 epilog，不是压缩写入"),
     "kv_compress":  dict(kernel="KvCompressEpilogV2",       shapes=[["1025", "512"]],               count=lambda c: 1, affects=["megamoe"],

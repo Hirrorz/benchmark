@@ -169,7 +169,7 @@ class DSparkDraft:
     # ── rope / 投影 ────────────────────────────────────────────────────────
     def _rope_apply(self, x, pos, stage, inverse=False):
         cos, sin = self._rope[stage]
-        T = int(x.shape[0])
+        T = x.shape[0]
         p = max(0, min(int(pos), cos.shape[0] - T))
         c, s = cos[p:p + T], sin[p:p + T]
         if inverse:
@@ -182,7 +182,7 @@ class DSparkDraft:
 
     def _project_kv(self, stage, x, pos):
         ctx, w = self._ctx[stage], self._w[stage]
-        ctx["T"] = int(x.shape[0])
+        ctx["T"] = x.shape[0]
         ctx["pos_offset"] = int(pos)
         st = {"x": x}
         exec_ops.OPS["wkv"](st, ctx, w)
@@ -211,14 +211,14 @@ class DSparkDraft:
 
     def _write_draft(self, stage, kv, slots=None):
         if slots is None:
-            j = torch.arange(int(kv.shape[0]), device=self.dev, dtype=torch.int32)
+            j = torch.arange(kv.shape[0], device=self.dev, dtype=torch.int32)
             slots = j + 2 * self.BS
         self._write_rows(stage, kv, slots)
 
     # ── 草稿注意力 ─────────────────────────────────────────────────────────
     def _qkv(self, stage, x, pos):
         ctx, w = self._ctx[stage], self._w[stage]
-        T = int(x.shape[0])
+        T = x.shape[0]
         ctx["T"] = T
         ctx["pos_offset"] = int(pos)
         st = {"x": x}
@@ -234,7 +234,7 @@ class DSparkDraft:
         return q, kv
 
     def _attn(self, stage, q, last_pos):
-        T = int(q.shape[0])
+        T = q.shape[0]
         K = self.win + T
         wcount = min(self.win, int(last_pos) + 1)
         idx = torch.full((T, 1, K), -1, dtype=torch.int32, device=self.dev)
@@ -271,7 +271,7 @@ class DSparkDraft:
     #   维护 —— propose 原先的上下文重写是**冗余**的（同样的行/位置再写一遍），
     #   图路径不重写；32 token 对 T=1 基线逐位一致已验证。
     def _rope_apply_buf(self, x, cos, sin):
-        T = int(x.shape[0])
+        T = x.shape[0]
         v = x.view(T, -1, 1, x.shape[-1])
         torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
             v, cos, sin, rotary_mode="interleave",
@@ -280,7 +280,7 @@ class DSparkDraft:
 
     def _qkv_g(self, stage, x, cos, sin):
         ctx, w = self._ctx[stage], self._w[stage]
-        T = int(x.shape[0])
+        T = x.shape[0]
         ctx["T"] = T
         ctx["pos_offset"] = 0                 # 位置只经 rope 缓冲进入，算子不吃 pos
         st = {"x": x}
@@ -322,7 +322,7 @@ class DSparkDraft:
         return got
 
     def _attn_g(self, stage, q, consts):
-        T = int(q.shape[0])
+        T = q.shape[0]
         pool = self._pool[stage].view(self._nblk(), self.BS, 1, self.KV_ROW).view(torch.uint8)
         out, _ = self._d.mixed_quant_sparse_flash_mla(
             q, quant_mode=1, ori_kv=pool,
@@ -336,7 +336,7 @@ class DSparkDraft:
 
     def _g_layer(self, stage, h, shared, cos, sin, sin_i, consts):
         ctx, w = self._ctx[stage], self._w[stage]
-        T = int(h.shape[0])
+        T = h.shape[0]
         ctx["T"] = T
         st = {"x": h, "residual": h.clone(), "_w": w, "_shared": shared,
               "_backends": (self.cfg.get("backends") or {}),
@@ -409,8 +409,8 @@ class DSparkDraft:
         B = self.B
         cos0, sin0 = self._rope[0]
         p = int(seed_pos)
-        if p < 0 or p + B > int(cos0.shape[0]):
-            raise RuntimeError(f"draft pos {p} 超出 rope 表 {int(cos0.shape[0])}")
+        if p < 0 or p + B > cos0.shape[0]:
+            raise RuntimeError(f"draft pos {p} 超出 rope 表 {cos0.shape[0]}")
         gin, gout = self._g_in, self._g_out
         gin["cos"].copy_(cos0[p:p + B])
         gin["sin"].copy_(sin0[p:p + B])
@@ -440,7 +440,7 @@ class DSparkDraft:
     # ── 单阶段 ─────────────────────────────────────────────────────────────
     def _layer(self, stage, h, draft_pos, last_pos, shared):
         ctx, w = self._ctx[stage], self._w[stage]
-        T = int(h.shape[0])
+        T = h.shape[0]
         ctx["T"] = T
         st = {"x": h, "residual": h.clone(), "_w": w, "_shared": shared,
               "_backends": (self.cfg.get("backends") or {}),
@@ -538,13 +538,13 @@ class DSparkDraft:
             return
         with _no_dg():
             main_x = self._main_x(aux_list)
-            T = int(main_x.shape[0])
+            T = main_x.shape[0]
             if T > self.win:
                 main_x = main_x[-self.win:].contiguous()
                 p0 = int(start_pos) + T - self.win
             else:
                 p0 = int(start_pos)
-            T = int(main_x.shape[0])
+            T = main_x.shape[0]
             pos = torch.arange(p0, p0 + T, device=self.dev)
             for s in range(self.n_stages):
                 kv = self._project_kv(s, main_x, p0)
@@ -558,7 +558,7 @@ class DSparkDraft:
             return
         with _no_dg():
             main_x = self._main_x(aux_list)
-            T = int(main_x.shape[0])
+            T = main_x.shape[0]
             pos = torch.arange(int(start_pos), int(start_pos) + T, device=self.dev)
             for s in range(self.n_stages):
                 kv = self._project_kv(s, main_x, int(start_pos))
@@ -634,7 +634,7 @@ class DSparkDraft:
         with _no_dg(), self._moe_layout():
             # ── 草稿块图（固定几何）──：上下文已由 prefill_context/update_context 写好，
             #   图里只跑 3 层 + rope 缓冲；head/Markov 保持在图外（链式 argmax + host 依赖）。
-            _S0 = int(aux_list[0].shape[0]) if (aux_list and aux_list[0] is not None) else 0
+            _S0 = aux_list[0].shape[0] if (aux_list and aux_list[0] is not None) else 0
             # ★ 默认**关**（2026-10-20 实测：图回放 3 层 18.6ms vs eager 9.4ms ——
             #   数值逐位一致（accept 分布/token 完全相同），但 3 个 128 专家 MoE 的集合
             #   通信压在单个 replay 里，固定开销比 eager 的流水下发还贵；rank 对齐等待
@@ -673,7 +673,7 @@ class DSparkDraft:
                             print(f"  ⚠️ [dspark] 草稿图 replay 失败 → eager："
                                   f"{type(_re).__name__}: {_re}", flush=True)
             main_x = self._main_x(aux_list)
-            S = int(main_x.shape[0])
+            S = main_x.shape[0]
             last_pos = int(start_pos) + S - 1
             draft_pos = last_pos + 1
             # ★ 同 prefill_context：窗环只有 win 槽，整段写会让同槽重复覆盖（胜负由

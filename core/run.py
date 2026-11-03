@@ -158,10 +158,23 @@ def expand_layer(cfg, recipes, layer):
 
 
 def apply_ops(counts, recipes, seq, ctx):
+    """把一层算子序列折成「kernel → 次数」。
+
+    `spec["count"](ctx)` 的语义**两种都有**（见 opgraph 的 `per_layer` 注释）：
+      · 默认：每次出现算 count 次（`hc_pre`/`hc_post`/`rmsnorm` 在 common 里各 2 处、
+        count=1 ⇒ 2/层，与 trace 的 80 对上）；
+      · `per_layer=True`：count 是**整层总量**，同层出现多次也只计一次
+        （`rope` 拆成 kv/q 两处，count=3+is_kv_src 已是全层总量）。
+    """
+    seen_per_layer = set()
     for name in seq:
         spec = ops_mod.OPS.get(name)
         if spec is None:
             raise SystemExit(f"recipes 里有未知算子: {name!r}（请先登记到 opgraph.py）")
+        if spec.get("per_layer"):
+            if name in seen_per_layer:
+                continue
+            seen_per_layer.add(name)
         n = spec["count"](ctx)
         if n:                       # 0 次的不进直方图（层角色没命中）
             counts[spec["kernel"]] += n

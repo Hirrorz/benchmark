@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """比对两套 QLI dump（`DS41M_QLI_DUMP`），定位**第一处**不一致。
 
-用途：命中 + CP 的索引器是否该按 CP 切（分块版 `_qli_cp` vs 全长复算 `_qli_cp_full`）——
+用途：命中 + CP 的索引器是否该按 CP 切（分块版 `_qli_cp`）——
 两版输出的 `cmp_sparse_indices` 必须逐位相同，否则不能用分块版（会改 top-k 选择）。
 
 dump 文件：`r<rank>_L<layer>_p<pass>.pt`，内含

@@ -67,13 +67,13 @@ def make_buffer(layer_idx: int, tbl: torch.Tensor, sf: torch.Tensor | None,
             _FAILED.add(key)
             return None
 
-        rows, hidden = int(tbl.shape[0]), int(tbl.shape[1])
+        rows, hidden = tbl.shape[0], tbl.shape[1]
         per = -(-rows // int(tp))                       # ceil：官方 input_size_per_partition
         r0 = int(rank) * per
         r1 = min(r0 + per, rows)
         slab = tbl[r0:r1]
-        if int(slab.shape[0]) < per:                    # 末片零填充（官方同款）
-            slab = torch.cat([slab, torch.zeros((per - int(slab.shape[0]), hidden),
+        if slab.shape[0] < per:                    # 末片零填充（官方同款）
+            slab = torch.cat([slab, torch.zeros((per - slab.shape[0], hidden),
                                                 dtype=tbl.dtype)], 0)
         slab = slab.contiguous()
 
@@ -92,8 +92,8 @@ def make_buffer(layer_idx: int, tbl: torch.Tensor, sf: torch.Tensor | None,
         sfs = None
         if num_sf:
             k = hidden // 32
-            full = sf if int(sf.shape[0]) >= per * int(tp) else torch.cat(
-                [sf, torch.zeros((per * int(tp) - int(sf.shape[0]), k),
+            full = sf if sf.shape[0] >= per * int(tp) else torch.cat(
+                [sf, torch.zeros((per * int(tp) - sf.shape[0], k),
                                  dtype=sf.dtype)], 0)
             full = full[: per * int(tp)]
             u8 = full.view(torch.uint8) if full.dtype != torch.uint8 else full
@@ -117,7 +117,7 @@ def make_buffer(layer_idx: int, tbl: torch.Tensor, sf: torch.Tensor | None,
 def fetch(buf_and_meta, ids: torch.Tensor):
     """ids: [T, ept] int32（全局行号）→ 惰性 hook（调用后返回 (fp8/bf16 张量, sf 或 None)）。"""
     buf, meta = buf_and_meta
-    n, ept = int(ids.shape[0]), int(ids.shape[-1])
+    n, ept = ids.shape[0], ids.shape[-1]
     assert ept == meta["ept"], (ept, meta["ept"])
     dev = torch.device("npu:%d" % torch.npu.current_device())
     idx3 = ids.reshape(1, n, ept).to(dtype=torch.int32, device=dev).contiguous()

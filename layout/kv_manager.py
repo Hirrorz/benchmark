@@ -261,14 +261,14 @@ class KVCacheManager:
         """
         key = f"_cmp_state_L{layer}"
         stc = hold.get(key)
-        if stc is not None and int(stc.shape[1]) != int(ring):
+        if stc is not None and stc.shape[1] != int(ring):
             stc = None
         if stc is None:
             stc = torch.zeros(int(nblocks), int(ring), 2, int(dim), dtype=torch.float32,
                               device=device)
             hold[key] = stc
-        elif int(stc.shape[0]) < int(nblocks):
-            grow = torch.zeros(int(nblocks) - int(stc.shape[0]), int(ring), 2, int(dim),
+        elif stc.shape[0] < int(nblocks):
+            grow = torch.zeros(int(nblocks) - stc.shape[0], int(ring), 2, int(dim),
                                dtype=torch.float32, device=stc.device)
             stc = torch.cat([stc, grow], 0)
             hold[key] = stc
